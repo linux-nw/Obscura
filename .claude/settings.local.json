@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(adb *)",
+      "PowerShell($proc = Start-Process -FilePath \"adb\" -ArgumentList \"-s emulator-5554 exec-out screencap -p\" -RedirectStandardOutput \"C:\\\\Users\\\\linux\\\\Desktop\\\\screenshot.png\" -Wait -PassThru -NoNewWindow; Write-Host \"Exit: $\\($proc.ExitCode\\)\")"
+    ]
+  }
+}
