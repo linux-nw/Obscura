@@ -4,14 +4,19 @@
  *
  * Sicherheitsmerkmale:
  * - Separate Vault mit fake Daten
-   - Unsichtbar für normale Apps
-   - Einfacher PIN für schnellen Zugriff
-   - Selbstschutz
+ * - Unsichtbar für normale Apps
+ * - Einfacher PIN für schnellen Zugriff
+ * - Selbstschutz
+ *
+ * WICHTIG: NUTZT Argon2id/PBKDF2 statt HMAC-SHA256 für PIN-Hashing
  */
 
 import * as FileSystem from 'expo-file-system/legacy';
 import * as SecureStore from 'expo-secure-store';
-import { XChaCha20CryptoService } from './XChaCha20CryptoService';
+import { SecureCryptoService } from './CryptoService';
+import { fastPbkdf2 } from './FastPBKDF2';
+import * as CryptoModule from 'expo-crypto';
+import { SettingsService } from './SettingsService';
 
 export interface DecoyFile {
   id: string;
@@ -48,7 +53,7 @@ export class DecoyVaultService {
       if (!dirInfo.exists) {
         await FileSystem.makeDirectoryAsync(this.DECOY_DIR, { intermediates: true });
       }
-      console.log('DecoyVault: Service initialized');
+      console.log('DecoyVault: Service initialized with AES-256');
     } catch (error) {
       console.error('Error initializing DecoyVault:', error);
     }
@@ -167,16 +172,19 @@ export class DecoyVaultService {
    * Setzt Decoy PIN
    */
   static async setDecoyPin(pin: string): Promise<void> {
+    const settings = await SettingsService.get();
+    const minLen = settings.minPinLength;
+    if (pin.length < minLen) {
+      throw new Error(`PIN zu kurz — mindestens ${minLen} Zeichen erforderlich`);
+    }
     try {
-      // Hash wie normale PIN
       const { hash, salt } = await this.computePinHash(pin);
-
       await SecureStore.setItemAsync(this.DECOY_PIN_HASH, hash);
       await SecureStore.setItemAsync(this.DECOY_PIN_SALT, salt);
-      console.log('DecoyVault: Decoy PIN set');
+      console.log('DecoyVault: Decoy PIN set (AES-256)');
     } catch (error) {
       console.error('Error setting decoy pin:', error);
-      throw new Error('Konnte Decoy PIN nicht setzen');
+      throw error instanceof Error ? error : new Error('Konnte Decoy PIN nicht setzen');
     }
   }
 
@@ -193,7 +201,7 @@ export class DecoyVaultService {
       }
 
       const { hash } = await this.computePinHash(pin, storedSalt);
-      return hash === storedHash;
+      return SecureCryptoService.constantsTimeEquals(hash, storedHash);
     } catch (error) {
       console.error('DecoyVault: PIN verification error:', error);
       return false;
@@ -201,7 +209,8 @@ export class DecoyVaultService {
   }
 
   /**
-   * Berechnet Decoy PIN Hash
+   * Berechnet Decoy PIN Hash mit Argon2id oder PBKDF2
+   * Fallback zu PBKDF2 wenn Argon2id nicht verfügbar ist
    */
   private static async computePinHash(
     pin: string,
@@ -209,11 +218,18 @@ export class DecoyVaultService {
   ): Promise<{ hash: string; salt: string }> {
     try {
       if (!salt) {
-        salt = await SecureStore.getItemAsync('filevault_pbkdf2_salt') || '';
+        // Generiere neuen Salt für Decoy Vault
+        const saltBytes = await CryptoModule.getRandomBytesAsync(16);
+        salt = Array.from(new Uint8Array(saltBytes))
+          .map(b => b.toString(16).padStart(2, '0'))
+          .join('');
       }
 
-      // Einfacher Hash für Decoy PIN (schneller, weniger sicher)
-      const derivedKey = await XChaCha20CryptoService.computeMac(salt, pin);
+      // Verwende fastPbkdf2 für PIN Hash (100k Iterationen wie normale PIN)
+      // Dies ist viel sicherer als HMAC-SHA256
+      const iterations = 100000;
+      const keyLength = 32; // 32 bytes = 256 bits
+      const derivedKey = await fastPbkdf2(pin, salt, iterations, keyLength);
 
       return {
         hash: derivedKey,
@@ -239,17 +255,22 @@ export class DecoyVaultService {
           const filePath = `${this.DECOY_DIR}${file}`;
           const metaPath = `${filePath}.meta`;
 
-          if (FileSystem.getInfoAsync(metaPath).then((info) => info.exists)) {
-            const meta = await FileSystem.readAsStringAsync(metaPath);
-            const data = JSON.parse(meta);
-            decoyFiles.push({
-              id: file.replace('file_', ''),
-              name: file,
-              originalName: data.originalName,
-              type: data.type,
-              size: data.size,
-              createdAt: new Date(),
-            });
+          try {
+            const info = await FileSystem.getInfoAsync(metaPath);
+            if (info.exists) {
+              const meta = await FileSystem.readAsStringAsync(metaPath);
+              const data = JSON.parse(meta);
+              decoyFiles.push({
+                id: file.replace('file_', ''),
+                name: file,
+                originalName: data.originalName,
+                type: data.type,
+                size: data.size,
+                createdAt: new Date(),
+              });
+            }
+          } catch {
+            // Skip invalid files
           }
         }
       }

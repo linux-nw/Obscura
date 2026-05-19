@@ -7,10 +7,14 @@
  * - DoD 5220.22-M (3-Pass)
  * - Quick Wipe (1-Pass)
  * - Secure deletion for all vault data
+ *
+ * WICHTIG: NUTZT AES-256-CBC statt XChaCha20
  */
 
 import * as FileSystem from 'expo-file-system/legacy';
-import { XChaCha20CryptoService } from './XChaCha20CryptoService';
+import * as SecureStore from 'expo-secure-store';
+import { SecureCryptoService } from './CryptoService';
+import { HardwareBackedStorage } from './HardwareKeystoreService';
 
 export type SecureDeleteMethod = 'quick' | 'dod' | 'guttman';
 
@@ -137,7 +141,7 @@ export class SecureDeleteService {
       }
 
       // Letzte Überschreibung mit Zufallsdaten
-      const randomPattern = this.generateRandomPattern(fileSize);
+      const randomPattern = await this.generateRandomPattern(fileSize);
       await FileSystem.writeAsStringAsync(filePath, randomPattern, {
         encoding: FileSystem.EncodingType.Base64,
       });
@@ -165,11 +169,13 @@ export class SecureDeleteService {
     }
 
     // Für mehr als 7 Passes: Zufallsmuster
-    return this.generateRandomPattern(8).substring(0, 2);
+    // Fallback: festes Muster für Sync-Aufrufe (sollte nicht vorkommen)
+    return '00';
   }
 
   /**
    * Wendet Muster auf Content an
+   * XORt den Base64-decodierten Content mit dem Pattern
    */
   private static applyPattern(
     base64Content: string,
@@ -177,29 +183,92 @@ export class SecureDeleteService {
     pass: number,
     totalPasses: number
   ): string {
-    // In Produktion: echtes Binary Pattern
-    // Hier: Simuliert durch XOR mit Muster
-    return base64Content; // Platzhalter - echte Implementierung mit native module
+    try {
+      // Decodiere Base64 zu Uint8Array
+      const decoded = atob(base64Content);
+      const bytes = new Uint8Array(decoded.length);
+      for (let i = 0; i < decoded.length; i++) {
+        bytes[i] = decoded.charCodeAt(i);
+      }
+
+      // Erstelle Pattern-Bytes (hex zu bytes)
+      const patternBytes = new Uint8Array(pattern.length / 2);
+      for (let i = 0; i < pattern.length; i += 2) {
+        patternBytes[i / 2] = parseInt(pattern.substr(i, 2), 16);
+      }
+
+      // Overwrite every byte with the pattern value (not XOR — XOR with 0x00 is a no-op)
+      const result = new Uint8Array(bytes.length);
+      for (let i = 0; i < bytes.length; i++) {
+        result[i] = patternBytes[i % patternBytes.length];
+      }
+
+      // Recodiere zu Base64
+      let binary = '';
+      for (let i = 0; i < result.length; i++) {
+        binary += String.fromCharCode(result[i]);
+      }
+      return btoa(binary);
+    } catch (error) {
+      // Rethrow so caller knows the overwrite pass failed rather than silently writing back original
+      throw new Error(`SecureDelete: applyPattern failed: ${error}`);
+    }
   }
 
   /**
    * Generiert zufälliges Pattern
+   * Verwendet SecureCryptoService.generateSecureBytes für echtes Zufalls-Random
    */
-  private static generateRandomPattern(size: number): string {
-    // In Produktion: crypto.getRandomValues() oder native module
-    // Hier: Platzhalter
-    return '0'.repeat(size * 2);
+  private static async generateRandomPattern(size: number): Promise<string> {
+    try {
+      const randomBytes = await SecureCryptoService.generateSecureBytes(size);
+      const bytes = new Uint8Array(randomBytes);
+      // writeAsStringAsync with EncodingType.Base64 expects base64 input
+      let binary = '';
+      for (let i = 0; i < bytes.length; i++) {
+        binary += String.fromCharCode(bytes[i]);
+      }
+      return btoa(binary);
+    } catch (error) {
+      console.error('SecureDelete: generateRandomPattern failed:', error);
+      // Fallback: write zero bytes as base64
+      const zeros = new Uint8Array(size);
+      let binary = '';
+      for (let i = 0; i < zeros.length; i++) {
+        binary += String.fromCharCode(zeros[i]);
+      }
+      return btoa(binary);
+    }
   }
 
   /**
    * Sichert alle Daten im Vault
    */
   static async secureWipeAll(): Promise<void> {
+    // List of all keys to verify deletion
+    const keysToVerify = [
+      'filevault_encryption_key',
+      'filevault_pbkdf2_salt',
+      'filevault_argon2id_salt',
+      'filevault_kek_salt',
+      'filevault_master_enc',
+      'filevault_master_iv',
+      'filevault_master_mac',
+      'filevault_bio_kek',
+      'filevault_pin_hash',
+      'filevault_pin_salt',
+      'filevault_pin_iv',
+      'filevault_pin_key',
+      'filevault_failed_attempts',
+      'filevault_lock_until',
+      'filevault_app_initialized',
+    ];
+
     try {
       console.log('SecureDelete: Starting full secure wipe...');
 
       // Zuerst Crypto Schlüssel löschen
-      await XChaCha20CryptoService.deleteEncryptionKey();
+      await SecureCryptoService.deleteEncryptionKey();
 
       // Vault löschen
       await this.secureDeleteVault();
@@ -207,7 +276,21 @@ export class SecureDeleteService {
       // Notizen löschen
       await this.secureDeleteNotes();
 
-      console.log('SecureDelete: Full secure wipe complete');
+      // Read-back Verification: Prüfe jedes gelöschte Item
+      console.log('SecureDelete: Starting read-back verification...');
+      for (const key of keysToVerify) {
+        const stillExists = await HardwareBackedStorage.exists(key);
+        if (stillExists) {
+          // Prüfe SecureStore direkt
+          const secureStoreValue = await SecureStore.getItemAsync(key);
+          if (secureStoreValue !== null) {
+            throw new Error(`secureWipeAll: Key still exists after deletion: ${key}`);
+          }
+        }
+        console.log(`SecureDelete: Verified deletion of ${key}`);
+      }
+
+      console.log('SecureDelete: Full secure wipe complete (AES-256)');
     } catch (error) {
       console.error('SecureDelete: Full wipe failed:', error);
       throw error;
@@ -226,7 +309,8 @@ export class SecureDeleteService {
       await this.secureDeleteFile(filePath, 'guttman');
 
       // Meta-Datei sicher löschen
-      if (FileSystem.getInfoAsync(metaPath).then((info) => info.exists)) {
+      const metaInfo = await FileSystem.getInfoAsync(metaPath);
+      if (metaInfo.exists) {
         await this.secureDeleteFile(metaPath, 'guttman');
       }
 

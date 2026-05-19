@@ -1,282 +1,194 @@
 /**
- * XChaCha20-Poly1305 Crypto Service
- * Modernes Chiffriersystem mit erweiterter Nonce für sichere Verschlüsselung
+ * DEPRECATED - XChaCha20CryptoService
+ * ACHTUNG: Dieser Service ist VERALTET!
+ * Alle Verschlüsselung erfolgt nun über SecureCryptoService (AES-256-CBC)
  *
- * Sicherheitsmerkmale:
- * - XChaCha20 für Verschlüsselung (256-bit)
- * - Poly1305 für Authentifizierung
- * - 192-bit Nonce für sichere Wiederverwendung
- * - Forward secrecy support
+ * Diese Datei existiert nur für Kompatibilität mit altem Code.
+ * WICHTIG: AES-256-CBC ist die VERBINDLICHE Verschlüsselungsmethode!
  */
 
 import * as SecureStore from 'expo-secure-store';
 import * as CryptoModule from 'expo-crypto';
+import CryptoJS from 'crypto-js';
 
+/**
+ * Hex utility functions
+ */
+function hexToBuffer(hex: string): ArrayBuffer {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
+  }
+  return bytes.buffer;
+}
+
+function bufferToHex(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let hex = '';
+  for (let i = 0; i < bytes.byteLength; i++) {
+    hex += (bytes[i] < 16 ? '0' : '') + bytes[i].toString(16);
+  }
+  return hex;
+}
+
+/**
+ * ACHTUNG: Diese Klasse ist veraltet!
+ * Alle Funktionen degressieren auf SecureCryptoService (AES-256-CBC)
+ */
 export class XChaCha20CryptoService {
   private static readonly STORAGE_KEY = 'filevault_xchacha20_key';
-  private static readonly NONCE_LENGTH = 24;
-  private static readonly KEY_LENGTH = 32;
 
   /**
-   * Initialisiert den Crypto Service
+   * DEPRECATED - Nutze SecureCryptoService.initialize()
    */
   static async initialize(): Promise<void> {
-    try {
-      const existingKey = await SecureStore.getItemAsync(this.STORAGE_KEY);
-      if (!existingKey) {
-        const key = await this.generateSecureKey();
-        await SecureStore.setItemAsync(this.STORAGE_KEY, key);
-      }
-    } catch (error) {
-      console.error('Error initializing XChaCha20CryptoService:', error);
-      throw new Error('Konnte XChaCha20 Crypto Service nicht initialisieren');
-    }
+    console.warn('XChaCha20CryptoService.initialize() ist veraltet! Nutze SecureCryptoService.');
   }
 
   /**
-   * Generiert einen kryptographisch sicheren Schlüssel
+   * DEPRECATED - AES-256 verwendet keinen separaten Storage Key
    */
-  private static async generateSecureKey(): Promise<string> {
+  static getStorageKey(): string {
+    console.warn('XChaCha20CryptoService.getStorageKey() ist veraltet!');
+    return this.STORAGE_KEY;
+  }
+
+  /**
+   * DEPRECATED - Generiert einen AES-256 Schlüssel über SecureCryptoService
+   */
+  static async generateSecureKey(): Promise<string> {
+    console.warn('XChaCha20CryptoService.generateSecureKey() ist veraltet!');
     try {
-      const buffer = await CryptoModule.getRandomBytesAsync(this.KEY_LENGTH);
-      return this.bufferToHex(buffer);
+      const bytes = await CryptoModule.getRandomBytesAsync(32);
+      return bufferToHex(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
     } catch (error) {
-      console.error('Error generating secure key:', error);
-      throw new Error('Konnte Sicherheitsschlüssel nicht generieren');
+      throw new Error('AES-256 Key Generierung fehlgeschlagen');
     }
   }
 
   /**
-   * XChaCha20 Verschlüsselung
-   * @param data Zu verschlüsselnder String
-   * @returns Objekt mit verschlüsselten Daten, Nonce und Tag
+   * DEPRECATED - Nutze SecureCryptoService.encryptData()
+   * ACHTUNG: Gibt iv/mac statt nonce/tag zurück für Kompatibilität mit SecureCryptoService
    */
   static async encrypt(data: string): Promise<{
     encryptedData: string;
-    nonce: string;
-    tag: string;
+    iv: string;
+    mac: string;
   }> {
-    try {
-      const nonce = await this.generateSecureBytes(this.NONCE_LENGTH);
-      const nonceHex = this.bufferToHex(nonce);
-      const keyHex = await SecureStore.getItemAsync(this.STORAGE_KEY);
-
-      if (!keyHex) {
-        throw new Error('Kein Verschlüsselungsschlüssel gefunden');
-      }
-
-      // XChaCha20 Verschlüsselung
-      // XChaCha20 nutzt 24-Byte Nonce im Gegensatz zu ChaCha20 mit 8-Byte
-      const keyBuffer = this.hexToBuffer(keyHex);
-      const nonceBuffer = this.hexToBuffer(nonceHex);
-
-      // Für jetzige Implementierung: Nutze poly1305 tag als mac
-      // In der finalen Version mit libsodium: crypto_secretbox_easy()
-      const tag = await this.computeAuthTag(data, keyHex, nonceHex);
-
-      return {
-        encryptedData: data, // Platzhalter - echte Verschlüsselung via native
-        nonce: nonceHex,
-        tag: tag,
-      };
-    } catch (error) {
-      console.error('XChaCha20 encryption error:', error);
-      throw new Error('XChaCha20 Verschlüsselung fehlgeschlagen');
-    }
+    console.warn('XChaCha20CryptoService.encrypt() ist veraltet! Nutze SecureCryptoService.encryptData().');
+    // Import hier für Cyclic dependency
+    const { SecureCryptoService } = await import('./CryptoService');
+    const result = await SecureCryptoService.encryptData(data);
+    return {
+      encryptedData: result.encryptedData,
+      iv: result.iv,
+      mac: result.mac,
+    };
   }
 
   /**
-   * XChaCha20 Entschlüsselung
+   * DEPRECATED - Nutze SecureCryptoService.decryptData()
    */
   static async decrypt(encryptedData: string, nonce: string, tag: string): Promise<string> {
-    try {
-      const keyHex = await SecureStore.getItemAsync(this.STORAGE_KEY);
-      if (!keyHex) {
-        throw new Error('Kein Verschlüsselungsschlüssel gefunden');
-      }
-
-      // Authentifizierung prüfen
-      const expectedTag = await this.computeAuthTag(encryptedData, keyHex, nonce);
-      if (expectedTag !== tag) {
-        throw new Error('Integritätsprüfung fehlgeschlagen - Daten manipuliert');
-      }
-
-      return encryptedData; // Platzhalter - echte Entschlüsselung via native
-    } catch (error) {
-      console.error('XChaCha20 decryption error:', error);
-      throw new Error('XChaCha20 Entschlüsselung fehlgeschlagen');
-    }
+    console.warn('XChaCha20CryptoService.decrypt() ist veraltet! Nutze SecureCryptoService.decryptData().');
+    const { SecureCryptoService } = await import('./CryptoService');
+    return await SecureCryptoService.decryptData(encryptedData, nonce, tag);
   }
 
   /**
-   * Berechnet Poly1305 Auth Tag
+   * DEPRECATED - ComputeMAC über SecureCryptoService
    */
-  private static async computeAuthTag(data: string, keyHex: string, nonceHex: string): Promise<string> {
-    try {
-      // Poly1305 Tag Berechnung
-      // In der finalen Version mit libsodium: crypto_auth()
-      const combined = data + nonceHex;
-      const hmac = this.hmacSha256(combined, keyHex);
-      // Poly1305 Tag ist 16 Bytes = 32 hex Zeichen
-      return hmac.substring(0, 32);
-    } catch (error) {
-      console.error('Poly1305 tag computation error:', error);
-      throw new Error('Konnte Auth Tag nicht berechnen');
-    }
+  static async computeMac(macKey: string, data: string): Promise<string> {
+    console.warn('XChaCha20CryptoService.computeMac() ist veraltet!');
+    const { SecureCryptoService } = await import('./CryptoService');
+    return await SecureCryptoService.computeMac(macKey, data);
   }
 
   /**
-   * HMAC-SHA256 Hilfsfunktion
+   * DEPRECATED - Nutze SecureCryptoService.deriveKeyFromPassphrase()
    */
-  private static hmacSha256(data: string, keyHex: string): string {
-    try {
-      const keyBuffer = this.hexToBuffer(keyHex);
-      const dataBuffer = new TextEncoder().encode(data);
-
-      // Simulierter HMAC - in Produktion native implementation
-      const combined = new Uint8Array(keyBuffer.byteLength + dataBuffer.byteLength);
-      combined.set(new Uint8Array(keyBuffer), 0);
-      combined.set(dataBuffer, keyBuffer.byteLength);
-
-      // Einfacher SHA256 Hash als Platzhalter
-      // In Produktion echtes HMAC nutzen
-      const hash = this.sha256(new TextEncoder().encode(data + keyHex));
-      return this.bufferToHex(hash);
-    } catch {
-      return '';
-    }
-  }
-
-  /**
-   * SHA256 Hilfsfunktion
-   */
-  private static sha256(data: Uint8Array): Uint8Array {
-    // Einfacher SHA256 - in Produktion native implementation
-    const hash = new Uint8Array(32);
-    let h = 0x6a09e667, k = 0xbb67ae85, g = 0x3c6ef372, f = 0xa54ff53a;
-    let j = 0x510e527f, m = 0x9b05688c, i = 0x1f83d9ab, l = 0x5be0cd19;
-
-    for (let o = 0; o < data.length; o++) {
-      const n = o >>> 2, s = o % 4 * 8;
-      hash[n] = (hash[n] || 0) | data[o] << 24 - s;
-    }
-
-    hash[data.length >>> 2] |= 0x80 << 24 - (data.length % 4) * 8;
-    hash[15] = data.length * 8;
-
-    for (let o = 0; o < 64; o++) {
-      const n = hash[o];
-      hash[o] = (n & 255 << 24) | (n & 65535 << 8) | (n & 16711680 >>> 8) | (n >>> 24 & 255);
-    }
-
-    return hash;
-  }
-
-  /**
-   * Generiert kryptographisch sichere Zufallsbytes
-   */
-  private static async generateSecureBytes(length: number): Promise<ArrayBuffer> {
-    try {
-      const bytes = await CryptoModule.getRandomBytesAsync(length);
-      return bytes.buffer as ArrayBuffer;
-    } catch (error) {
-      console.error('Error generating secure bytes:', error);
-      throw new Error('Konnte sichere Zufallsbytes nicht generieren');
-    }
-  }
-
-  /**
-   * Konvertiert ArrayBuffer zu Hex String
-   */
-  private static bufferToHex(buffer: ArrayBuffer): string {
-    const bytes = new Uint8Array(buffer);
-    let hex = '';
-    for (let i = 0; i < bytes.byteLength; i++) {
-      hex += (bytes[i] < 16 ? '0' : '') + bytes[i].toString(16);
-    }
-    return hex;
-  }
-
-  /**
-   * Konvertiert Hex String zu ArrayBuffer
-   */
-  private static hexToBuffer(hex: string): ArrayBuffer {
-    const bytes = new Uint8Array(hex.length / 2);
-    for (let i = 0; i < hex.length; i += 2) {
-      bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
-    }
-    return bytes.buffer;
-  }
-
-  /**
-   * Berechnet HMAC-SHA256
-   */
-  private static async computeMac(macKey: string, data: string): Promise<string> {
-    try {
-      const combined = data + macKey;
-      const hash = this.sha256(new TextEncoder().encode(combined));
-      return this.bufferToHex(hash);
-    } catch (error) {
-      console.error('MAC computation error:', error);
-      throw new Error('Konnte MAC nicht berechnen');
-    }
+  static async deriveKeyFromPassphrase(
+    password: string,
+    saltBase64?: string,
+    iterations = 2,
+    memory = 65536
+  ): Promise<string> {
+    console.warn('XChaCha20CryptoService.deriveKeyFromPassphrase() ist veraltet!');
+    const { SecureCryptoService } = await import('./CryptoService');
+    return await SecureCryptoService.deriveKeyFromPassphrase(password);
   }
 
   // ─────────────────────────────── Dateiverschlüsselung ───────────────────────────────
 
   static async encryptFile(fileData: string): Promise<{
     encryptedData: string;
-    nonce: string;
-    tag: string;
+    iv: string;
+    mac: string;
   }> {
-    try {
-      return await this.encrypt(fileData);
-    } catch (error) {
-      console.error('File encryption error:', error);
-      throw new Error('Dateiverschlüsselung fehlgeschlagen');
-    }
+    console.warn('XChaCha20CryptoService.encryptFile() ist veraltet!');
+    const { SecureCryptoService } = await import('./CryptoService');
+    const result = await SecureCryptoService.encryptFile(fileData);
+    return {
+      encryptedData: result.encryptedData,
+      iv: result.iv,
+      mac: result.mac,
+    };
   }
 
-  static async decryptFile(encryptedData: string, nonce: string, tag: string): Promise<string> {
-    try {
-      return await this.decrypt(encryptedData, nonce, tag);
-    } catch (error) {
-      console.error('File decryption error:', error);
-      throw new Error('Dateientschlüsselung fehlgeschlagen');
-    }
+  static async decryptFile(encryptedData: string, iv: string, mac: string): Promise<string> {
+    console.warn('XChaCha20CryptoService.decryptFile() ist veraltet!');
+    const { SecureCryptoService } = await import('./CryptoService');
+    return await SecureCryptoService.decryptFile(encryptedData, iv, mac);
   }
 
   // ─────────────────────────────── Metadaten-Verschlüsselung ───────────────────────────────
 
   static async encryptMetadata(data: string): Promise<{
     encryptedData: string;
-    nonce: string;
-    tag: string;
+    iv: string;
+    mac: string;
   }> {
-    try {
-      return await this.encrypt(data);
-    } catch (error) {
-      console.error('Metadata encryption error:', error);
-      throw new Error('Metadaten-Verschlüsselung fehlgeschlagen');
-    }
+    console.warn('XChaCha20CryptoService.encryptMetadata() ist veraltet!');
+    const { SecureCryptoService } = await import('./CryptoService');
+    const result = await SecureCryptoService.encryptMetadata(data);
+    return {
+      encryptedData: result.encryptedData,
+      iv: result.iv,
+      mac: result.mac,
+    };
   }
 
-  static async decryptMetadata(encrypted: { data: string; nonce: string; tag: string }): Promise<string> {
-    try {
-      return await this.decrypt(encrypted.data, encrypted.nonce, encrypted.tag);
-    } catch (error) {
-      console.error('Metadata decryption error:', error);
-      throw new Error('Metadaten-Entschlüsselung fehlgeschlagen');
-    }
+  static async decryptMetadata(encrypted: { data: string; iv: string; mac: string }): Promise<string> {
+    console.warn('XChaCha20CryptoService.decryptMetadata() ist veraltet!');
+    const { SecureCryptoService } = await import('./CryptoService');
+    return await SecureCryptoService.decryptMetadata({
+      data: encrypted.data,
+      iv: encrypted.iv,
+      mac: encrypted.mac,
+    });
   }
 
   // ─────────────────────────────── Schlüsselverwaltung ───────────────────────────────
 
   static async deleteEncryptionKey(): Promise<void> {
-    try {
-      await SecureStore.deleteItemAsync(this.STORAGE_KEY);
-    } catch (error) {
-      console.error('Error deleting encryption key:', error);
-    }
+    console.warn('XChaCha20CryptoService.deleteEncryptionKey() ist veraltet!');
+    const { SecureCryptoService } = await import('./CryptoService');
+    await SecureCryptoService.deleteEncryptionKey();
+  }
+
+  /**
+   * DEPRECATED - Nutze SecureCryptoService.constantsTimeEquals()
+   */
+  static async verifyConstantTime(a: string, b: string): Promise<boolean> {
+    const { SecureCryptoService } = require('./CryptoService');
+    return SecureCryptoService.constantsTimeEquals(a, b);
   }
 }
+
+// Export helper function für Argon2id mit AES-256
+export async function generateArgon2Salt(): Promise<string> {
+  const bytes = await CryptoModule.getRandomBytesAsync(16);
+  return bufferToHex(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+}
+
+export default XChaCha20CryptoService;

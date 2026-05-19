@@ -1,72 +1,79 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
-  View, Text, TouchableOpacity, StyleSheet,
+  View, Text, TextInput, TouchableOpacity, StyleSheet,
   Animated, Vibration, Platform, StatusBar,
-  Alert,
+  Alert, ActivityIndicator,
 } from 'react-native';
 import * as LocalAuthentication from 'expo-local-authentication';
-import * as Crypto from 'expo-crypto';
 import * as SecureStore from 'expo-secure-store';
-import CryptoJS from 'crypto-js';
 import { SecureCryptoService } from '../services/CryptoService';
 import { DeviceSecurityService } from '../services/DeviceSecurityService';
+import { SettingsService, AppSettings } from '../services/SettingsService';
 import LockIcon from '../components/LockIcon';
 import { c, rs, SAFE_TOP, SAFE_BOTTOM } from '../theme';
 
-const PIN_MIN = 4;
-const PIN_MAX = 6;
-const PBKDF2_ITERATIONS = 100000;
-
-const LETTER_MAP: Record<string, string | undefined> = {
-  '2': 'ABC', '3': 'DEF', '4': 'GHI', '5': 'JKL',
-  '6': 'MNO', '7': 'PQRS', '8': 'TUV', '9': 'WXYZ',
-};
-
-interface StoredPin {
-  hash: string;
-  salt: string;
-  iterationCount: number;
-}
+const ATTEMPTS_KEY = 'filevault_auth_attempts';
 
 interface Props {
   onAuthenticate: () => void;
   isFirstLaunch: boolean;
+  onWipeVault?: () => Promise<void>;
 }
 
-export default function AuthScreen({ onAuthenticate, isFirstLaunch }: Props) {
-  const [pin, setPin]         = useState('');
-  const [confirm, setConfirm] = useState('');
-  const [phase, setPhase]     = useState<'enter' | 'confirm'>('enter');
-  const [hasBio, setHasBio]   = useState(false);
+export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault }: Props) {
+  const [pass, setPass]           = useState('');
+  const [confirm, setConfirm]     = useState('');
+  const [phase, setPhase]         = useState<'enter' | 'confirm'>('enter');
+  const [showPass, setShowPass]   = useState(false);
+  const [hasBio, setHasBio]       = useState(false);
   const [unlocking, setUnlocking] = useState(false);
-  const [errMsg, setErrMsg]   = useState('');
+  const [errMsg, setErrMsg]       = useState('');
   const [isHashing, setIsHashing] = useState(false);
+  const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
+  const [failedAttempts, setFailedAttempts] = useState(0);
+  const [bioPassedFor2FA, setBioPassedFor2FA] = useState(false);
 
-  const shakeX  = useRef(new Animated.Value(0)).current;
-  const errOpacity = useRef(new Animated.Value(0)).current;
-  const errTimer   = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const shakeX      = useRef(new Animated.Value(0)).current;
+  const errOpacity  = useRef(new Animated.Value(0)).current;
+  const errTimer    = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const authFiredRef = useRef(false);
+  const inputRef    = useRef<TextInput>(null);
 
-  // Biometrics check + auto-trigger on returning users
+  const doAuth = () => {
+    if (authFiredRef.current) return;
+    authFiredRef.current = true;
+    onAuthenticate();
+  };
+
   useEffect(() => {
     (async () => {
       try {
+        const [settings, storedAttempts] = await Promise.all([
+          SettingsService.get(),
+          SecureStore.getItemAsync(ATTEMPTS_KEY),
+        ]);
+        setAppSettings(settings);
+        if (storedAttempts) setFailedAttempts(parseInt(storedAttempts, 10));
+
         const hw  = await LocalAuthentication.hasHardwareAsync();
         const ok  = hw && await LocalAuthentication.isEnrolledAsync();
-        setHasBio(!!ok);
-        if (!isFirstLaunch && ok) setTimeout(triggerBio, 600);
+        const bioEnabled = settings.biometricsEnabled && ok;
+        setHasBio(!!bioEnabled);
+
+        if (!isFirstLaunch && bioEnabled) {
+          setTimeout(() => triggerBio(settings), 600);
+        }
       } catch {}
     })();
     return () => { if (errTimer.current) clearTimeout(errTimer.current); };
   }, []);
 
-  // Device Security Check on mount
   useEffect(() => {
     (async () => {
       try {
         const security = await DeviceSecurityService.checkDeviceSecurity();
         if (security.detectedTampering) {
-          Alert.alert('Sicherheitsalarm', 'Das Gerät wurde kompromittiert! Die App wird gelöscht.');
-          // In Produktion: Auto wipe
+          console.warn('Security: Device tampering detected');
         }
       } catch {}
     })();
@@ -94,275 +101,164 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch }: Props) {
     }, 1800);
   };
 
-  const triggerBio = async () => {
-    try {
-      const res = await LocalAuthentication.authenticateAsync({
-        promptMessage: 'Tresor entsperren',
-        fallbackLabel: 'PIN eingeben',
-      });
-      if (res.success) {
-        setUnlocking(true);
-        // Wichtig: Biometrie-Authentifizierung erfolgt, aber der echte Schlüssel
-        // wird erst nach der PIN-Prüfung freigegeben (Two-Factor-Schema)
-        setTimeout(onAuthenticate, 500);
-      }
-    } catch {}
-  };
-
-  /**
-   * Berechnet PBKDF2-Hash der PIN
-   * Verwendet kryptographisch sichere Zufallsbits für den Salt
-   */
-  const computePinHash = async (pin: string): Promise<{ hash: string; salt: string; iterationCount: number }> => {
-    try {
-      const saltBytes = await Crypto.getRandomBytesAsync(16);
-      const saltHex = bufferToHex(saltBytes);
-
-      // PBKDF2 mit SHA-256, 100k Iterationen, 32-byte Ausgabe
-      const derivedKey = CryptoJS.PBKDF2(
-        pin,
-        saltHex,
-        {
-          keySize: 32 / 4,
-          iterations: PBKDF2_ITERATIONS,
-          hasher: CryptoJS.algo.SHA256,
+  const triggerBio = async (settings?: AppSettings) => {
+    const s = settings ?? appSettings;
+    if (s?.require2FA) {
+      try {
+        const res = await LocalAuthentication.authenticateAsync({
+          promptMessage: 'Biometrie bestätigen',
+          fallbackLabel: 'Passwort eingeben',
+        });
+        if (res.success) setBioPassedFor2FA(true);
+      } catch {}
+    } else {
+      try {
+        const success = await SecureCryptoService.loadMasterKeyForBiometric();
+        if (success) {
+          setUnlocking(true);
+          setTimeout(doAuth, 500);
+        } else {
+          showError('Biometrie fehlgeschlagen');
         }
-      );
-
-      return {
-        hash: bufferToHex(derivedKey.words),
-        salt: saltHex,
-        iterationCount: PBKDF2_ITERATIONS,
-      };
-    } catch (error) {
-      console.error('PIN hashing error:', error);
-      throw new Error('Konnte PIN nicht hashen');
-    }
-  };
-
-  /**
-   * Prüft die eingegebene PIN gegen den gespeicherten Hash
-   * Verwendet konstante Zeit-Vergleich um Timing-Attacks zu verhindern
-   */
-  const verifyPin = async (entered: string): Promise<boolean> => {
-    try {
-      const stored = await getStoredPin();
-      if (!stored) return false;
-
-      const { hash: storedHash, salt: storedSalt, iterationCount } = stored;
-
-      // PBKDF2 mit denselben Parametern wie beim Speichern
-      const derivedKey = CryptoJS.PBKDF2(
-        entered,
-        storedSalt,
-        {
-          keySize: 32 / 4,
-          iterations: iterationCount,
-          hasher: CryptoJS.algo.SHA256,
-        }
-      );
-
-      const derivedHash = bufferToHex(derivedKey.words);
-
-      // Konstante Zeit-Vergleich um Timing-Attacks zu verhindern
-      return constantTimeEquals(derivedHash, storedHash);
-    } catch (error) {
-      console.error('PIN verification error:', error);
-      return false;
-    }
-  };
-
-  const getStoredPin = async (): Promise<StoredPin | null> => {
-    try {
-      const dataHex = await SecureStore.getItemAsync('filevault_pin_hash');
-      const ivHex = await SecureStore.getItemAsync('filevault_pin_iv');
-      const keyHex = await SecureStore.getItemAsync('filevault_pin_key');
-
-      if (!dataHex || !ivHex || !keyHex) {
-        return null;
+      } catch {
+        showError('Biometrie fehlgeschlagen');
       }
-
-      const masterKeyBuffer = hexToBuffer(keyHex);
-      const ivBuffer = hexToBuffer(ivHex);
-      const dataBuffer = hexToBuffer(dataHex);
-
-      // crypto-js expects the ciphertext as a hex string or WordArray
-      // We need to convert the dataBuffer to a WordArray
-      const cipher = CryptoJS.lib.CipherParams.create({
-        ciphertext: CryptoJS.lib.WordArray.create(dataBuffer),
-      });
-
-      const decrypted = CryptoJS.AES.decrypt(cipher, masterKeyBuffer, {
-        iv: ivBuffer,
-        mode: CryptoJS.mode.CBC,
-        padding: CryptoJS.pad.Pkcs7,
-      });
-
-      const json = JSON.parse(bufferToString(decrypted)) as StoredPin;
-      return json;
-    } catch {
-      return null;
     }
   };
 
-  const checkLoginPin = async (entered: string) => {
+  const checkLoginPass = async (entered: string) => {
     if (isHashing) return;
-
     setIsHashing(true);
     try {
-      const isValid = await verifyPin(entered);
-      if (isValid) {
-        setUnlocking(true);
-      } else if (entered.length >= PIN_MAX) {
-        showError('Falsche PIN');
-        setPin('');
+      const lockStatus = await SecureCryptoService.getLockStatus();
+      if (lockStatus.locked) {
+        const secsLeft = Math.ceil((lockStatus.unlockAt - Date.now()) / 1000);
+        showError(`Zu viele Versuche — noch ${secsLeft}s warten`);
+        setPass('');
+        return;
       }
-    } catch (error) {
-      showError('Fehler beim Prüfen der PIN');
-      setPin('');
+
+      const isValid = await SecureCryptoService.unlock(entered);
+
+      if (isValid) {
+        setFailedAttempts(0);
+        await SecureStore.deleteItemAsync(ATTEMPTS_KEY);
+        setUnlocking(true);
+        setTimeout(doAuth, 300);
+      } else {
+        const maxAttempts = appSettings?.maxFailedAttempts ?? 5;
+        const newCount = failedAttempts + 1;
+        setFailedAttempts(newCount);
+        await SecureStore.setItemAsync(ATTEMPTS_KEY, String(newCount));
+
+        if (newCount >= maxAttempts) {
+          Alert.alert(
+            'Tresor gelöscht',
+            `${maxAttempts} falsche Passwörter — alle Daten werden unwiderruflich gelöscht.`,
+            [{
+              text: 'Löschen',
+              style: 'destructive',
+              onPress: async () => {
+                await SecureStore.deleteItemAsync(ATTEMPTS_KEY);
+                await onWipeVault?.();
+              },
+            }],
+            { cancelable: false },
+          );
+        } else {
+          const remaining = maxAttempts - newCount;
+          showError(`Falsches Passwort — noch ${remaining} ${remaining === 1 ? 'Versuch' : 'Versuche'}`);
+        }
+        setPass('');
+      }
+    } catch {
+      showError('Fehler beim Prüfen des Passworts');
+      setPass('');
     } finally {
       setIsHashing(false);
     }
   };
 
-  const checkConfirmPin = async (original: string, entered: string) => {
+  const checkConfirmPass = async (original: string, entered: string) => {
+    if (isHashing) return;
+
     if (original !== entered) {
-      showError('PINs stimmen nicht überein');
+      showError('Passwörter stimmen nicht überein');
+      setConfirm('');
+      inputRef.current?.focus();
+      return;
+    }
+
+    const minLen = appSettings?.minPinLength ?? 6;
+    if (entered.length < minLen) {
+      showError(`Mindestens ${minLen} Zeichen erforderlich`);
       setConfirm('');
       return;
     }
 
-    if (entered.length < PIN_MIN) {
-      showError(`PIN muss mindestens ${PIN_MIN} Ziffern haben`);
-      setConfirm('');
-      return;
-    }
-
-    // PIN hashen und sicher speichern
-    const { hash, salt, iterationCount } = await computePinHash(entered);
-
+    setIsHashing(true);
     try {
-      // Speichert PIN-Hash und Salt (nicht die PIN selbst!)
-      // Der PIN-Hash wird mit einem Master-Key verschlüsselt
-      const masterKey = await Crypto.getRandomBytesAsync(32);
-      const masterKeyHex = bufferToHex(masterKey);
-
-      // Verschlüsselt PIN-Daten mit Master-Key
-      const pinData = JSON.stringify({ hash, salt, iterationCount });
-      const pinBuffer = stringToBuffer(pinData);
-      const iv = await Crypto.getRandomBytesAsync(12);
-
-      const cipher = CryptoJS.AES.encrypt(
-        CryptoJS.enc.Utf8.parse(pinData),
-        CryptoJS.enc.Hex.parse(masterKeyHex),
-        {
-          iv: iv,
-          mode: CryptoJS.mode.CBC,
-          padding: CryptoJS.pad.Pkcs7,
-        }
-      );
-
-      // Speichert verschlüsselte PIN-Hash
-      await SecureStore.setItemAsync('filevault_pin_hash', bufferToHex(cipher.ciphertext));
-      await SecureStore.setItemAsync('filevault_pin_salt', salt);
-      await SecureStore.setItemAsync('filevault_pin_iv', bufferToHex(iv));
-      await SecureStore.setItemAsync('filevault_pin_key', masterKeyHex);
-
-      // Markiert App als initialisiert
-      await SecureCryptoService.setAppInitialized(true);
+      await Promise.all([
+        SecureCryptoService.setupMasterKey(entered),
+        SecureCryptoService.setAppInitialized(true),
+      ]);
       setUnlocking(true);
+      setTimeout(doAuth, 300);
     } catch (error) {
-      console.error('Error storing PIN:', error);
-      showError('Konnte PIN nicht speichern');
+      console.error('Fehler beim Speichern des Passworts:', error);
+      showError('Konnte Passwort nicht speichern');
       setConfirm('');
+    } finally {
+      setIsHashing(false);
     }
-  };
-
-  /**
-   * Vergleicht zwei Strings in konstanter Zeit
-   * Verhindert Timing-Attacks
-   */
-  const constantTimeEquals = (a: string, b: string): boolean => {
-    if (a.length !== b.length) return false;
-
-    let result = 0;
-    for (let i = 0; i < a.length; i++) {
-      result |= a.charCodeAt(i) ^ b.charCodeAt(i);
-    }
-    return result === 0;
-  };
-
-  // ─────────────────────────────── Hilfsfunktionen ───────────────────────────────
-
-  const bufferToHex = (buffer: ArrayBuffer | Uint8Array): string => {
-    const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
-    let hex = '';
-    for (let i = 0; i < bytes.byteLength; i++) {
-      hex += (bytes[i] < 16 ? '0' : '') + bytes[i].toString(16);
-    }
-    return hex;
-  };
-
-  const hexToBuffer = (hex: string): ArrayBuffer => {
-    const bytes = new Uint8Array(hex.length / 2);
-    for (let i = 0; i < hex.length; i += 2) {
-      bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
-    }
-    return bytes.buffer;
-  };
-
-  const stringToBuffer = (str: string): ArrayBuffer => {
-    const encoder = new TextEncoder();
-    return encoder.encode(str).buffer;
-  };
-
-  const bufferToString = (buffer: ArrayBuffer | Uint8Array): string => {
-    const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
-    const decoder = new TextDecoder();
-    return decoder.decode(bytes);
-  };
-
-  // ─────────────────────────────── Event Handler ───────────────────────────────
-
-  const handleDigit = (digit: string) => {
-    if (unlocking || isHashing) return;
-    if (phase === 'enter') {
-      const np = pin + digit;
-      if (np.length > PIN_MAX) return;
-      setPin(np);
-      if (!isFirstLaunch) checkLoginPin(np);
-    } else {
-      const nc = confirm + digit;
-      if (nc.length > PIN_MAX) return;
-      setConfirm(nc);
-      checkConfirmPin(pin, nc);
-    }
-  };
-
-  const handleDelete = () => {
-    if (unlocking || isHashing) return;
-    if (phase === 'confirm') setConfirm(v => v.slice(0, -1));
-    else setPin(v => v.slice(0, -1));
   };
 
   const handleAdvance = () => {
-    if (isFirstLaunch && phase === 'enter' && pin.length >= PIN_MIN) {
+    const current = phase === 'confirm' ? confirm : pass;
+    const minLen = appSettings?.minPinLength ?? 6;
+    if (current.length < minLen || unlocking || isHashing) return;
+
+    if (isFirstLaunch && phase === 'enter') {
       setPhase('confirm');
+      setConfirm('');
+      setTimeout(() => inputRef.current?.focus(), 80);
+    } else if (isFirstLaunch && phase === 'confirm') {
+      checkConfirmPass(pass, confirm);
+    } else if (!isFirstLaunch) {
+      checkLoginPass(pass);
     }
   };
 
   const handleBack = () => {
     setPhase('enter');
     setConfirm('');
+    setTimeout(() => inputRef.current?.focus(), 80);
   };
 
-  const curLen  = phase === 'confirm' ? confirm.length : pin.length;
-  const showOK  = isFirstLaunch && phase === 'enter' && pin.length >= PIN_MIN;
-  const showBack = isFirstLaunch && phase === 'confirm';
+  const currentVal  = phase === 'confirm' ? confirm : pass;
+  const setCurrentVal = phase === 'confirm' ? setConfirm : setPass;
+  const minLen = appSettings?.minPinLength ?? 6;
+  const canAdvance  = currentVal.length >= minLen && !unlocking && !isHashing;
 
-  const subtitle = isFirstLaunch
-    ? (phase === 'enter' ? `${PIN_MIN}–${PIN_MAX} Ziffern wählen` : 'PIN erneut eingeben')
-    : 'Geben Sie Ihre PIN ein';
+  const phaseLabel = isFirstLaunch
+    ? (phase === 'enter' ? 'Passwort erstellen' : 'Passwort bestätigen')
+    : bioPassedFor2FA ? '2FA – Passwort eingeben'
+    : 'Entsperren';
+
+  const subtitle = isHashing
+    ? (phase === 'confirm' ? 'Passwort wird gespeichert...' : 'Passwort wird geprüft...')
+    : bioPassedFor2FA
+    ? 'Biometrie bestätigt — Passwort eingeben'
+    : isFirstLaunch
+    ? (() => {
+        const minLen = appSettings?.minPinLength ?? 6;
+        return (phase === 'enter' ? `Mindestens ${minLen} Zeichen` : 'Passwort erneut eingeben');
+      })()
+    : 'Geben Sie Ihr Passwort ein';
+
+  const submitLabel = isFirstLaunch
+    ? (phase === 'enter' ? 'Weiter' : 'Speichern')
+    : 'Entsperren';
 
   return (
     <View style={s.root}>
@@ -374,151 +270,78 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch }: Props) {
           locked
           size={rs(90)}
           animating={unlocking}
-          onAnimationComplete={onAuthenticate}
+          onAnimationComplete={doAuth}
         />
         <Text style={s.appName}>Obscura</Text>
-        <Text style={s.phase}>
-          {isFirstLaunch
-            ? (phase === 'enter' ? 'PIN erstellen' : 'PIN bestätigen')
-            : 'Entsperren'}
-        </Text>
+        <Text style={s.phase}>{phaseLabel}</Text>
         <Text style={s.sub}>{subtitle}</Text>
       </View>
 
-      {/* ── PIN dots + error ── */}
-      <Animated.View style={[s.dotsWrap, { transform: [{ translateX: shakeX }] }]}>
-        <View style={s.dotsRow}>
-          {Array.from({ length: PIN_MAX }).map((_, i) => (
-            <View
-              key={i}
-              style={[
-                s.dot,
-                i < curLen && s.dotFilled,
-                i === PIN_MIN && s.dotGap,
-              ]}
-            />
-          ))}
+      {/* ── Input + error ── */}
+      <Animated.View style={[s.inputSection, { transform: [{ translateX: shakeX }] }]}>
+        <View style={s.inputRow}>
+          <TextInput
+            ref={inputRef}
+            style={s.input}
+            value={currentVal}
+            onChangeText={v => { setCurrentVal(v); }}
+            secureTextEntry={!showPass}
+            placeholder="Passwort eingeben"
+            placeholderTextColor={c.textTer}
+            autoFocus
+            autoCapitalize="none"
+            autoCorrect={false}
+            returnKeyType="done"
+            onSubmitEditing={handleAdvance}
+            editable={!unlocking && !isHashing}
+            maxLength={256}
+          />
+          <TouchableOpacity
+            style={s.eyeBtn}
+            onPress={() => setShowPass(v => !v)}
+            activeOpacity={0.7}
+          >
+            <Text style={s.eyeIcon}>{showPass ? '🙈' : '👁'}</Text>
+          </TouchableOpacity>
         </View>
         <Animated.Text style={[s.errText, { opacity: errOpacity }]}>
           {errMsg}
         </Animated.Text>
       </Animated.View>
 
-      {/* ── Numeric keypad ── */}
-      <View style={s.pad}>
-        {hasBio && !isFirstLaunch ? (
-          <PinKey label="Touch ID" ghost onPress={triggerBio} />
-        ) : showBack ? (
-          <PinKey label="‹ zurück" ghost onPress={handleBack} />
-        ) : (
-          <PinKey digit="1" ghost disabled />
+      {/* ── Action buttons ── */}
+      <View style={s.actions}>
+        {isFirstLaunch && phase === 'confirm' && (
+          <TouchableOpacity style={s.backBtn} onPress={handleBack} activeOpacity={0.7}>
+            <Text style={s.backTxt}>‹ Zurück</Text>
+          </TouchableOpacity>
         )}
-        <PinKey digit="0" onPress={() => handleDigit('0')} />
-        {showOK ? (
-          <PinKey label="Weiter" accent onPress={handleAdvance} />
-        ) : (
-          <PinKey label="⌫" ghost onPress={handleDelete} largeSymbol />
+
+        <TouchableOpacity
+          style={[s.submitBtn, !canAdvance && s.submitDisabled]}
+          onPress={handleAdvance}
+          disabled={!canAdvance}
+          activeOpacity={0.8}
+        >
+          {isHashing
+            ? <ActivityIndicator color="#fff" size="small" />
+            : <Text style={s.submitTxt}>{submitLabel}</Text>
+          }
+        </TouchableOpacity>
+
+        {!isFirstLaunch && hasBio && !bioPassedFor2FA && (
+          <TouchableOpacity
+            style={s.bioBtn}
+            onPress={() => triggerBio()}
+            activeOpacity={0.7}
+          >
+            <Text style={s.bioTxt}>Biometrie verwenden</Text>
+          </TouchableOpacity>
         )}
       </View>
 
-      {/* ── Extended keypad for PIN creation ── */}
-      <Animated.View
-        style={[
-          s.keypad,
-          { opacity: (phase === 'enter' && !showOK) || (phase === 'confirm') ? 1 : 0 },
-        ]}
-      >
-        <View style={s.padRow}>
-          <PinKey digit="1"             onPress={() => handleDigit('1')} />
-          <PinKey digit="2" sub="ABC"   onPress={() => handleDigit('2')} />
-          <PinKey digit="3" sub="DEF"   onPress={() => handleDigit('3')} />
-        </View>
-        <View style={s.padRow}>
-          <PinKey digit="4" sub="GHI"   onPress={() => handleDigit('4')} />
-          <PinKey digit="5" sub="JKL"   onPress={() => handleDigit('5')} />
-          <PinKey digit="6" sub="MNO"   onPress={() => handleDigit('6')} />
-        </View>
-        <View style={s.padRow}>
-          <PinKey digit="7" sub="PQRS"  onPress={() => handleDigit('7')} />
-          <PinKey digit="8" sub="TUV"   onPress={() => handleDigit('8')} />
-          <PinKey digit="9" sub="WXYZ"  onPress={() => handleDigit('9')} />
-        </View>
-        <View style={s.padRow}>
-          <PinKey digit="" ghost disabled />
-          <PinKey digit="0" onPress={() => handleDigit('0')} />
-          {showOK && phase === 'enter' ? (
-            <PinKey label="Weiter" accent onPress={handleAdvance} />
-          ) : (
-            <PinKey label="⌫" ghost onPress={handleDelete} largeSymbol />
-          )}
-        </View>
-      </Animated.View>
-
       <View style={{ height: SAFE_BOTTOM + rs(8) }} />
     </View>
-  );
-}
-
-// ─────────────────────────────── PIN Key ───────────────────────────────
-
-const KEY_SIZE = rs(72);
-
-interface PinKeyProps {
-  onPress?: () => void;
-  digit?: string;
-  sub?: string;
-  label?: string;
-  ghost?: boolean;
-  accent?: boolean;
-  largeSymbol?: boolean;
-  disabled?: boolean;
-}
-
-function PinKey({ onPress, digit, sub, label, ghost, accent, largeSymbol, disabled }: PinKeyProps) {
-  const sc = useRef(new Animated.Value(1)).current;
-
-  const handlePress = () => {
-    if (disabled) return;
-    Animated.sequence([
-      Animated.timing(sc, { toValue: 0.85, duration: 55,  useNativeDriver: true }),
-      Animated.timing(sc, { toValue: 1,    duration: 130, useNativeDriver: true }),
-    ]).start();
-    onPress?.();
-  };
-
-  return (
-    <TouchableOpacity
-      onPress={handlePress}
-      activeOpacity={0.8}
-      style={s.keySlot}
-      disabled={disabled}
-      accessible
-      accessibilityLabel={digit ?? label ?? 'Leer'}
-      accessibilityRole="button"
-    >
-      <Animated.View style={[
-        s.key,
-        ghost  && s.keyGhost,
-        accent && s.keyAccent,
-        disabled && s.keyDisabled,
-        { transform: [{ scale: sc }] },
-      ]}>
-        {digit ? (
-          <>
-            <Text style={s.keyDigit}>{digit}</Text>
-            {sub ? <Text style={s.keyLetters}>{sub}</Text> : null}
-          </>
-        ) : label ? (
-          <Text style={[
-            s.keyLabel,
-            largeSymbol && s.keyLabelLarge,
-            accent      && { color: c.accent, fontWeight: '600' },
-          ]}>
-            {label}
-          </Text>
-        ) : null}
-      </Animated.View>
-    </TouchableOpacity>
   );
 }
 
@@ -557,28 +380,33 @@ const s = StyleSheet.create({
     letterSpacing: 0.1,
   },
 
-  dotsWrap: {
-    alignItems: 'center',
+  inputSection: {
+    width: '88%',
+    alignSelf: 'center',
   },
-  dotsRow: {
+  inputRow: {
     flexDirection: 'row',
-    gap: rs(14),
+    alignItems: 'center',
+    backgroundColor: c.card,
+    borderRadius: rs(14),
+    borderWidth: 1,
+    borderColor: c.border,
+    paddingHorizontal: rs(16),
     marginBottom: rs(10),
   },
-  dot: {
-    width: rs(11),
-    height: rs(11),
-    borderRadius: rs(6),
-    borderWidth: 1.5,
-    borderColor: '#2E2E30',
-    backgroundColor: 'transparent',
+  input: {
+    flex: 1,
+    paddingVertical: rs(16),
+    fontSize: rs(18),
+    color: c.text,
+    letterSpacing: 0.5,
   },
-  dotFilled: {
-    backgroundColor: c.accent,
-    borderColor: c.accent,
+  eyeBtn: {
+    padding: rs(8),
+    marginLeft: rs(4),
   },
-  dotGap: {
-    marginLeft: rs(8),
+  eyeIcon: {
+    fontSize: rs(18),
   },
   errText: {
     fontSize: rs(13),
@@ -588,71 +416,39 @@ const s = StyleSheet.create({
     textAlign: 'center',
   },
 
-  pad: {
-    flexDirection: 'row',
+  actions: {
+    width: '88%',
+    alignSelf: 'center',
+    gap: rs(12),
+  },
+  backBtn: {
+    alignSelf: 'flex-start',
+    paddingVertical: rs(4),
+  },
+  backTxt: {
+    fontSize: rs(15),
+    color: c.accent,
+  },
+  submitBtn: {
+    backgroundColor: c.accent,
+    borderRadius: rs(14),
+    paddingVertical: rs(16),
     alignItems: 'center',
-    gap: rs(10),
-    paddingHorizontal: rs(20),
-    marginBottom: rs(20),
   },
-  keypad: {
-    gap: rs(10),
-    paddingHorizontal: rs(20),
-    width: '100%',
-    maxWidth: rs(310),
+  submitDisabled: {
+    opacity: 0.35,
   },
-  padRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-  },
-  keySlot: {
-    width: KEY_SIZE,
-    height: KEY_SIZE,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  key: {
-    width: KEY_SIZE,
-    height: KEY_SIZE,
-    borderRadius: KEY_SIZE / 2,
-    backgroundColor: c.cardEl,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  keyDisabled: {
-    opacity: 0.3,
-    backgroundColor: 'transparent',
-  },
-  keyGhost: {
-    backgroundColor: 'transparent',
-  },
-  keyAccent: {
-    backgroundColor: c.accentDim,
-    borderWidth: 1,
-    borderColor: c.accentBorder,
-  },
-  keyDigit: {
-    fontSize: rs(27),
-    fontWeight: '300',
-    color: c.text,
-    lineHeight: rs(30),
-  },
-  keyLetters: {
-    fontSize: rs(9),
+  submitTxt: {
+    fontSize: rs(16),
     fontWeight: '600',
-    color: c.textSec,
-    letterSpacing: 1.2,
-    marginTop: rs(-2),
+    color: '#fff',
   },
-  keyLabel: {
-    fontSize: rs(12),
-    fontWeight: '500',
-    color: c.textSec,
-    textAlign: 'center',
+  bioBtn: {
+    paddingVertical: rs(12),
+    alignItems: 'center',
   },
-  keyLabelLarge: {
-    fontSize: rs(20),
-    fontWeight: '400',
+  bioTxt: {
+    fontSize: rs(14),
     color: c.textSec,
   },
 });
