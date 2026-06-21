@@ -6,10 +6,11 @@ import {
 import { NotesService, Note } from '../services/NotesService';
 import { SecureCryptoService } from '../services/CryptoService';
 import NoteEditor from './NoteEditor';
-import { c, rs, TAB_BAR_HEIGHT } from '../theme';
-import ActionIcon from '../components/ActionIcon';
+import Icon from '../components/Icon';
+import { c, rs, font, radius, TAB_BAR_HEIGHT, useBottomInset } from '../theme';
 
-export default function NotesScreen() {
+export default function NotesScreen({ isDecoy = false }: { isDecoy?: boolean }) {
+  const safeBot = useBottomInset();
   const [notes,   setNotes]   = useState<Note[]>([]);
   const [query,   setQuery]   = useState('');
   const [editing, setEditing] = useState<Note | null | undefined>(undefined); // undefined = hidden
@@ -17,6 +18,9 @@ export default function NotesScreen() {
   const [initialized, setInitialized] = useState(false);
 
   useEffect(() => { initialize(); }, []);
+
+  // Notizen laden, sobald die Services bereit sind (und bei erneuter Bereitschaft).
+  useEffect(() => { if (initialized) loadNotes(); }, [initialized]);
 
   const initialize = async () => {
     try {
@@ -29,8 +33,11 @@ export default function NotesScreen() {
     }
   };
 
+  // Kein initialized-Guard: NotesService.getNotes() initialisiert sich selbst. Der
+  // frühere Guard las über einen stale Closure immer initialized=false → die Liste
+  // wurde nach dem Speichern nie neu geladen.
   const loadNotes = async () => {
-    if (!initialized) return;
+    if (isDecoy) { setNotes([]); setLoading(false); return; }
     setLoading(true);
     try {
       setNotes(await NotesService.getNotes());
@@ -104,7 +111,7 @@ export default function NotesScreen() {
         hitSlop={{ top: 10, right: 10, bottom: 10, left: 10 }}
         activeOpacity={0.7}
       >
-        <ActionIcon type="delete" size={rs(28)} />
+        <Icon name="trash-2" size={rs(18)} color={c.textTer} />
       </TouchableOpacity>
     </TouchableOpacity>
   );
@@ -115,13 +122,11 @@ export default function NotesScreen() {
     <View style={s.root}>
       {/* ── Search bar ── */}
       <View style={s.searchBar}>
-        <View style={s.searchIcon}>
-          <Text style={s.searchIconTxt}>⌕</Text>
-        </View>
+        <Icon name="search" size={rs(17)} color={c.textTer} />
         <TextInput
           style={s.searchInput}
           placeholder="Notizen durchsuchen …"
-          placeholderTextColor={c.textSec}
+          placeholderTextColor={c.textFaint}
           value={query}
           onChangeText={setQuery}
           returnKeyType="search"
@@ -129,7 +134,7 @@ export default function NotesScreen() {
         />
         {query.length > 0 && (
           <TouchableOpacity onPress={() => setQuery('')} style={s.clearBtn} activeOpacity={0.7}>
-            <Text style={s.clearTxt}>✕</Text>
+            <Icon name="x" size={rs(15)} color={c.textTer} />
           </TouchableOpacity>
         )}
       </View>
@@ -148,16 +153,18 @@ export default function NotesScreen() {
         renderItem={renderNote}
         contentContainerStyle={[
           s.list,
-          { paddingBottom: TAB_BAR_HEIGHT + rs(80) },
+          { paddingBottom: rs(56) + safeBot + rs(80) },
         ]}
         ListEmptyComponent={
           <View style={s.empty}>
-            <Text style={s.emptyIcon}>📝</Text>
+            <View style={s.emptyMark}>
+              <Icon name="sticky-note" size={rs(34)} color={c.accent} stroke={1.4} />
+            </View>
             <Text style={s.emptyTitle}>
-              {query ? 'Keine Treffer' : 'Noch keine Notizen'}
+              {query ? 'Keine Treffer' : 'Keine Notizen'}
             </Text>
             <Text style={s.emptySub}>
-              {query ? 'Anderen Suchbegriff versuchen' : 'Tippe + um eine Notiz zu erstellen'}
+              {query ? 'Anderen Suchbegriff versuchen' : 'Passwörter, Codes, alles Vertrauliche — verschlüsselt notiert.'}
             </Text>
           </View>
         }
@@ -165,14 +172,14 @@ export default function NotesScreen() {
 
       {/* ── FAB ── */}
       <TouchableOpacity style={s.fab} onPress={openCreate} activeOpacity={0.85}>
-        <Text style={s.fabTxt}>+</Text>
+        <Icon name="plus" size={rs(24)} color={c.accentFg} stroke={2.2} />
       </TouchableOpacity>
 
       {/* ── Full-screen note editor ── */}
       <Modal
         visible={editorVisible}
-        animationType="slide"
-        presentationStyle="fullScreen"
+        animationType="fade"
+        statusBarTranslucent
         onRequestClose={closeEditor}
       >
         {editorVisible && (
@@ -208,35 +215,26 @@ const s = StyleSheet.create({
   searchBar: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: c.card,
+    gap: rs(10),
+    backgroundColor: c.inset,
     marginHorizontal: rs(16),
-    marginTop: rs(12),
+    marginTop: rs(8),
     marginBottom: rs(4),
-    borderRadius: rs(12),
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: c.border,
-    paddingHorizontal: rs(12),
-    height: rs(44),
-  },
-  searchIcon: {
-    marginRight: rs(6),
-  },
-  searchIconTxt: {
-    fontSize: rs(18),
-    color: c.textSec,
+    borderRadius: radius.input,
+    borderWidth: 1,
+    borderColor: c.border2,
+    paddingHorizontal: rs(13),
+    height: rs(46),
   },
   searchInput: {
     flex: 1,
-    fontSize: rs(15),
+    fontFamily: font.mono,
+    fontSize: rs(14),
     color: c.text,
     paddingVertical: 0,
   },
   clearBtn: {
     padding: rs(4),
-  },
-  clearTxt: {
-    fontSize: rs(13),
-    color: c.textSec,
   },
 
   // Strip
@@ -245,11 +243,11 @@ const s = StyleSheet.create({
     paddingVertical: rs(8),
   },
   stripTxt: {
-    fontSize: rs(12),
-    fontWeight: '500',
-    color: c.textSec,
+    fontFamily: font.mono,
+    fontSize: rs(10.5),
+    color: c.textTer,
     textTransform: 'uppercase',
-    letterSpacing: 0.4,
+    letterSpacing: rs(1),
   },
 
   // List
@@ -262,36 +260,35 @@ const s = StyleSheet.create({
   card: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: c.card,
-    borderRadius: rs(14),
-    borderWidth: StyleSheet.hairlineWidth,
+    backgroundColor: c.surface,
+    borderRadius: radius.card,
+    borderWidth: 1,
     borderColor: c.border,
-    marginBottom: rs(10),
+    marginBottom: rs(8),
     overflow: 'hidden',
   },
   cardBar: {
-    width: rs(3),
+    width: rs(2),
     alignSelf: 'stretch',
     backgroundColor: c.accent,
-    borderTopLeftRadius: rs(14),
-    borderBottomLeftRadius: rs(14),
   },
   cardBody: {
     flex: 1,
     paddingVertical: rs(13),
-    paddingHorizontal: rs(12),
+    paddingHorizontal: rs(13),
   },
   cardTitle: {
-    fontSize: rs(15),
-    fontWeight: '600',
+    fontFamily: font.displaySemi,
+    fontSize: rs(17),
     color: c.text,
-    marginBottom: rs(3),
+    marginBottom: rs(4),
   },
   cardPreview: {
+    fontFamily: font.sans,
     fontSize: rs(13),
     color: c.textSec,
     lineHeight: rs(19),
-    marginBottom: rs(6),
+    marginBottom: rs(7),
   },
   cardMeta: {
     flexDirection: 'row',
@@ -299,23 +296,25 @@ const s = StyleSheet.create({
     gap: rs(8),
   },
   cardDate: {
-    fontSize: rs(11),
-    color: c.textTer,
-    fontWeight: '500',
+    fontFamily: font.mono,
+    fontSize: rs(10.5),
+    color: c.textFaint,
+    letterSpacing: rs(0.3),
   },
 
   // Badge (category)
   badge: {
     backgroundColor: c.accentDim,
-    borderRadius: rs(4),
-    paddingHorizontal: rs(6),
-    paddingVertical: rs(2),
+    borderRadius: rs(2),
+    paddingHorizontal: rs(7),
+    paddingVertical: rs(3),
   },
   badgeTxt: {
-    fontSize: rs(10),
-    fontWeight: '600',
+    fontFamily: font.monoBold,
+    fontSize: rs(9.5),
     color: c.accent,
-    letterSpacing: 0.2,
+    letterSpacing: rs(0.6),
+    textTransform: 'uppercase',
   },
 
   // Delete button
@@ -328,48 +327,45 @@ const s = StyleSheet.create({
   // Empty state
   empty: {
     alignItems: 'center',
-    paddingTop: rs(80),
+    paddingTop: rs(72),
     paddingHorizontal: rs(40),
   },
-  emptyIcon: {
-    fontSize: rs(48),
-    marginBottom: rs(16),
+  emptyMark: {
+    width: rs(78),
+    height: rs(78),
+    borderWidth: 1.5,
+    borderColor: c.border2,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: rs(22),
   },
   emptyTitle: {
-    fontSize: rs(17),
-    fontWeight: '600',
-    color: c.textSec,
-    marginBottom: rs(6),
+    fontFamily: font.displaySemi,
+    fontSize: rs(22),
+    color: c.text,
+    marginBottom: rs(10),
     textAlign: 'center',
   },
   emptySub: {
+    fontFamily: font.sans,
     fontSize: rs(14),
     color: c.textTer,
     textAlign: 'center',
     lineHeight: rs(20),
+    maxWidth: rs(260),
   },
 
   // FAB
   fab: {
     position: 'absolute',
     right: rs(20),
-    bottom: TAB_BAR_HEIGHT + rs(16),
-    width: rs(56),
-    height: rs(56),
-    borderRadius: rs(28),
+    bottom: rs(20),
+    width: rs(52),
+    height: rs(52),
+    borderRadius: radius.card,
     backgroundColor: c.accent,
     alignItems: 'center',
     justifyContent: 'center',
-    shadowColor: c.accent,
-    shadowOffset: { width: 0, height: rs(4) },
-    shadowOpacity: 0.45,
-    shadowRadius: rs(10),
-    elevation: 8,
-  },
-  fabTxt: {
-    fontSize: rs(32),
-    color: '#fff',
-    fontWeight: '300',
-    lineHeight: rs(38),
+    elevation: 6,
   },
 });

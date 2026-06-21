@@ -1,29 +1,36 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View, Text, TouchableOpacity, StyleSheet,
   FlatList, Alert, ActivityIndicator, Modal,
-  TouchableWithoutFeedback, Image, Animated,
+  TouchableWithoutFeedback, Image,
 } from 'react-native';
 import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
 import { FileManager, FileMetadata } from '../services/FileManager';
 import { SecureCryptoService } from '../services/CryptoService';
+import { AutoLockService } from '../services/AutoLockService';
 import FileIcon from '../components/FileIcon';
-import { c, rs, TAB_BAR_HEIGHT, fileColor } from '../theme';
+import FileViewer from '../components/FileViewer';
+import Icon from '../components/Icon';
+import { c, rs, font, radius, TAB_BAR_HEIGHT, useBottomInset, fileColor } from '../theme';
 
 const FREE_LIMIT = 10;
 
-export default function FilesView() {
+export default function FilesView({ isDecoy = false }: { isDecoy?: boolean }) {
   const [files,    setFiles]    = useState<FileMetadata[]>([]);
   const [loading,  setLoading]  = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [showPicker, setShowPicker] = useState(false);
-  const [preview,    setPreview]    = useState<{ uri: string; type: 'image' | 'video' } | null>(null);
+  const [viewerFile, setViewerFile] = useState<FileMetadata | null>(null);
+  const [thumbs,     setThumbs]     = useState<Record<string, string>>({});
   const [initialized, setInitialized] = useState(false);
-
-  const overlayOpacity = useRef(new Animated.Value(0)).current;
+  const safeBot = useBottomInset();
 
   useEffect(() => { initialize(); }, []);
+
+  // Dateien laden, sobald die Services bereit sind — sonst bleibt die Liste beim
+  // erneuten Öffnen leer (es gab keinen initialen Ladevorgang nach der Init).
+  useEffect(() => { if (initialized) loadFiles(); }, [initialized]);
 
   const initialize = async () => {
     try {
@@ -36,15 +43,32 @@ export default function FilesView() {
     }
   };
 
+  // Kein initialized-Guard: FileManager.getFiles() initialisiert sich selbst.
   const loadFiles = async () => {
-    if (!initialized) return;
+    if (isDecoy) { setFiles([]); setLoading(false); return; }
     setLoading(true);
     try {
-      setFiles(await FileManager.getFiles());
+      const loaded = await FileManager.getFiles();
+      setFiles(loaded);
+      loadThumbs(loaded);
     } catch {
       Alert.alert('Fehler', 'Dateien konnten nicht geladen werden.');
     } finally {
       setLoading(false);
+    }
+  };
+
+  // Lazy: entschlüsselt Bild-Inhalte für Listen-Thumbnails. Nur Bilder; bei einem
+  // Free-Limit von 10 Dateien ist das vertretbar. Bereits geladene werden übersprungen.
+  const loadThumbs = async (list: FileMetadata[]) => {
+    for (const f of list) {
+      if (f.type !== 'image') continue;
+      try {
+        const b64 = await FileManager.getFileContent(f.id);
+        setThumbs(prev => prev[f.id] ? prev : { ...prev, [f.id]: `data:image/jpeg;base64,${b64}` });
+      } catch {
+        // Thumbnail-Fehler ignorieren — Karte fällt auf das Icon zurück.
+      }
     }
   };
 
@@ -72,6 +96,7 @@ export default function FilesView() {
 
   const pickGallery = async () => {
     setShowPicker(false);
+    AutoLockService.beginPickerSession();
     try {
       const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
       if (!perm.granted) {
@@ -81,31 +106,72 @@ export default function FilesView() {
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ImagePicker.MediaTypeOptions.ImagesAndVideos,
         allowsEditing: false,
+        allowsMultipleSelection: true,
         quality: 1,
-      });
-      if (!result.canceled && result.assets?.[0]) {
-        const asset = result.assets[0];
-        await saveFile(asset.uri, 'image', asset.fileName ?? 'Bild');
+      } as any);
+      if (!result.canceled && result.assets?.length) {
+        setLoading(true);
+        let saved = 0;
+        for (const asset of result.assets) {
+          const currentFiles = await FileManager.getFiles();
+          if (currentFiles.length >= FREE_LIMIT) {
+            Alert.alert('Limit erreicht', `Kostenlose Version: max. ${FREE_LIMIT} Dateien. ${saved} von ${result.assets.length} importiert.`);
+            break;
+          }
+          const assetType = (asset as any).type;
+          const type: 'video' | 'image' = assetType === 'video' ? 'video' : 'image';
+          await saveFileNoReload(asset.uri, type, asset.fileName ?? (type === 'video' ? 'Video' : 'Bild'));
+          saved++;
+        }
+        await loadFiles();
+        setLoading(false);
       }
     } catch (e) {
       Alert.alert('Fehler', `Importfehler: ${String(e)}`);
+      setLoading(false);
+    } finally {
+      AutoLockService.endPickerSession();
     }
   };
 
   const pickDocument = async () => {
     setShowPicker(false);
+    AutoLockService.beginPickerSession();
     await new Promise(r => setTimeout(r, 300));
     try {
       const result = await DocumentPicker.getDocumentAsync({
         type: '*/*',
         copyToCacheDirectory: true,
-      });
-      if (!result.canceled && result.assets?.[0]) {
-        const asset = result.assets[0];
-        await saveFile(asset.uri, 'document', asset.name ?? 'Dokument');
+        multiple: true,
+      } as any);
+      if (!result.canceled && result.assets?.length) {
+        setLoading(true);
+        let saved = 0;
+        for (const asset of result.assets) {
+          const currentFiles = await FileManager.getFiles();
+          if (currentFiles.length >= FREE_LIMIT) {
+            Alert.alert('Limit erreicht', `Kostenlose Version: max. ${FREE_LIMIT} Dateien. ${saved} von ${result.assets.length} importiert.`);
+            break;
+          }
+          await saveFileNoReload(asset.uri, 'document', asset.name ?? 'Dokument');
+          saved++;
+        }
+        await loadFiles();
+        setLoading(false);
       }
     } catch (e) {
       Alert.alert('Fehler', `Importfehler: ${String(e)}`);
+      setLoading(false);
+    } finally {
+      AutoLockService.endPickerSession();
+    }
+  };
+
+  const saveFileNoReload = async (uri: string, type: 'image' | 'video' | 'document', name: string) => {
+    try {
+      await FileManager.saveFile(uri, type, name);
+    } catch (e) {
+      Alert.alert('Fehler', `Datei konnte nicht gespeichert werden: ${String(e)}`);
     }
   };
 
@@ -145,25 +211,6 @@ export default function FilesView() {
     );
   };
 
-  // ── Preview (images) ───────────────────────────────────────────────
-
-  const openPreview = async (file: FileMetadata) => {
-    if (file.type !== 'image') return;
-    try {
-      const b64 = await FileManager.getFileContent(file.id);
-      const uri = `data:image/jpeg;base64,${b64}`;
-      setPreview({ uri, type: file.type });
-      Animated.timing(overlayOpacity, { toValue: 1, duration: 220, useNativeDriver: true }).start();
-    } catch {
-      Alert.alert('Fehler', 'Bild konnte nicht geladen werden.');
-    }
-  };
-
-  const closePreview = () => {
-    Animated.timing(overlayOpacity, { toValue: 0, duration: 180, useNativeDriver: true })
-      .start(() => setPreview(null));
-  };
-
   // ── Render file card ───────────────────────────────────────────────
 
   const renderItem = ({ item }: { item: FileMetadata }) => {
@@ -174,7 +221,7 @@ export default function FilesView() {
     return (
       <TouchableOpacity
         style={[s.card, isSelected && s.cardSelected]}
-        onPress={() => isSelecting ? toggleSelect(item.id) : openPreview(item)}
+        onPress={() => isSelecting ? toggleSelect(item.id) : setViewerFile(item)}
         onLongPress={() => toggleSelect(item.id)}
         activeOpacity={0.72}
         delayLongPress={350}
@@ -182,9 +229,18 @@ export default function FilesView() {
         {/* Type-colored left bar */}
         <View style={[s.cardBar, { backgroundColor: fc.accent }]} />
 
-        {/* Icon */}
+        {/* Thumbnail (images) or type icon + EXT badge */}
         <View style={[s.iconWrap, { backgroundColor: fc.dim }]}>
-          <FileIcon type={item.type} size={rs(28)} color={fc.accent} />
+          {item.type === 'image' && thumbs[item.id] ? (
+            <Image source={{ uri: thumbs[item.id] }} style={s.thumb} resizeMode="cover" />
+          ) : (
+            <View style={s.iconContent}>
+              <FileIcon type={item.type} size={rs(22)} color={fc.accent} />
+              <Text style={s.extBadge} numberOfLines={1}>
+                {item.originalName.split('.').pop()?.toUpperCase().slice(0, 4) ?? item.type.toUpperCase().slice(0, 3)}
+              </Text>
+            </View>
+          )}
         </View>
 
         {/* Info */}
@@ -198,7 +254,7 @@ export default function FilesView() {
         {/* Selection indicator OR delete button */}
         {isSelecting ? (
           <View style={[s.checkCircle, isSelected && s.checkCircleOn]}>
-            {isSelected && <Text style={s.checkMark}>✓</Text>}
+            {isSelected && <Icon name="check" size={rs(14)} color={c.accentFg} stroke={2.4} />}
           </View>
         ) : (
           <TouchableOpacity
@@ -207,7 +263,7 @@ export default function FilesView() {
             hitSlop={{ top: 10, right: 10, bottom: 10, left: 10 }}
             activeOpacity={0.7}
           >
-            <Text style={s.deleteTxt}>✕</Text>
+            <Icon name="x" size={rs(17)} color={c.textTer} />
           </TouchableOpacity>
         )}
       </TouchableOpacity>
@@ -270,14 +326,16 @@ export default function FilesView() {
         renderItem={renderItem}
         contentContainerStyle={[
           s.list,
-          { paddingBottom: TAB_BAR_HEIGHT + rs(88) },
+          { paddingBottom: rs(56) + safeBot + rs(88) },
         ]}
         ListEmptyComponent={!loading ? (
           <View style={s.empty}>
-            <Text style={s.emptyIcon}>🔐</Text>
+            <View style={s.emptyMark}>
+              <Icon name="shield" size={rs(38)} color={c.accent} stroke={1.4} />
+            </View>
             <Text style={s.emptyTitle}>Tresor ist leer</Text>
             <Text style={s.emptySub}>
-              Importiere Dateien über den + Button
+              Importiere dein erstes Dokument oder Foto. Alles wird sofort verschlüsselt.
             </Text>
           </View>
         ) : null}
@@ -286,7 +344,7 @@ export default function FilesView() {
       {/* FAB — import button */}
       {selected.size === 0 && (
         <TouchableOpacity style={s.fab} onPress={handleImport} activeOpacity={0.85}>
-          <Text style={s.fabTxt}>+</Text>
+          <Icon name="plus" size={rs(24)} color={c.accentFg} stroke={2.2} />
         </TouchableOpacity>
       )}
 
@@ -305,25 +363,25 @@ export default function FilesView() {
                 <Text style={s.sheetTitle}>Datei importieren</Text>
 
                 <TouchableOpacity style={s.sheetOption} onPress={pickGallery} activeOpacity={0.75}>
-                  <View style={[s.sheetOptionIcon, { backgroundColor: fileColor.image.dim }]}>
-                    <Text style={s.sheetOptionEmoji}>🖼️</Text>
+                  <View style={s.sheetOptionIcon}>
+                    <Icon name="image" size={rs(20)} color={c.accent} />
                   </View>
                   <View style={s.sheetOptionInfo}>
                     <Text style={s.sheetOptionTitle}>Galerie</Text>
                     <Text style={s.sheetOptionSub}>Fotos & Videos auswählen</Text>
                   </View>
-                  <Text style={s.sheetChevron}>›</Text>
+                  <Icon name="chevron-right" size={rs(18)} color={c.textTer} />
                 </TouchableOpacity>
 
                 <TouchableOpacity style={s.sheetOption} onPress={pickDocument} activeOpacity={0.75}>
-                  <View style={[s.sheetOptionIcon, { backgroundColor: fileColor.document.dim }]}>
-                    <Text style={s.sheetOptionEmoji}>📄</Text>
+                  <View style={s.sheetOptionIcon}>
+                    <Icon name="file" size={rs(20)} color={c.accent} />
                   </View>
                   <View style={s.sheetOptionInfo}>
                     <Text style={s.sheetOptionTitle}>Dateien</Text>
                     <Text style={s.sheetOptionSub}>Dokumente und andere Dateien</Text>
                   </View>
-                  <Text style={s.sheetChevron}>›</Text>
+                  <Icon name="chevron-right" size={rs(18)} color={c.textTer} />
                 </TouchableOpacity>
 
                 <TouchableOpacity style={s.sheetCancel} onPress={() => setShowPicker(false)} activeOpacity={0.7}>
@@ -335,22 +393,8 @@ export default function FilesView() {
         </TouchableWithoutFeedback>
       </Modal>
 
-      {/* ── Image preview overlay ── */}
-      {preview && (
-        <Animated.View style={[s.previewOverlay, { opacity: overlayOpacity }]}>
-          <TouchableWithoutFeedback onPress={closePreview}>
-            <View style={s.previewBg} />
-          </TouchableWithoutFeedback>
-          <Image
-            source={{ uri: preview.uri }}
-            style={s.previewImage}
-            resizeMode="contain"
-          />
-          <TouchableOpacity style={s.previewClose} onPress={closePreview} activeOpacity={0.7}>
-            <Text style={s.previewCloseTxt}>✕</Text>
-          </TouchableOpacity>
-        </Animated.View>
-      )}
+      {/* ── In-App File Viewer (alle Typen) ── */}
+      <FileViewer file={viewerFile} onClose={() => setViewerFile(null)} />
     </View>
   );
 }
@@ -395,24 +439,22 @@ const s = StyleSheet.create({
     gap: rs(10),
   },
   statsTxt: {
-    fontSize: rs(12),
-    fontWeight: '500',
-    color: c.textSec,
+    fontFamily: font.mono,
+    fontSize: rs(10.5),
+    color: c.textTer,
     textTransform: 'uppercase',
-    letterSpacing: 0.4,
-    minWidth: rs(100),
+    letterSpacing: rs(1),
+    minWidth: rs(110),
   },
   storageBar: {
     flex: 1,
     height: rs(3),
-    backgroundColor: c.card,
-    borderRadius: rs(2),
+    backgroundColor: c.inset,
     overflow: 'hidden',
   },
   storageFill: {
     height: '100%',
     backgroundColor: c.accent,
-    borderRadius: rs(2),
   },
 
   // Selection bar
@@ -428,17 +470,18 @@ const s = StyleSheet.create({
   },
   selBtn: { minWidth: rs(80) },
   selCount: {
-    fontSize: rs(14),
-    fontWeight: '600',
+    fontFamily: font.monoBold,
+    fontSize: rs(13),
     color: c.text,
   },
   selCancelTxt: {
-    fontSize: rs(14),
+    fontFamily: font.mono,
+    fontSize: rs(13),
     color: c.accent,
   },
   selDeleteTxt: {
-    fontSize: rs(14),
-    fontWeight: '600',
+    fontFamily: font.monoBold,
+    fontSize: rs(13),
     color: c.danger,
     textAlign: 'right',
   },
@@ -452,7 +495,8 @@ const s = StyleSheet.create({
     paddingVertical: rs(6),
   },
   loadingTxt: {
-    fontSize: rs(13),
+    fontFamily: font.mono,
+    fontSize: rs(12),
     color: c.textSec,
   },
 
@@ -466,11 +510,11 @@ const s = StyleSheet.create({
   card: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: c.card,
-    borderRadius: rs(14),
-    borderWidth: StyleSheet.hairlineWidth,
+    backgroundColor: c.surface,
+    borderRadius: radius.card,
+    borderWidth: 1,
     borderColor: c.border,
-    marginBottom: rs(10),
+    marginBottom: rs(8),
     overflow: 'hidden',
   },
   cardSelected: {
@@ -478,16 +522,33 @@ const s = StyleSheet.create({
     backgroundColor: c.accentDim,
   },
   cardBar: {
-    width: rs(3),
+    width: rs(2),
     alignSelf: 'stretch',
   },
   iconWrap: {
-    width: rs(46),
-    height: rs(46),
-    borderRadius: rs(10),
+    width: rs(44),
+    height: rs(44),
     margin: rs(12),
     alignItems: 'center',
     justifyContent: 'center',
+    overflow: 'hidden',
+    backgroundColor: c.inset,
+  },
+  thumb: {
+    width: '100%',
+    height: '100%',
+  },
+  iconContent: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: rs(2),
+  },
+  extBadge: {
+    fontFamily: font.monoBold,
+    fontSize: rs(8),
+    color: c.accent,
+    letterSpacing: rs(0.5),
+    textAlign: 'center',
   },
   cardInfo: {
     flex: 1,
@@ -495,23 +556,24 @@ const s = StyleSheet.create({
     paddingRight: rs(4),
   },
   cardName: {
-    fontSize: rs(14),
-    fontWeight: '600',
+    fontFamily: font.sansMed,
+    fontSize: rs(15),
     color: c.text,
-    marginBottom: rs(3),
+    marginBottom: rs(4),
   },
   cardMeta: {
-    fontSize: rs(12),
-    color: c.textSec,
+    fontFamily: font.mono,
+    fontSize: rs(11),
+    color: c.textTer,
+    letterSpacing: rs(0.3),
   },
 
   // Check circle (multi-select)
   checkCircle: {
     width: rs(24),
     height: rs(24),
-    borderRadius: rs(12),
     borderWidth: 1.5,
-    borderColor: c.textSec,
+    borderColor: c.textTer,
     marginRight: rs(14),
     alignItems: 'center',
     justifyContent: 'center',
@@ -520,11 +582,6 @@ const s = StyleSheet.create({
     backgroundColor: c.accent,
     borderColor: c.accent,
   },
-  checkMark: {
-    fontSize: rs(13),
-    color: '#fff',
-    fontWeight: '700',
-  },
 
   // Delete button
   deleteBtn: {
@@ -532,54 +589,49 @@ const s = StyleSheet.create({
     alignSelf: 'stretch',
     justifyContent: 'center',
   },
-  deleteTxt: {
-    fontSize: rs(15),
-    color: c.danger,
-    fontWeight: '400',
-  },
 
   // Empty state
   empty: {
     alignItems: 'center',
-    paddingTop: rs(80),
+    paddingTop: rs(72),
     paddingHorizontal: rs(40),
   },
-  emptyIcon: { fontSize: rs(52), marginBottom: rs(16) },
+  emptyMark: {
+    width: rs(78),
+    height: rs(78),
+    borderWidth: 1.5,
+    borderColor: c.border2,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: rs(22),
+  },
   emptyTitle: {
-    fontSize: rs(18),
-    fontWeight: '600',
-    color: c.textSec,
-    marginBottom: rs(6),
+    fontFamily: font.displaySemi,
+    fontSize: rs(22),
+    color: c.text,
+    marginBottom: rs(10),
   },
   emptySub: {
+    fontFamily: font.sans,
     fontSize: rs(14),
     color: c.textTer,
     textAlign: 'center',
     lineHeight: rs(20),
+    maxWidth: rs(260),
   },
 
   // FAB
   fab: {
     position: 'absolute',
     right: rs(20),
-    bottom: TAB_BAR_HEIGHT + rs(16),
-    width: rs(56),
-    height: rs(56),
-    borderRadius: rs(28),
+    bottom: rs(20),
+    width: rs(52),
+    height: rs(52),
+    borderRadius: radius.card,
     backgroundColor: c.accent,
     alignItems: 'center',
     justifyContent: 'center',
-    shadowColor: c.accent,
-    shadowOffset: { width: 0, height: rs(4) },
-    shadowOpacity: 0.45,
-    shadowRadius: rs(10),
-    elevation: 8,
-  },
-  fabTxt: {
-    fontSize: rs(32),
-    color: '#fff',
-    fontWeight: '300',
-    lineHeight: rs(38),
+    elevation: 6,
   },
 
   // Bottom sheet
@@ -590,23 +642,24 @@ const s = StyleSheet.create({
   },
   sheet: {
     backgroundColor: c.surface,
-    borderTopLeftRadius: rs(20),
-    borderTopRightRadius: rs(20),
+    borderTopWidth: 1,
+    borderColor: c.border2,
+    borderTopLeftRadius: radius.card,
+    borderTopRightRadius: radius.card,
     paddingTop: rs(10),
     paddingHorizontal: rs(16),
     paddingBottom: rs(34),
   },
   sheetHandle: {
-    width: rs(36),
-    height: rs(4),
-    borderRadius: rs(2),
-    backgroundColor: c.border,
+    width: rs(34),
+    height: rs(3),
+    backgroundColor: c.border2,
     alignSelf: 'center',
     marginBottom: rs(16),
   },
   sheetTitle: {
+    fontFamily: font.displaySemi,
     fontSize: rs(17),
-    fontWeight: '700',
     color: c.text,
     marginBottom: rs(16),
     paddingHorizontal: rs(4),
@@ -614,83 +667,48 @@ const s = StyleSheet.create({
   sheetOption: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: c.card,
-    borderRadius: rs(12),
+    backgroundColor: c.surface2,
+    borderRadius: radius.card,
     padding: rs(14),
     marginBottom: rs(10),
-    borderWidth: StyleSheet.hairlineWidth,
+    borderWidth: 1,
     borderColor: c.border,
     gap: rs(12),
   },
   sheetOptionIcon: {
-    width: rs(44),
-    height: rs(44),
-    borderRadius: rs(10),
+    width: rs(40),
+    height: rs(40),
+    borderRadius: rs(2),
+    backgroundColor: c.accentDim,
     alignItems: 'center',
     justifyContent: 'center',
   },
-  sheetOptionEmoji: { fontSize: rs(22) },
   sheetOptionInfo: { flex: 1 },
   sheetOptionTitle: {
+    fontFamily: font.sansMed,
     fontSize: rs(15),
-    fontWeight: '600',
     color: c.text,
     marginBottom: rs(2),
   },
   sheetOptionSub: {
-    fontSize: rs(12),
-    color: c.textSec,
-  },
-  sheetChevron: {
-    fontSize: rs(20),
-    color: c.textSec,
-    fontWeight: '300',
+    fontFamily: font.mono,
+    fontSize: rs(11),
+    color: c.textTer,
   },
   sheetCancel: {
-    backgroundColor: c.card,
-    borderRadius: rs(12),
+    backgroundColor: c.surface2,
+    borderRadius: radius.card,
     padding: rs(14),
     alignItems: 'center',
-    borderWidth: StyleSheet.hairlineWidth,
+    borderWidth: 1,
     borderColor: c.border,
     marginTop: rs(4),
   },
   sheetCancelTxt: {
-    fontSize: rs(15),
-    fontWeight: '600',
+    fontFamily: font.monoBold,
+    fontSize: rs(13),
+    letterSpacing: rs(1),
+    textTransform: 'uppercase',
     color: c.danger,
-  },
-
-  // Image preview
-  previewOverlay: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(0,0,0,0.92)',
-    alignItems: 'center',
-    justifyContent: 'center',
-    zIndex: 100,
-  },
-  previewBg: {
-    ...StyleSheet.absoluteFillObject,
-  },
-  previewImage: {
-    width: '92%',
-    height: '72%',
-    borderRadius: rs(10),
-  },
-  previewClose: {
-    position: 'absolute',
-    top: rs(56),
-    right: rs(20),
-    width: rs(36),
-    height: rs(36),
-    borderRadius: rs(18),
-    backgroundColor: 'rgba(255,255,255,0.12)',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  previewCloseTxt: {
-    fontSize: rs(16),
-    color: c.text,
-    fontWeight: '400',
   },
 });

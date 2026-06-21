@@ -7,10 +7,13 @@ import {
 import * as LocalAuthentication from 'expo-local-authentication';
 import * as SecureStore from 'expo-secure-store';
 import { SecureCryptoService } from '../services/CryptoService';
+import { KeyRotationService } from '../services/KeyRotationService';
+import { PanicService } from '../services/PanicService';
 import { DeviceSecurityService } from '../services/DeviceSecurityService';
 import { SettingsService, AppSettings } from '../services/SettingsService';
-import LockIcon from '../components/LockIcon';
-import { c, rs, SAFE_TOP, SAFE_BOTTOM } from '../theme';
+import VaultMark, { CornerFrame } from '../components/VaultMark';
+import Icon from '../components/Icon';
+import { c, rs, font, radius, SAFE_TOP, SAFE_BOTTOM, useBottomInset } from '../theme';
 
 const ATTEMPTS_KEY = 'filevault_auth_attempts';
 
@@ -21,6 +24,7 @@ interface Props {
 }
 
 export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault }: Props) {
+  const safeBot = useBottomInset();
   const [pass, setPass]           = useState('');
   const [confirm, setConfirm]     = useState('');
   const [phase, setPhase]         = useState<'enter' | 'confirm'>('enter');
@@ -113,6 +117,14 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
       } catch {}
     } else {
       try {
+        // If a key rotation was interrupted, it can only be finished after a
+        // passphrase login (resume needs the passphrase to re-install the master
+        // key). Skip biometric auto-unlock so the user enters the passphrase and
+        // resumeRotationIfNeeded() runs — otherwise content stays half-migrated.
+        if (await KeyRotationService.hasPendingRotation()) {
+          showError('Bitte Passwort eingeben (Wartung läuft)');
+          return;
+        }
         const success = await SecureCryptoService.loadMasterKeyForBiometric();
         if (success) {
           setUnlocking(true);
@@ -138,11 +150,61 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
         return;
       }
 
-      const isValid = await SecureCryptoService.unlock(entered);
+      // R-01: Run BOTH checks always so neither path leaks timing info.
+      // unlock() loads the real master key into cache if correct.
+      // verifyPanicPin() is independent and never touches the real master key.
+      const [panicMatch, realMatch] = await Promise.all([
+        PanicService.verifyPanicPin(entered),
+        SecureCryptoService.unlock(entered),
+      ]);
 
-      if (isValid) {
+      if (panicMatch) {
+        // Panic PIN entered: clear master key cache first, then dispatch configured action.
+        SecureCryptoService.clearAllCaches();
+        const triggerAction = await PanicService.getTriggerAction();
+
+        if (triggerAction === 'wipe' || triggerAction === 'all') {
+          // Wipe vault — resets to first-launch state.
+          try { await onWipeVault?.(); } catch {}
+          return;
+        }
+
+        if (triggerAction === 'lock') {
+          // Permanent lock for 1 year.
+          const lockUntil = Date.now() + 365 * 24 * 60 * 60 * 1000;
+          try { await SecureStore.setItemAsync('filevault_lock_until', lockUntil.toString()); } catch {}
+          showError('App dauerhaft gesperrt.');
+          setPass('');
+          return;
+        }
+
+        // 'decoy' (default fallback): navigate to main screen without master key.
+        // The decoy flag hides real data in FilesView and NotesScreen.
+        try {
+          await SecureStore.setItemAsync('filevault_decoy_activated', 'true');
+        } catch {
+          showError('Sicherheitsfehler — Decoy konnte nicht aktiviert werden');
+          setPass('');
+          return;
+        }
         setFailedAttempts(0);
         await SecureStore.deleteItemAsync(ATTEMPTS_KEY);
+        setUnlocking(true);
+        setTimeout(doAuth, 300);
+        return;
+      }
+
+      if (realMatch) {
+        setFailedAttempts(0);
+        await SecureStore.deleteItemAsync(ATTEMPTS_KEY);
+        // Finish any key rotation that was interrupted by a crash/power-loss.
+        // Needs the passphrase (to re-install the new master) and the unlocked
+        // master key in cache — both available right here. Never block login on it.
+        try {
+          await KeyRotationService.resumeRotationIfNeeded(entered);
+        } catch (e) {
+          console.error('KeyRotation: resume after unlock failed:', e);
+        }
         setUnlocking(true);
         setTimeout(doAuth, 300);
       } else {
@@ -189,7 +251,7 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
       return;
     }
 
-    const minLen = appSettings?.minPinLength ?? 6;
+    const minLen = appSettings?.minPinLength ?? 12;
     if (entered.length < minLen) {
       showError(`Mindestens ${minLen} Zeichen erforderlich`);
       setConfirm('');
@@ -198,10 +260,11 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
 
     setIsHashing(true);
     try {
-      await Promise.all([
-        SecureCryptoService.setupMasterKey(entered),
-        SecureCryptoService.setAppInitialized(true),
-      ]);
+      // Sequential: setAppInitialized only after setupMasterKey succeeds.
+      // If setupMasterKey throws (e.g. crypto error), the app must NOT appear
+      // initialized — otherwise the user gets stuck on "Entsperren" with no key.
+      await SecureCryptoService.setupMasterKey(entered);
+      await SecureCryptoService.setAppInitialized(true);
       setUnlocking(true);
       setTimeout(doAuth, 300);
     } catch (error) {
@@ -215,7 +278,7 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
 
   const handleAdvance = () => {
     const current = phase === 'confirm' ? confirm : pass;
-    const minLen = appSettings?.minPinLength ?? 6;
+    const minLen = appSettings?.minPinLength ?? 12;
     if (current.length < minLen || unlocking || isHashing) return;
 
     if (isFirstLaunch && phase === 'enter') {
@@ -237,7 +300,7 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
 
   const currentVal  = phase === 'confirm' ? confirm : pass;
   const setCurrentVal = phase === 'confirm' ? setConfirm : setPass;
-  const minLen = appSettings?.minPinLength ?? 6;
+  const minLen = appSettings?.minPinLength ?? 12;
   const canAdvance  = currentVal.length >= minLen && !unlocking && !isHashing;
 
   const phaseLabel = isFirstLaunch
@@ -251,7 +314,7 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
     ? 'Biometrie bestätigt — Passwort eingeben'
     : isFirstLaunch
     ? (() => {
-        const minLen = appSettings?.minPinLength ?? 6;
+        const minLen = appSettings?.minPinLength ?? 12;
         return (phase === 'enter' ? `Mindestens ${minLen} Zeichen` : 'Passwort erneut eingeben');
       })()
     : 'Geben Sie Ihr Passwort ein';
@@ -260,34 +323,56 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
     ? (phase === 'enter' ? 'Weiter' : 'Speichern')
     : 'Entsperren';
 
+  // H4: lightweight, no-dependency strength estimate (charset × length → bits).
+  const strength = (() => {
+    const pw = currentVal;
+    if (!pw) return { label: '', frac: 0, color: c.border };
+    let charset = 0;
+    if (/[a-z]/.test(pw)) charset += 26;
+    if (/[A-Z]/.test(pw)) charset += 26;
+    if (/[0-9]/.test(pw)) charset += 10;
+    if (/[^a-zA-Z0-9]/.test(pw)) charset += 32;
+    const bits = pw.length * Math.log2(charset || 1);
+    const frac = Math.min(bits / 90, 1);
+    if (bits >= 70) return { label: 'Stark', frac, color: c.success };
+    if (bits >= 55) return { label: 'Gut', frac, color: c.warning };
+    if (bits >= 40) return { label: 'Mittel', frac, color: c.warning };
+    return { label: 'Schwach', frac, color: c.danger };
+  })();
+  const showStrength = isFirstLaunch && phase === 'enter' && currentVal.length > 0;
+
+  const segActive = Math.round(strength.frac * 4);
+
   return (
     <View style={s.root}>
       <StatusBar barStyle="light-content" backgroundColor="transparent" translucent />
 
-      {/* ── Lock icon + branding ── */}
+      {/* ── Hero: aperture mark in registration frame + wordmark ── */}
       <View style={s.brand}>
-        <LockIcon
-          locked
-          size={rs(90)}
-          animating={unlocking}
-          onAnimationComplete={doAuth}
-        />
+        <View style={s.markWrap}>
+          <CornerFrame size={rs(116)} />
+          <VaultMark size={rs(66)} locked={!unlocking} spinning={unlocking} />
+        </View>
         <Text style={s.appName}>Obscura</Text>
-        <Text style={s.phase}>{phaseLabel}</Text>
+        <View style={s.overline}>
+          <View style={s.overlineTick} />
+          <Text style={s.overlineTxt}>{phaseLabel}</Text>
+        </View>
         <Text style={s.sub}>{subtitle}</Text>
       </View>
 
       {/* ── Input + error ── */}
       <Animated.View style={[s.inputSection, { transform: [{ translateX: shakeX }] }]}>
-        <View style={s.inputRow}>
+        <View style={[s.field, errMsg ? s.fieldErr : null]}>
+          <Icon name="key" size={rs(18)} color={c.textTer} />
           <TextInput
             ref={inputRef}
             style={s.input}
             value={currentVal}
             onChangeText={v => { setCurrentVal(v); }}
             secureTextEntry={!showPass}
-            placeholder="Passwort eingeben"
-            placeholderTextColor={c.textTer}
+            placeholder="Passphrase eingeben"
+            placeholderTextColor={c.textFaint}
             autoFocus
             autoCapitalize="none"
             autoCorrect={false}
@@ -300,10 +385,25 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
             style={s.eyeBtn}
             onPress={() => setShowPass(v => !v)}
             activeOpacity={0.7}
+            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
           >
-            <Text style={s.eyeIcon}>{showPass ? '🙈' : '👁'}</Text>
+            <Icon name={showPass ? 'eye-off' : 'eye'} size={rs(18)} color={c.textTer} />
           </TouchableOpacity>
         </View>
+
+        {showStrength && (
+          <View style={s.strengthWrap}>
+            <View style={s.strength}>
+              {[0, 1, 2, 3].map(i => (
+                <View key={i} style={[s.strSeg, { backgroundColor: i < segActive ? strength.color : c.border2 }]} />
+              ))}
+            </View>
+            <View style={s.strengthRow}>
+              <Text style={s.strHint}>min. {appSettings?.minPinLength ?? 12} Zeichen</Text>
+              {!!strength.label && <Text style={[s.strLabel, { color: strength.color }]}>{strength.label}</Text>}
+            </View>
+          </View>
+        )}
         <Animated.Text style={[s.errText, { opacity: errOpacity }]}>
           {errMsg}
         </Animated.Text>
@@ -313,7 +413,8 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
       <View style={s.actions}>
         {isFirstLaunch && phase === 'confirm' && (
           <TouchableOpacity style={s.backBtn} onPress={handleBack} activeOpacity={0.7}>
-            <Text style={s.backTxt}>‹ Zurück</Text>
+            <Icon name="chevron-left" size={rs(15)} color={c.accent} />
+            <Text style={s.backTxt}>Zurück</Text>
           </TouchableOpacity>
         )}
 
@@ -321,26 +422,38 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
           style={[s.submitBtn, !canAdvance && s.submitDisabled]}
           onPress={handleAdvance}
           disabled={!canAdvance}
-          activeOpacity={0.8}
+          activeOpacity={0.85}
         >
-          {isHashing
-            ? <ActivityIndicator color="#fff" size="small" />
-            : <Text style={s.submitTxt}>{submitLabel}</Text>
-          }
+          {isHashing ? (
+            <ActivityIndicator color={c.accentFg} size="small" />
+          ) : (
+            <>
+              <Icon
+                name={isFirstLaunch ? (phase === 'confirm' ? 'shield-check' : 'chevron-right') : 'unlock'}
+                size={rs(18)}
+                color={canAdvance ? c.accentFg : c.textFaint}
+              />
+              <Text style={[s.submitTxt, !canAdvance && s.submitTxtDisabled]}>{submitLabel}</Text>
+            </>
+          )}
         </TouchableOpacity>
 
         {!isFirstLaunch && hasBio && !bioPassedFor2FA && (
-          <TouchableOpacity
-            style={s.bioBtn}
-            onPress={() => triggerBio()}
-            activeOpacity={0.7}
-          >
-            <Text style={s.bioTxt}>Biometrie verwenden</Text>
-          </TouchableOpacity>
+          <>
+            <View style={s.divider}>
+              <View style={s.divLine} />
+              <Text style={s.divTxt}>oder</Text>
+              <View style={s.divLine} />
+            </View>
+            <TouchableOpacity style={s.bioBtn} onPress={() => triggerBio()} activeOpacity={0.75}>
+              <Icon name="fingerprint" size={rs(20)} color={c.text} />
+              <Text style={s.bioTxt}>Mit Biometrie entsperren</Text>
+            </TouchableOpacity>
+          </>
         )}
       </View>
 
-      <View style={{ height: SAFE_BOTTOM + rs(8) }} />
+      <View style={{ height: safeBot + rs(8) }} />
     </View>
   );
 }
@@ -358,97 +471,173 @@ const s = StyleSheet.create({
 
   brand: {
     alignItems: 'center',
-    paddingTop: rs(12),
+    paddingTop: rs(28),
+  },
+  markWrap: {
+    width: rs(116),
+    height: rs(116),
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: rs(24),
   },
   appName: {
-    fontSize: rs(36),
-    fontWeight: '700',
+    fontFamily: font.monoBold,
+    fontSize: rs(22),
     color: c.text,
-    letterSpacing: -1,
-    marginTop: rs(20),
-    marginBottom: rs(6),
+    letterSpacing: rs(4),
+    textTransform: 'uppercase',
   },
-  phase: {
-    fontSize: rs(18),
-    fontWeight: '600',
-    color: c.text,
-    marginBottom: rs(4),
+  overline: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: rs(8),
+    marginTop: rs(12),
+  },
+  overlineTick: { width: rs(10), height: 2, backgroundColor: c.accent },
+  overlineTxt: {
+    fontFamily: font.monoBold,
+    fontSize: rs(10),
+    letterSpacing: rs(2),
+    textTransform: 'uppercase',
+    color: c.accent,
   },
   sub: {
-    fontSize: rs(14),
+    fontFamily: font.sans,
+    fontSize: rs(13.5),
     color: c.textSec,
-    letterSpacing: 0.1,
+    marginTop: rs(10),
   },
 
   inputSection: {
-    width: '88%',
+    width: '86%',
     alignSelf: 'center',
   },
-  inputRow: {
+  field: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: c.card,
-    borderRadius: rs(14),
+    gap: rs(11),
+    backgroundColor: c.inset,
     borderWidth: 1,
-    borderColor: c.border,
-    paddingHorizontal: rs(16),
-    marginBottom: rs(10),
+    borderColor: c.border2,
+    borderRadius: radius.input,
+    paddingHorizontal: rs(14),
+    height: rs(58),
+  },
+  fieldErr: {
+    borderColor: c.danger,
   },
   input: {
     flex: 1,
-    paddingVertical: rs(16),
-    fontSize: rs(18),
+    fontFamily: font.mono,
+    fontSize: rs(16),
     color: c.text,
-    letterSpacing: 0.5,
+    letterSpacing: rs(0.6),
+    padding: 0,
   },
   eyeBtn: {
-    padding: rs(8),
-    marginLeft: rs(4),
-  },
-  eyeIcon: {
-    fontSize: rs(18),
+    padding: rs(6),
   },
   errText: {
-    fontSize: rs(13),
-    fontWeight: '500',
+    fontFamily: font.mono,
+    fontSize: rs(12),
     color: c.danger,
     minHeight: rs(18),
     textAlign: 'center',
+    marginTop: rs(10),
+  },
+  strengthWrap: {
+    marginTop: rs(12),
+    gap: rs(8),
+  },
+  strength: {
+    flexDirection: 'row',
+    gap: rs(4),
+  },
+  strSeg: {
+    flex: 1,
+    height: rs(4),
+  },
+  strengthRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  strHint: {
+    fontFamily: font.mono,
+    fontSize: rs(11),
+    color: c.textTer,
+  },
+  strLabel: {
+    fontFamily: font.monoBold,
+    fontSize: rs(11),
   },
 
   actions: {
-    width: '88%',
+    width: '86%',
     alignSelf: 'center',
     gap: rs(12),
   },
   backBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: rs(2),
     alignSelf: 'flex-start',
     paddingVertical: rs(4),
   },
   backTxt: {
-    fontSize: rs(15),
+    fontFamily: font.mono,
+    fontSize: rs(14),
     color: c.accent,
   },
   submitBtn: {
-    backgroundColor: c.accent,
-    borderRadius: rs(14),
-    paddingVertical: rs(16),
+    flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'center',
+    gap: rs(9),
+    backgroundColor: c.accent,
+    borderRadius: radius.btn,
+    paddingVertical: rs(16),
   },
   submitDisabled: {
-    opacity: 0.35,
+    backgroundColor: c.surface2,
   },
   submitTxt: {
-    fontSize: rs(16),
-    fontWeight: '600',
-    color: '#fff',
+    fontFamily: font.monoBold,
+    fontSize: rs(13),
+    letterSpacing: rs(1),
+    textTransform: 'uppercase',
+    color: c.accentFg,
+  },
+  submitTxtDisabled: {
+    color: c.textFaint,
+  },
+  divider: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: rs(12),
+    marginVertical: rs(2),
+  },
+  divLine: { flex: 1, height: 1, backgroundColor: c.border },
+  divTxt: {
+    fontFamily: font.mono,
+    fontSize: rs(11),
+    color: c.textFaint,
   },
   bioBtn: {
-    paddingVertical: rs(12),
+    flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'center',
+    gap: rs(9),
+    borderWidth: 1,
+    borderColor: c.border2,
+    borderRadius: radius.btn,
+    paddingVertical: rs(15),
   },
   bioTxt: {
-    fontSize: rs(14),
-    color: c.textSec,
+    fontFamily: font.monoBold,
+    fontSize: rs(13),
+    letterSpacing: rs(1),
+    textTransform: 'uppercase',
+    color: c.text,
   },
 });

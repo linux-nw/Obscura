@@ -225,11 +225,10 @@ export class DecoyVaultService {
           .join('');
       }
 
-      // Verwende fastPbkdf2 für PIN Hash (100k Iterationen wie normale PIN)
-      // Dies ist viel sicherer als HMAC-SHA256
-      const iterations = 100000;
+      const iterations = 100000; // Lower than vault KEK — decoy data is fake, timing parity not required here
       const keyLength = 32; // 32 bytes = 256 bits
-      const derivedKey = await fastPbkdf2(pin, salt, iterations, keyLength);
+      // R-03: NFC-normalisieren, sonst leiten NFD/NFC-Eingaben verschiedene Keys ab.
+      const derivedKey = await fastPbkdf2(pin.normalize('NFC'), salt, iterations, keyLength);
 
       return {
         hash: derivedKey,
