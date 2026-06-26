@@ -162,6 +162,17 @@ export default function App() {
         }
       } catch {}
 
+      // Layer 4: definitive per-key Keystore security level (KeyInfo via native module),
+      // preferred over the biometric heuristic above. Warn if keys are software-backed.
+      try {
+        const lvl = await HardwareBackedStorage.assessKeystoreSecurityLevel();
+        if (lvl.securityLevel === 'SOFTWARE') {
+          console.warn('[security][L4] Keystore keys are SOFTWARE-backed (no TEE/StrongBox). On a rooted/compromised device the key material is at materially higher risk.');
+        } else if (lvl.securityLevel !== 'UNAVAILABLE') {
+          console.log(`[security][L4] Keystore security level: ${lvl.securityLevel} (hardwareBacked=${lvl.isHardwareBacked}).`);
+        }
+      } catch {}
+
       // Layer 2: warn (once) if a third-party (non-system) keyboard is active. A
       // malicious IME can capture every keystroke incl. the passphrase. Best-effort
       // signal only — a system IME could still be malicious on a compromised device.
