@@ -4,7 +4,7 @@ import {
   KeyboardAvoidingView, Platform, StatusBar, Alert, ScrollView,
 } from 'react-native';
 import { NotesService, Note } from '../services/NotesService';
-import { c, rs, SAFE_TOP, SAFE_BOTTOM } from '../theme';
+import { c, rs, font, SAFE_TOP, SAFE_BOTTOM, useBottomInset } from '../theme';
 
 interface Props {
   note?: Note | null;
@@ -13,9 +13,11 @@ interface Props {
 }
 
 export default function NoteEditor({ note, onClose, onSaved }: Props) {
-  const [title,   setTitle]   = useState(note?.title ?? '');
-  const [content, setContent] = useState(note?.content ?? '');
-  const [saving,  setSaving]  = useState(false);
+  const safeBot = useBottomInset();
+  const [title,    setTitle]    = useState(note?.title ?? '');
+  const [content,  setContent]  = useState(note?.content ?? '');
+  const [category, setCategory] = useState(note?.category ?? '');
+  const [saving,   setSaving]   = useState(false);
 
   const titleRef = useRef<TextInput>(null);
 
@@ -27,8 +29,8 @@ export default function NoteEditor({ note, onClose, onSaved }: Props) {
   }, []);
 
   const isDirty = note
-    ? title !== note.title || content !== note.content
-    : title.trim().length > 0 || content.trim().length > 0;
+    ? title !== note.title || content !== note.content || category !== (note.category ?? '')
+    : title.trim().length > 0 || content.trim().length > 0 || category.trim().length > 0;
 
   const handleClose = () => {
     if (isDirty) {
@@ -56,9 +58,10 @@ export default function NoteEditor({ note, onClose, onSaved }: Props) {
         await NotesService.updateNote(note.id, {
           title: title.trim(),
           content: content.trim(),
+          category: category.trim() || undefined,
         });
       } else {
-        await NotesService.createNote(title.trim(), content.trim());
+        await NotesService.createNote(title.trim(), content.trim(), category.trim() || undefined);
       }
       onSaved();
       onClose();
@@ -104,7 +107,7 @@ export default function NoteEditor({ note, onClose, onSaved }: Props) {
         {/* ── Editor area ── */}
         <ScrollView
           style={s.scroll}
-          contentContainerStyle={[s.scrollContent, { paddingBottom: SAFE_BOTTOM + rs(24) }]}
+          contentContainerStyle={[s.scrollContent, { paddingBottom: safeBot + rs(24) }]}
           keyboardShouldPersistTaps="handled"
         >
           <TextInput
@@ -117,6 +120,16 @@ export default function NoteEditor({ note, onClose, onSaved }: Props) {
             returnKeyType="next"
             maxLength={120}
             onSubmitEditing={() => {}}
+          />
+          <TextInput
+            style={s.categoryInput}
+            placeholder="Kategorie (optional)"
+            placeholderTextColor={c.textFaint}
+            value={category}
+            onChangeText={setCategory}
+            returnKeyType="next"
+            autoCapitalize="words"
+            maxLength={40}
           />
           <View style={s.divider} />
           <TextInput
@@ -162,17 +175,22 @@ const s = StyleSheet.create({
   headerTitle: {
     flex: 1,
     textAlign: 'center',
-    fontSize: rs(17),
-    fontWeight: '600',
+    fontFamily: font.monoBold,
+    fontSize: rs(12),
+    letterSpacing: rs(1.5),
+    textTransform: 'uppercase',
     color: c.text,
   },
   cancelTxt: {
-    fontSize: rs(16),
+    fontFamily: font.mono,
+    fontSize: rs(14),
     color: c.accent,
   },
   saveTxt: {
-    fontSize: rs(16),
-    fontWeight: '600',
+    fontFamily: font.monoBold,
+    fontSize: rs(13),
+    letterSpacing: rs(1),
+    textTransform: 'uppercase',
     color: c.accent,
   },
   saveTxtDisabled: {
@@ -185,19 +203,29 @@ const s = StyleSheet.create({
     padding: rs(20),
   },
   titleInput: {
+    fontFamily: font.displayBold,
     fontSize: rs(26),
-    fontWeight: '700',
     color: c.text,
     letterSpacing: -0.4,
     paddingVertical: rs(4),
     marginBottom: rs(14),
   },
+  categoryInput: {
+    fontFamily: font.mono,
+    fontSize: rs(11.5),
+    color: c.textSec,
+    letterSpacing: rs(0.8),
+    textTransform: 'uppercase',
+    paddingVertical: rs(6),
+    marginBottom: rs(10),
+  },
   divider: {
-    height: StyleSheet.hairlineWidth,
-    backgroundColor: c.sep,
+    height: 1,
+    backgroundColor: c.border,
     marginBottom: rs(16),
   },
   bodyInput: {
+    fontFamily: font.sans,
     fontSize: rs(16),
     color: c.text,
     lineHeight: rs(25),

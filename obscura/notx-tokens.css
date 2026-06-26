@@ -1,0 +1,295 @@
+/* ============================================================
+   NotX Design System — Color & Type Foundations  (v4 · "Riso Editorial")
+   ------------------------------------------------------------
+   A deliberate break from the dark-social cliché. NotX is "die
+   ruhige Seite des Internets" — so it reads like good print:
+   warm paper, deep ink, one confident risograph accent. Bold
+   display type, generous air, flat color blocks. Calm but with
+   real personality. Light by default; a true dark mode ships too.
+   ============================================================ */
+
+/* ---------- FONTS ----------
+   Bricolage Grotesque — display (characterful, modern grotesque)
+   Geist Sans / Mono — body, UI, identifiers
+   ------------------------------------------------------------ */
+@import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,500;12..96,600;12..96,700;12..96,800&family=Newsreader:opsz,wght@6..72,400;6..72,500;6..72,600&family=Geist:wght@300;400;500;600;700;800&family=Geist+Mono:wght@400;500;600&display=swap');
+
+:root {
+  /* ---------------------------------------------------------
+     COLOR — Paper & ink (the warm neutral ramp)
+     Cream paper base. Ink is warm near-black, never pure.
+     --------------------------------------------------------- */
+  --nx-paper-0:    #FBF8F1;   /* lifted card / white-ish */
+  --nx-paper-50:   #F6F1E6;   /* default app background — warm cream */
+  --nx-paper-100:  #EFE9DA;   /* inset / search well */
+  --nx-paper-200:  #E7DECB;   /* hover wash on paper */
+  --nx-paper-300:  #DACFB8;   /* border subtle */
+  --nx-paper-400:  #C7B99C;   /* border default */
+  --nx-paper-500:  #A89A7C;   /* border strong / muted divider */
+
+  --nx-ink-900:    #16130D;   /* deepest ink, headlines */
+  --nx-ink-800:    #231F17;
+  --nx-ink-700:    #393327;   /* body text strong */
+  --nx-ink-500:    #5C5544;   /* secondary text */
+  --nx-ink-400:    #847C66;   /* tertiary text */
+  --nx-ink-300:    #A89F86;   /* muted text */
+
+  /* ---------------------------------------------------------
+     COLOR — Brand accents (risograph palette)
+     Vermillion is the hero. Cobalt is the rare second voice
+     (charts, links). Both flat, both confident.
+     --------------------------------------------------------- */
+  --nx-vermillion-50:  #FDE8E0;
+  --nx-vermillion-100: #FCD2C3;
+  --nx-vermillion-300: #F58463;
+  --nx-vermillion-500: #EC4221;   /* PRIMARY ACCENT — riso vermillion */
+  --nx-vermillion-600: #D5330F;
+  --nx-vermillion-700: #AE2809;
+  --nx-vermillion-900: #5E1604;
+
+  --nx-cobalt-500: #2438D8;   /* secondary — links, chart line 2 */
+  --nx-cobalt-700: #1A28A0;
+
+  --nx-forest-500: #1F7A4D;   /* success */
+  --nx-amber-500:  #C9821B;   /* warning */
+  --nx-plum-500:   #8B2F6B;   /* extra chart hue */
+
+  /* ---------------------------------------------------------
+     SEMANTIC TOKENS
+     --------------------------------------------------------- */
+  --bg-app:         var(--nx-paper-50);
+  --bg-surface:     var(--nx-paper-0);
+  --bg-elevated:    var(--nx-paper-0);
+  --bg-inset:       var(--nx-paper-100);
+  --bg-hover:       rgba(22,19,13,0.045);
+  --bg-active:      rgba(236,66,33,0.10);
+
+  --border-subtle:  var(--nx-paper-300);
+  --border-default: var(--nx-paper-400);
+  --border-strong:  var(--nx-paper-500);
+  --border-focus:   var(--nx-vermillion-500);
+  --border-ink:     var(--nx-ink-900);   /* the bold 1.5px ink hairline used on key cards */
+
+  --fg-primary:     var(--nx-ink-900);
+  --fg-secondary:   var(--nx-ink-700);
+  --fg-tertiary:    var(--nx-ink-500);
+  --fg-muted:       var(--nx-ink-400);
+  --fg-faint:       var(--nx-ink-300);
+  --fg-on-accent:   #FFF6F0;   /* warm white on vermillion */
+  --fg-inverse:     var(--nx-paper-50);
+
+  --accent:         var(--nx-vermillion-500);
+  --accent-hover:   var(--nx-vermillion-600);
+  --accent-press:   var(--nx-vermillion-700);
+  --accent-soft:    rgba(236,66,33,0.12);
+  --accent-fg:      #FFF6F0;
+
+  --danger:         var(--nx-vermillion-600);
+  --success:        var(--nx-forest-500);
+  --warning:        var(--nx-amber-500);
+  --link:           var(--nx-cobalt-500);
+
+  /* Chrome washes */
+  --scrim:          rgba(22,19,13,0.45);
+  --header-bg:      rgba(246,241,230,0.82);
+  --bar-bg:         rgba(246,241,230,0.90);
+
+  /* ---------------------------------------------------------
+     TYPOGRAPHY
+     Display = Bricolage Grotesque (heavy, tight). Body = Geist.
+     --------------------------------------------------------- */
+  --font-display: "Bricolage Grotesque", "Geist", -apple-system, "Helvetica Neue", sans-serif;
+  --font-editorial: "Newsreader", "Iowan Old Style", Georgia, "Times New Roman", serif;
+  --font-sans:    "Geist", -apple-system, "Helvetica Neue", Arial, sans-serif;
+  --font-mono:    "Geist Mono", "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  --fs-2xs:  10px;
+  --fs-xs:   12px;
+  --fs-sm:   13px;
+  --fs-base: 14px;
+  --fs-md:   15px;
+  --fs-lg:   17px;
+  --fs-xl:   20px;
+  --fs-2xl:  25px;
+  --fs-3xl:  34px;
+  --fs-4xl:  48px;
+  --fs-5xl:  68px;
+  --fs-6xl:  100px;
+
+  --lh-tight:   0.98;
+  --lh-snug:    1.10;
+  --lh-default: 1.55;
+  --lh-relaxed: 1.7;
+
+  --ls-display: -0.03em;
+  --ls-tight:   -0.02em;
+  --ls-snug:    -0.012em;
+  --ls-normal:   0em;
+  --ls-wide:     0.02em;
+  --ls-caps:     0.16em;
+
+  /* ---------------------------------------------------------
+     SHAPE — crisp, print-like. Modest radii, bold ink hairlines.
+     --------------------------------------------------------- */
+  --r-xs:  2px;
+  --r-sm:  4px;
+  --r-md:  7px;
+  --r-lg:  11px;
+  --r-xl:  16px;
+  --r-2xl: 22px;
+  --r-pill: 999px;
+
+  /* Shadows are soft + warm, used sparingly — print doesn't float */
+  --shadow-1: 0 1px 2px rgba(60,48,28,0.10);
+  --shadow-2: 0 10px 28px rgba(60,48,28,0.14);
+  --shadow-3: 0 26px 64px rgba(48,38,20,0.22);
+  --shadow-glow: 0 0 0 1px rgba(236,66,33,0.45);
+  --ring-focus: 0 0 0 3px rgba(236,66,33,0.28);
+
+  --sp-0:0; --sp-1:4px; --sp-2:8px; --sp-3:12px; --sp-4:16px; --sp-5:20px;
+  --sp-6:24px; --sp-7:32px; --sp-8:40px; --sp-9:56px; --sp-10:72px;
+
+  --ease-out:    cubic-bezier(0.16, 1, 0.30, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --dur-fast:120ms; --dur-base:200ms; --dur-slow:360ms;
+
+  --bp-sm:480px; --bp-md:720px; --bp-lg:1100px; --bp-xl:1400px;
+  --sidebar-full:248px; --sidebar-icon:74px; --tabbar-h:60px;
+}
+
+/* ---------- DARK MODE — warm charcoal, not pitch black; vermillion stays ---------- */
+:root[data-theme="dark"] {
+  --bg-app:         #221D16;
+  --bg-surface:     #2B251C;
+  --bg-elevated:    #342D22;
+  --bg-inset:       #1C170F;
+  --bg-hover:       rgba(246,241,230,0.06);
+  --bg-active:      rgba(242,85,47,0.20);
+
+  --border-subtle:  #3A3225;
+  --border-default: #4B4130;
+  --border-strong:  #6E6149;
+  --border-ink:     #F6F1E6;
+
+  --fg-primary:     #F6F1E5;
+  --fg-secondary:   #E0D8C7;
+  --fg-tertiary:    #B3A994;
+  --fg-muted:       #8C836E;
+  --fg-faint:       #635A4A;
+
+  --accent:         #F2552F;
+  --accent-hover:   #FF6840;
+  --accent-soft:    rgba(242,85,47,0.18);
+  --accent-fg:      #1B1610;
+
+  --danger:         #F2674A;
+  --success:        #5FC48C;
+  --warning:        #E0A23F;
+  --link:           #7FA6FF;
+
+  --scrim:          rgba(10,8,5,0.60);
+  --header-bg:      rgba(34,29,22,0.82);
+  --bar-bg:         rgba(34,29,22,0.92);
+  --shadow-1: 0 1px 2px rgba(0,0,0,0.4);
+  --shadow-2: 0 10px 28px rgba(0,0,0,0.5);
+  --shadow-3: 0 26px 64px rgba(0,0,0,0.6);
+}
+
+/* ============================================================
+   SEMANTIC TYPE CLASSES
+   ============================================================ */
+.nx-display, .nx-h0 {
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: clamp(52px, 8vw, var(--fs-6xl));
+  line-height: var(--lh-tight);
+  letter-spacing: var(--ls-display);
+  color: var(--fg-primary);
+}
+.nx-h1, h1 {
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: var(--fs-4xl);
+  line-height: var(--lh-tight);
+  letter-spacing: var(--ls-display);
+  color: var(--fg-primary);
+}
+.nx-h2, h2 {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: var(--fs-3xl);
+  line-height: var(--lh-snug);
+  letter-spacing: var(--ls-tight);
+  color: var(--fg-primary);
+}
+.nx-h3, h3 {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: var(--fs-2xl);
+  line-height: var(--lh-snug);
+  letter-spacing: var(--ls-snug);
+  color: var(--fg-primary);
+}
+.nx-h4, h4 {
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: var(--fs-xl);
+  line-height: var(--lh-snug);
+  letter-spacing: var(--ls-snug);
+  color: var(--fg-primary);
+}
+.nx-h5, h5 {
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: var(--fs-lg);
+  line-height: var(--lh-snug);
+  color: var(--fg-primary);
+}
+.nx-body, p {
+  font-family: var(--font-sans);
+  font-weight: 400;
+  font-size: var(--fs-base);
+  line-height: var(--lh-default);
+  color: var(--fg-secondary);
+}
+.nx-body-lg { font-size: var(--fs-md); line-height: var(--lh-relaxed); }
+.nx-small, small { font-size: var(--fs-xs); color: var(--fg-tertiary); }
+.nx-caption { font-family: var(--font-sans); font-size: var(--fs-xs); font-weight: 500; color: var(--fg-tertiary); }
+.nx-overline {
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  font-weight: 600;
+  letter-spacing: var(--ls-caps);
+  text-transform: uppercase;
+  color: var(--fg-tertiary);
+}
+.nx-mono, code, kbd, pre { font-family: var(--font-mono); font-size: 0.92em; }
+
+.nx-link, a {
+  color: var(--link);
+  text-decoration: none;
+  transition: color var(--dur-fast) var(--ease-out);
+}
+.nx-link:hover, a:hover { color: var(--accent); }
+
+*, *::before, *::after { box-sizing: border-box; }
+html, body {
+  margin: 0; padding: 0;
+  font-family: var(--font-sans);
+  background: var(--bg-app);
+  color: var(--fg-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+/* ============================================================
+   RESPONSIVE UTILITIES
+   ============================================================ */
+.nx-show-mobile { display: none !important; }
+.nx-hide-mobile { display: initial; }
+@media (max-width: 1099px) { .nx-hide-tablet { display: none !important; } }
+@media (max-width: 719px) {
+  .nx-hide-mobile { display: none !important; }
+  .nx-show-mobile { display: initial !important; }
+}

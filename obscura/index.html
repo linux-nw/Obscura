@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>Obscura FileVault</title>
+
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500&family=Space+Grotesk:wght@600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet" />
+
+  <link rel="stylesheet" href="notx-tokens.css" />
+  <link rel="stylesheet" href="theme.css" />
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    /* dvh = dynamic viewport height: shrinks when browser chrome appears.
+       svw/svh = small viewport: always the smallest visible area.
+       This keeps #root from ever going behind address bar or nav bar. */
+    html, body {
+      width: 100%;
+      height: 100dvh;
+      background: #060608;
+      overflow: hidden;
+    }
+    #root {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    /* ── Desktop / tablet: centered phone shell ── */
+    #app {
+      position: relative;
+      width: min(390px, 100svw);
+      height: min(844px, 100dvh);
+      overflow: hidden;
+      box-shadow: 0 32px 90px rgba(0,0,0,0.75), 0 0 0 1px rgba(255,255,255,0.07);
+      border-radius: 4px;
+      /* expose safe-area values to child CSS via custom props */
+      --sat: env(safe-area-inset-top,    0px);
+      --sab: env(safe-area-inset-bottom, 0px);
+      --sal: env(safe-area-inset-left,   0px);
+      --sar: env(safe-area-inset-right,  0px);
+    }
+
+    /* ── Mobile: fill the full viewport, respect system safe areas ── */
+    @media (max-width: 430px) {
+      html, body { background: #0A0A0C; }
+      #root { align-items: stretch; justify-content: stretch; }
+      #app {
+        width: 100svw;
+        height: 100dvh;
+        box-shadow: none;
+        border-radius: 0;
+      }
+      /* push tab bar above home indicator / gesture nav */
+      .ob-tabbar {
+        padding-bottom: max(10px, var(--sab)) !important;
+        padding-left:  var(--sal);
+        padding-right: var(--sar);
+      }
+      /* push top content below status bar / notch */
+      .ob-screen > *:first-child {
+        padding-top: max(0px, var(--sat));
+      }
+    }
+
+    /* loading splash shown while Babel compiles */
+    #splash {
+      position: absolute; inset: 0;
+      background: #0A0A0C;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 18px;
+      font-family: 'Space Mono', monospace;
+      color: #51535A; font-size: 11px; letter-spacing: 0.14em;
+    }
+    #splash .dot { width: 5px; height: 5px; background: #E9A23B; display: inline-block; }
+  </style>
+</head>
+<body>
+  <div id="root">
+    <div id="app" class="ob-app">
+      <div id="splash">
+        <div class="dot"></div>
+        OBSCURA WIRD GELADEN
+      </div>
+    </div>
+  </div>
+
+  <!-- React 18 + Babel Standalone (CDN, no build step) -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <!-- Force classic JSX runtime (prevents Babel adding import statements to output) -->
+  <script>
+    Babel.registerPreset('ob-react', {
+      presets: [[Babel.availablePresets['react'], { runtime: 'classic' }]]
+    });
+  </script>
+
+  <!-- Plain JS data (no JSX, loads fine anywhere) -->
+  <script src="data.js"></script>
+
+  <!-- JSX components — must be served over HTTP (not file://) -->
+  <script type="text/babel" data-presets="ob-react" src="icons.jsx"></script>
+  <script type="text/babel" data-presets="ob-react" src="components.jsx"></script>
+  <script type="text/babel" data-presets="ob-react" src="modals.jsx"></script>
+  <script type="text/babel" data-presets="ob-react" src="screens.jsx"></script>
+  <script type="text/babel" data-presets="ob-react" src="main.jsx"></script>
+  <script type="text/babel" data-presets="ob-react" src="app.jsx"></script>
+
+  <!-- Mount -->
+  <script type="text/babel" data-presets="ob-react">
+    document.getElementById('splash').remove();
+    ReactDOM.createRoot(document.getElementById('app')).render(
+      <ObscuraApp />
+    );
+  </script>
+</body>
+</html>

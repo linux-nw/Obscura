@@ -23,6 +23,24 @@ console.log(
   `(RNFileVault module ${(NativeModules as any).RNFileVault ? 'LOADED' : 'MISSING'})`
 );
 
+// S3: explicit, logged opt-in for the pure-JS crypto fallback. Content writes refuse the
+// JS AES-256-CBC+HMAC backend unless this flag is set (see CryptoService jsCryptoWriteAllowed).
+// Enabled ONLY in dev builds (__DEV__) AND only when the native module is missing — so
+// Expo Go / a dev build without the native module stays usable. A PRODUCTION RELEASE never
+// sets this flag: if the native module is absent/stripped there, content writes throw
+// rather than silently downgrade to JS crypto. Never enable this in a shipped build.
+try {
+  const nativeMissing = !(NativeModules as any).RNFileVault;
+  if (typeof __DEV__ !== 'undefined' && __DEV__ && nativeMissing) {
+    (global as any).__filevault_allow_js_crypto = true;
+    console.warn(
+      '[crypto][S3] DEV build without native crypto module — enabling the pure-JS ' +
+      'AES-256-CBC+HMAC fallback for content writes. DEV-ONLY downgrade; NEVER enabled in ' +
+      'a production release.'
+    );
+  }
+} catch { /* __DEV__ unavailable — leave the flag unset (production-safe default) */ }
+
 // Neue Enterprise Services importieren
 import { XChaCha20CryptoService } from './src/services/XChaCha20CryptoService';
 import { DeviceSecurityService } from './src/services/DeviceSecurityService';

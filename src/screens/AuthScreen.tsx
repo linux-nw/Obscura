@@ -9,6 +9,7 @@ import * as SecureStore from 'expo-secure-store';
 import { SecureCryptoService } from '../services/CryptoService';
 import { KeyRotationService } from '../services/KeyRotationService';
 import { PanicService } from '../services/PanicService';
+import { DecoyVaultService } from '../services/DecoyVaultService';
 import { DeviceSecurityService } from '../services/DeviceSecurityService';
 import { SettingsService, AppSettings } from '../services/SettingsService';
 import VaultMark, { CornerFrame } from '../components/VaultMark';
@@ -64,7 +65,7 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
         const bioEnabled = settings.biometricsEnabled && ok;
         setHasBio(!!bioEnabled);
 
-        if (!isFirstLaunch && bioEnabled) {
+        if (!isFirstLaunch && bioEnabled && settings.bioAutoTrigger) {
           setTimeout(() => triggerBio(settings), 600);
         }
       } catch {}
@@ -107,6 +108,7 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
 
   const triggerBio = async (settings?: AppSettings) => {
     const s = settings ?? appSettings;
+    if (!s?.biometricsEnabled) return;
     if (s?.require2FA) {
       try {
         const res = await LocalAuthentication.authenticateAsync({
@@ -144,66 +146,64 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
     try {
       const lockStatus = await SecureCryptoService.getLockStatus();
       if (lockStatus.locked) {
-        const secsLeft = Math.ceil((lockStatus.unlockAt - Date.now()) / 1000);
-        showError(`Zu viele Versuche — noch ${secsLeft}s warten`);
+        const isPermanent = lockStatus.unlockAt >= Number.MAX_SAFE_INTEGER - 86400000;
+        if (isPermanent) {
+          showError('Tresor dauerhaft gesperrt.');
+        } else {
+          const secsLeft = Math.ceil((lockStatus.unlockAt - Date.now()) / 1000);
+          showError(`Zu viele Versuche — noch ${secsLeft}s warten`);
+        }
         setPass('');
         return;
       }
 
-      // R-01: Run BOTH checks always so neither path leaks timing info.
-      // unlock() loads the real master key into cache if correct.
-      // verifyPanicPin() is independent and never touches the real master key.
-      const [panicMatch, realMatch] = await Promise.all([
+      // R-01: All three checks run in parallel — no timing leak between paths.
+      // unlock() loads the real master key into cache if passphrase is correct.
+      // verifyPanicPin() and verifyDecoyPin() are independent.
+      const [panicMatch, realMatch, decoyMatch] = await Promise.all([
         PanicService.verifyPanicPin(entered),
         SecureCryptoService.unlock(entered),
+        DecoyVaultService.verifyDecoyPin(entered),
       ]);
 
       if (panicMatch) {
-        // Panic PIN entered: clear master key cache first, then dispatch configured action.
+        // Panic PIN: clear master key, then dispatch wipe or permanent lock.
         SecureCryptoService.clearAllCaches();
         const triggerAction = await PanicService.getTriggerAction();
 
-        if (triggerAction === 'wipe' || triggerAction === 'all') {
-          // Wipe vault — resets to first-launch state.
+        if (triggerAction === 'wipe') {
           try { await onWipeVault?.(); } catch {}
           return;
         }
 
-        if (triggerAction === 'lock') {
-          // Permanent lock for 1 year.
-          const lockUntil = Date.now() + 365 * 24 * 60 * 60 * 1000;
-          try { await SecureStore.setItemAsync('filevault_lock_until', lockUntil.toString()); } catch {}
-          showError('App dauerhaft gesperrt.');
-          setPass('');
-          return;
-        }
-
-        // 'decoy' (default fallback): navigate to main screen without master key.
-        // The decoy flag hides real data in FilesView and NotesScreen.
-        try {
-          await SecureStore.setItemAsync('filevault_decoy_activated', 'true');
-        } catch {
-          showError('Sicherheitsfehler — Decoy konnte nicht aktiviert werden');
-          setPass('');
-          return;
-        }
-        setFailedAttempts(0);
-        await SecureStore.deleteItemAsync(ATTEMPTS_KEY);
-        setUnlocking(true);
-        setTimeout(doAuth, 300);
+        // 'lock' — permanent, no way back.
+        try { await SecureStore.setItemAsync('filevault_lock_until', String(Number.MAX_SAFE_INTEGER)); } catch {}
+        showError('Tresor dauerhaft gesperrt.');
+        setPass('');
         return;
       }
 
       if (realMatch) {
         setFailedAttempts(0);
         await SecureStore.deleteItemAsync(ATTEMPTS_KEY);
-        // Finish any key rotation that was interrupted by a crash/power-loss.
-        // Needs the passphrase (to re-install the new master) and the unlocked
-        // master key in cache — both available right here. Never block login on it.
         try {
           await KeyRotationService.resumeRotationIfNeeded(entered);
         } catch (e) {
           console.error('KeyRotation: resume after unlock failed:', e);
+        }
+        setUnlocking(true);
+        setTimeout(doAuth, 300);
+      } else if (decoyMatch) {
+        // Decoy PIN: clear real master key (loaded by parallel unlock()), show empty vault.
+        SecureCryptoService.clearAllCaches();
+        setFailedAttempts(0);
+        await SecureStore.deleteItemAsync(ATTEMPTS_KEY);
+        try {
+          await SecureStore.setItemAsync('filevault_decoy_activated', 'true');
+        } catch {
+          showError('Fehler beim Aktivieren des Täusch-Tresors');
+          setPass('');
+          return;
         }
         setUnlocking(true);
         setTimeout(doAuth, 300);
@@ -214,19 +214,27 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
         await SecureStore.setItemAsync(ATTEMPTS_KEY, String(newCount));
 
         if (newCount >= maxAttempts) {
-          Alert.alert(
-            'Tresor gelöscht',
-            `${maxAttempts} falsche Passwörter — alle Daten werden unwiderruflich gelöscht.`,
-            [{
-              text: 'Löschen',
-              style: 'destructive',
-              onPress: async () => {
-                await SecureStore.deleteItemAsync(ATTEMPTS_KEY);
-                await onWipeVault?.();
-              },
-            }],
-            { cancelable: false },
-          );
+          const action = appSettings?.maxFailedAttemptsAction ?? 'wipe';
+          if (action === 'lock') {
+            await SecureStore.deleteItemAsync(ATTEMPTS_KEY);
+            try { await SecureStore.setItemAsync('filevault_lock_until', String(Number.MAX_SAFE_INTEGER)); } catch {}
+            showError('Tresor dauerhaft gesperrt.');
+            setPass('');
+          } else {
+            Alert.alert(
+              'Tresor gelöscht',
+              `${maxAttempts} falsche Passwörter — alle Daten werden unwiderruflich gelöscht.`,
+              [{
+                text: 'Löschen',
+                style: 'destructive',
+                onPress: async () => {
+                  await SecureStore.deleteItemAsync(ATTEMPTS_KEY);
+                  await onWipeVault?.();
+                },
+              }],
+              { cancelable: false },
+            );
+          }
         } else {
           const remaining = maxAttempts - newCount;
           showError(`Falsches Passwort — noch ${remaining} ${remaining === 1 ? 'Versuch' : 'Versuche'}`);
@@ -251,7 +259,7 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
       return;
     }
 
-    const minLen = appSettings?.minPinLength ?? 12;
+    const minLen = 8;
     if (entered.length < minLen) {
       showError(`Mindestens ${minLen} Zeichen erforderlich`);
       setConfirm('');
@@ -278,8 +286,7 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
 
   const handleAdvance = () => {
     const current = phase === 'confirm' ? confirm : pass;
-    const minLen = appSettings?.minPinLength ?? 12;
-    if (current.length < minLen || unlocking || isHashing) return;
+    if (current.length < 8 || unlocking || isHashing) return;
 
     if (isFirstLaunch && phase === 'enter') {
       setPhase('confirm');
@@ -300,7 +307,7 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
 
   const currentVal  = phase === 'confirm' ? confirm : pass;
   const setCurrentVal = phase === 'confirm' ? setConfirm : setPass;
-  const minLen = appSettings?.minPinLength ?? 12;
+  const minLen = 8;
   const canAdvance  = currentVal.length >= minLen && !unlocking && !isHashing;
 
   const phaseLabel = isFirstLaunch
@@ -313,10 +320,7 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
     : bioPassedFor2FA
     ? 'Biometrie bestätigt — Passwort eingeben'
     : isFirstLaunch
-    ? (() => {
-        const minLen = appSettings?.minPinLength ?? 12;
-        return (phase === 'enter' ? `Mindestens ${minLen} Zeichen` : 'Passwort erneut eingeben');
-      })()
+    ? (phase === 'enter' ? 'Mindestens 8 Zeichen' : 'Passwort erneut eingeben')
     : 'Geben Sie Ihr Passwort ein';
 
   const submitLabel = isFirstLaunch
@@ -399,7 +403,7 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
               ))}
             </View>
             <View style={s.strengthRow}>
-              <Text style={s.strHint}>min. {appSettings?.minPinLength ?? 12} Zeichen</Text>
+              <Text style={s.strHint}>min. 8 Zeichen</Text>
               {!!strength.label && <Text style={[s.strLabel, { color: strength.color }]}>{strength.label}</Text>}
             </View>
           </View>

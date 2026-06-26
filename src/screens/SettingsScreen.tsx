@@ -13,6 +13,7 @@ import { KeyRotationService } from '../services/KeyRotationService';
 import { PanicService } from '../services/PanicService';
 import { DecoyVaultService } from '../services/DecoyVaultService';
 import { AutoLockService } from '../services/AutoLockService';
+import { SecureCryptoService } from '../services/CryptoService';
 import Icon from '../components/Icon';
 import { c, rs, font, radius, SAFE_TOP, SAFE_BOTTOM, useBottomInset } from '../theme';
 
@@ -53,10 +54,12 @@ export default function SettingsScreen({
 }: Props) {
   const [settings, setSettings] = useState<AppSettings>({
     biometricsEnabled: false,
+    bioAutoTrigger: false,
     require2FA: false,
     autoLockTimeout: 300,
     maxFailedAttempts: 5,
-    minPinLength: 12,
+    maxFailedAttemptsAction: 'wipe',
+    minPinLength: 8,
   });
   const [biometricsAvailable, setBiometricsAvailable] = useState(false);
   const [storageUsed, setStorageUsed] = useState(0);
@@ -84,7 +87,7 @@ export default function SettingsScreen({
 
   // Panic PIN + Decoy Vault
   const [hasPanicPin, setHasPanicPin] = useState(false);
-  const [panicTrigger, setPanicTrigger] = useState<'lock' | 'wipe' | 'decoy' | 'all'>('lock');
+  const [panicTrigger, setPanicTrigger] = useState<'lock' | 'wipe'>('lock');
   const [hasDecoy, setHasDecoy] = useState(false);
   // Set-secret-PIN modal: two-field confirm (panic PIN / decoy PIN)
   const [spModal, setSpModal] = useState<{ title: string; sub: string; onSubmit: (pin: string) => Promise<void> } | null>(null);
@@ -92,6 +95,11 @@ export default function SettingsScreen({
   const [spConfirm, setSpConfirm] = useState('');
   const [spBusy, setSpBusy] = useState(false);
   const [spErr, setSpErr] = useState('');
+
+  const [showPinPass, setShowPinPass] = useState(false);
+  const [showPpPass, setShowPpPass] = useState(false);
+  const [showSpNew, setShowSpNew] = useState(false);
+  const [showSpConfirm, setShowSpConfirm] = useState(false);
 
   useEffect(() => {
     if (visible) {
@@ -146,17 +154,18 @@ export default function SettingsScreen({
   const startPinChange = () => {
     setCurrentPin(''); setNewPin(''); setConfirmPin('');
     setPinError('');
+    setShowPinPass(false);
     setScreen('pin_current');
   };
 
   const handlePinNext = async () => {
-    const minLen = settings.minPinLength;
+    const minLen = 8;
     if (screen === 'pin_current') {
       if (currentPin.length < minLen) { setPinError(`Mindestens ${minLen} Zeichen`); return; }
-      setPinError(''); setScreen('pin_new');
+      setPinError(''); setShowPinPass(false); setScreen('pin_new');
     } else if (screen === 'pin_new') {
       if (newPin.length < minLen) { setPinError(`Mindestens ${minLen} Zeichen`); return; }
-      setPinError(''); setScreen('pin_confirm');
+      setPinError(''); setShowPinPass(false); setScreen('pin_confirm');
     } else if (screen === 'pin_confirm') {
       if (confirmPin !== newPin) {
         setPinError('PINs stimmen nicht überein');
@@ -212,7 +221,7 @@ export default function SettingsScreen({
   // ── Data: key rotation + backup/restore ──────────────────────
 
   const openPrompt = (cfg: PassPrompt) => {
-    setPpVal(''); setPpErr(''); setPp(cfg);
+    setPpVal(''); setPpErr(''); setShowPpPass(false); setPp(cfg);
   };
 
   const submitPrompt = async () => {
@@ -233,7 +242,7 @@ export default function SettingsScreen({
     title: 'Schlüssel rotieren',
     sub: 'Aktuelles Passwort eingeben. Alle Dateien und Notizen werden mit einem frischen Master-Schlüssel neu verschlüsselt.',
     cta: 'Rotieren',
-    minLen: settings.minPinLength,
+    minLen: 8,
     run: async (pass) => {
       await KeyRotationService.performSecureRotation(pass);
       Alert.alert('Erfolg', 'Schlüssel rotiert — alle Daten neu verschlüsselt.');
@@ -244,7 +253,7 @@ export default function SettingsScreen({
     title: 'Backup erstellen',
     sub: 'Backup-Passwort wählen. Du brauchst es zum Wiederherstellen — es ist NICHT dein Tresor-Passwort.',
     cta: 'Erstellen',
-    minLen: settings.minPinLength,
+    minLen: 8,
     run: async (pass) => {
       const id = await BackupService.createBackup(pass, includeSettingsCb);
       await BackupService.shareBackup(id);
@@ -311,12 +320,13 @@ export default function SettingsScreen({
 
   const openSetPinModal = (cfg: { title: string; sub: string; onSubmit: (pin: string) => Promise<void> }) => {
     setSpNew(''); setSpConfirm(''); setSpErr('');
+    setShowSpNew(false); setShowSpConfirm(false);
     setSpModal(cfg);
   };
 
   const submitSetPin = async () => {
     if (!spModal) return;
-    const minLen = settings.minPinLength;
+    const minLen = 8;
     if (spNew.length < minLen) { setSpErr(`Mindestens ${minLen} Zeichen`); return; }
     if (spNew !== spConfirm) { setSpErr('PINs stimmen nicht überein'); setSpConfirm(''); return; }
     setSpBusy(true); setSpErr('');
@@ -328,6 +338,27 @@ export default function SettingsScreen({
     } finally {
       setSpBusy(false);
     }
+  };
+
+  const handleBioToggle = async (enable: boolean) => {
+    if (!enable) {
+      await SecureCryptoService.disableBioUnlock();
+      await updateSetting('biometricsEnabled', false);
+      return;
+    }
+    // Enable: ask passphrase so we can derive + store the bio KEK.
+    // The SecureStore write with requireAuthentication triggers one intentional biometric prompt.
+    openPrompt({
+      title: 'Biometrie aktivieren',
+      sub: 'Aktuelles Tresor-Passwort eingeben, um Biometrie freizuschalten.',
+      cta: 'Aktivieren',
+      minLen: 8,
+      run: async (pass) => {
+        const ok = await SecureCryptoService.enableBioUnlock(pass);
+        if (!ok) throw new Error('Falsches Passwort');
+        await updateSetting('biometricsEnabled', true);
+      },
+    });
   };
 
   const handleSetPanicPin = () => openSetPinModal({
@@ -350,7 +381,7 @@ export default function SettingsScreen({
     ]);
   };
 
-  const handlePanicTrigger = async (action: 'lock' | 'wipe' | 'decoy' | 'all') => {
+  const handlePanicTrigger = async (action: 'lock' | 'wipe') => {
     await PanicService.setTriggerAction(action).catch(() => {});
     setPanicTrigger(action);
   };
@@ -452,19 +483,30 @@ export default function SettingsScreen({
               ))}
             </View>
 
-            <TextInput
-              style={s.pinInput}
-              value={pinValue}
-              onChangeText={v => { setPinValue(v.slice(0, 128)); setPinError(''); }}
-              keyboardType="default"
-              secureTextEntry
-              placeholder="Passwort eingeben"
-              placeholderTextColor={c.textTer}
-              autoFocus
-              autoCapitalize="none"
-              autoCorrect={false}
-              maxLength={128}
-            />
+            <View style={s.passField}>
+              <Icon name="key" size={rs(17)} color={c.textTer} />
+              <TextInput
+                style={s.passInput}
+                value={pinValue}
+                onChangeText={v => { setPinValue(v.slice(0, 128)); setPinError(''); }}
+                keyboardType="default"
+                secureTextEntry={!showPinPass}
+                placeholder="Passwort eingeben"
+                placeholderTextColor={c.textTer}
+                autoFocus
+                autoCapitalize="none"
+                autoCorrect={false}
+                maxLength={128}
+              />
+              <TouchableOpacity
+                style={s.eyeBtn}
+                onPress={() => setShowPinPass(v => !v)}
+                activeOpacity={0.7}
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+              >
+                <Icon name={showPinPass ? 'eye-off' : 'eye'} size={rs(17)} color={c.textTer} />
+              </TouchableOpacity>
+            </View>
 
             {!!pinError && <Text style={s.pinError}>{pinError}</Text>}
 
@@ -473,9 +515,9 @@ export default function SettingsScreen({
                 <Text style={s.pinCancelTxt}>Abbrechen</Text>
               </TouchableOpacity>
               <TouchableOpacity
-                style={[s.pinNextBtn, (pinValue.length < settings.minPinLength || pinSaving) && s.pinNextDisabled]}
+                style={[s.pinNextBtn, (pinValue.length < 8 || pinSaving) && s.pinNextDisabled]}
                 onPress={handlePinNext}
-                disabled={pinValue.length < settings.minPinLength || pinSaving}
+                disabled={pinValue.length < 8 || pinSaving}
                 activeOpacity={0.7}
               >
                 {pinSaving
@@ -495,6 +537,33 @@ export default function SettingsScreen({
             keyboardShouldPersistTaps="handled"
           >
 
+            {/* ─── KONTO ─── */}
+            <Text style={s.sectionLabel}>KONTO</Text>
+            <View style={s.card}>
+
+              <TouchableOpacity style={s.row} onPress={startPinChange} activeOpacity={0.7}>
+                <View style={s.rowIcon}><Icon name="key" size={rs(17)} color={c.textSec} /></View>
+                <View style={s.rowInfo}>
+                  <Text style={s.rowTitle}>Passwort ändern</Text>
+                </View>
+                <Icon name="chevron-right" size={rs(17)} color={c.textFaint} />
+              </TouchableOpacity>
+
+              <View style={s.sep} />
+
+              <TouchableOpacity
+                style={s.row}
+                onPress={() => { onClose(); setTimeout(onLogout, 300); }}
+                activeOpacity={0.7}
+              >
+                <View style={s.rowIcon}><Icon name="log-out" size={rs(17)} color={c.accent} /></View>
+                <View style={s.rowInfo}>
+                  <Text style={s.rowTitle}>Tresor sperren</Text>
+                </View>
+                <Icon name="chevron-right" size={rs(17)} color={c.textFaint} />
+              </TouchableOpacity>
+            </View>
+
             {/* ─── SICHERHEIT ─── */}
             <Text style={s.sectionLabel}>SICHERHEIT</Text>
             <View style={s.card}>
@@ -510,7 +579,7 @@ export default function SettingsScreen({
                 </View>
                 <Switch
                   value={settings.biometricsEnabled && biometricsAvailable}
-                  onValueChange={v => updateSetting('biometricsEnabled', v)}
+                  onValueChange={handleBioToggle}
                   disabled={!biometricsAvailable}
                   trackColor={{ false: c.border, true: c.accent }}
                   thumbColor="#fff"
@@ -518,6 +587,26 @@ export default function SettingsScreen({
               </View>
 
               <View style={s.sep} />
+
+              {/* Bio auto-trigger (only when bio is on) */}
+              {settings.biometricsEnabled && biometricsAvailable && (
+                <>
+                  <View style={s.row}>
+                    <View style={s.rowIcon}><Icon name="scan-face" size={rs(17)} color={c.textSec} /></View>
+                    <View style={s.rowInfo}>
+                      <Text style={s.rowTitle}>Automatisch beim Start</Text>
+                      <Text style={s.rowSub}>Biometrie-Abfrage ohne Button-Druck</Text>
+                    </View>
+                    <Switch
+                      value={settings.bioAutoTrigger}
+                      onValueChange={v => updateSetting('bioAutoTrigger', v)}
+                      trackColor={{ false: c.border, true: c.accent }}
+                      thumbColor="#fff"
+                    />
+                  </View>
+                  <View style={s.sep} />
+                </>
+              )}
 
               {/* 2FA */}
               <View style={s.row}>
@@ -597,60 +686,34 @@ export default function SettingsScreen({
 
               <View style={s.sep} />
 
-              {/* Min. PIN-Länge */}
+              {/* Aktion bei max. Fehlversuchen */}
               <View style={s.block}>
                 <View style={s.blockHeader}>
-                  <View style={s.rowIcon}><Icon name="type" size={rs(17)} color={c.textSec} /></View>
+                  <View style={s.rowIcon}><Icon name="shield-off" size={rs(17)} color={c.textSec} /></View>
                   <View style={s.rowInfo}>
-                    <Text style={s.rowTitle}>Min. Passwortlänge</Text>
-                    <Text style={s.rowSub}>{settings.minPinLength} Zeichen (12-24)</Text>
+                    <Text style={s.rowTitle}>Aktion bei max. Fehlversuchen</Text>
+                    <Text style={s.rowSub}>Was bei zu vielen falschen Passwörtern passiert</Text>
                   </View>
                 </View>
-                <View style={s.sliderContainer}>
-                  <Text style={s.sliderValue}>{settings.minPinLength}</Text>
-                  <View style={s.sliderTrack}>
-                    {Array.from({ length: 13 }, (_, i) => {
-                      const val = i + 12;
-                      const active = settings.minPinLength === val;
-                      return (
-                        <TouchableOpacity
-                          key={val}
-                          style={[s.sliderDot, active && s.sliderDotActive]}
-                          onPress={() => updateSetting('minPinLength', val)}
-                          activeOpacity={0.7}
-                        />
-                      );
-                    })}
-                  </View>
+                <View style={s.chips}>
+                  {([
+                    { label: 'Sperren', value: 'lock' as const },
+                    { label: 'Löschen', value: 'wipe' as const },
+                  ]).map(opt => (
+                    <TouchableOpacity
+                      key={opt.value}
+                      style={[s.chip, settings.maxFailedAttemptsAction === opt.value && s.chipOn]}
+                      onPress={() => updateSetting('maxFailedAttemptsAction', opt.value)}
+                      activeOpacity={0.7}
+                    >
+                      <Text style={[s.chipTxt, settings.maxFailedAttemptsAction === opt.value && s.chipTxtOn]}>
+                        {opt.label}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
                 </View>
               </View>
-            </View>
 
-            {/* ─── KONTO ─── */}
-            <Text style={s.sectionLabel}>KONTO</Text>
-            <View style={s.card}>
-
-              <TouchableOpacity style={s.row} onPress={startPinChange} activeOpacity={0.7}>
-                <View style={s.rowIcon}><Icon name="key" size={rs(17)} color={c.textSec} /></View>
-                <View style={s.rowInfo}>
-                  <Text style={s.rowTitle}>Passwort ändern</Text>
-                </View>
-                <Icon name="chevron-right" size={rs(17)} color={c.textFaint} />
-              </TouchableOpacity>
-
-              <View style={s.sep} />
-
-              <TouchableOpacity
-                style={s.row}
-                onPress={() => { onClose(); setTimeout(onLogout, 300); }}
-                activeOpacity={0.7}
-              >
-                <View style={s.rowIcon}><Icon name="log-out" size={rs(17)} color={c.accent} /></View>
-                <View style={s.rowInfo}>
-                  <Text style={s.rowTitle}>Tresor sperren</Text>
-                </View>
-                <Icon name="chevron-right" size={rs(17)} color={c.textFaint} />
-              </TouchableOpacity>
             </View>
 
             {/* ─── DATEN ─── */}
@@ -763,8 +826,6 @@ export default function SettingsScreen({
                   {([
                     { label: 'Sperren', value: 'lock' as const },
                     { label: 'Löschen', value: 'wipe' as const },
-                    { label: 'Täuschung', value: 'decoy' as const },
-                    { label: 'Alles', value: 'all' as const },
                   ]).map(opt => (
                     <TouchableOpacity
                       key={opt.value}
@@ -922,31 +983,53 @@ export default function SettingsScreen({
             <View style={s.promptBox}>
               <Text style={s.promptTitle}>{spModal?.title}</Text>
               <Text style={s.promptSub}>{spModal?.sub}</Text>
-              <TextInput
-                style={[s.pinInput, { marginBottom: rs(8) }]}
-                value={spNew}
-                onChangeText={(v) => { setSpNew(v.slice(0, 128)); setSpErr(''); }}
-                secureTextEntry
-                placeholder={`Neue PIN (min. ${settings.minPinLength} Zeichen)`}
-                placeholderTextColor={c.textTer}
-                autoFocus
-                autoCapitalize="none"
-                autoCorrect={false}
-                maxLength={128}
-                editable={!spBusy}
-              />
-              <TextInput
-                style={s.pinInput}
-                value={spConfirm}
-                onChangeText={(v) => { setSpConfirm(v.slice(0, 128)); setSpErr(''); }}
-                secureTextEntry
-                placeholder="PIN bestätigen"
-                placeholderTextColor={c.textTer}
-                autoCapitalize="none"
-                autoCorrect={false}
-                maxLength={128}
-                editable={!spBusy}
-              />
+              <View style={[s.passField, { marginBottom: rs(8) }]}>
+                <Icon name="key" size={rs(17)} color={c.textTer} />
+                <TextInput
+                  style={s.passInput}
+                  value={spNew}
+                  onChangeText={(v) => { setSpNew(v.slice(0, 128)); setSpErr(''); }}
+                  secureTextEntry={!showSpNew}
+                  placeholder="Neue PIN (min. 8 Zeichen)"
+                  placeholderTextColor={c.textTer}
+                  autoFocus
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  maxLength={128}
+                  editable={!spBusy}
+                />
+                <TouchableOpacity
+                  style={s.eyeBtn}
+                  onPress={() => setShowSpNew(v => !v)}
+                  activeOpacity={0.7}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                >
+                  <Icon name={showSpNew ? 'eye-off' : 'eye'} size={rs(17)} color={c.textTer} />
+                </TouchableOpacity>
+              </View>
+              <View style={s.passField}>
+                <Icon name="key" size={rs(17)} color={c.textTer} />
+                <TextInput
+                  style={s.passInput}
+                  value={spConfirm}
+                  onChangeText={(v) => { setSpConfirm(v.slice(0, 128)); setSpErr(''); }}
+                  secureTextEntry={!showSpConfirm}
+                  placeholder="PIN bestätigen"
+                  placeholderTextColor={c.textTer}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  maxLength={128}
+                  editable={!spBusy}
+                />
+                <TouchableOpacity
+                  style={s.eyeBtn}
+                  onPress={() => setShowSpConfirm(v => !v)}
+                  activeOpacity={0.7}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                >
+                  <Icon name={showSpConfirm ? 'eye-off' : 'eye'} size={rs(17)} color={c.textTer} />
+                </TouchableOpacity>
+              </View>
               {!!spErr && <Text style={s.pinError}>{spErr}</Text>}
               <View style={s.pinBtns}>
                 <TouchableOpacity style={s.pinCancelBtn} onPress={() => !spBusy && setSpModal(null)} activeOpacity={0.7} disabled={spBusy}>
@@ -974,19 +1057,30 @@ export default function SettingsScreen({
             <View style={s.promptBox}>
               <Text style={s.promptTitle}>{pp?.title}</Text>
               <Text style={s.promptSub}>{pp?.sub}</Text>
-              <TextInput
-                style={s.pinInput}
-                value={ppVal}
-                onChangeText={(v) => { setPpVal(v.slice(0, 128)); setPpErr(''); }}
-                secureTextEntry
-                placeholder="Passwort eingeben"
-                placeholderTextColor={c.textTer}
-                autoFocus
-                autoCapitalize="none"
-                autoCorrect={false}
-                maxLength={128}
-                editable={!ppBusy}
-              />
+              <View style={s.passField}>
+                <Icon name="key" size={rs(17)} color={c.textTer} />
+                <TextInput
+                  style={s.passInput}
+                  value={ppVal}
+                  onChangeText={(v) => { setPpVal(v.slice(0, 128)); setPpErr(''); }}
+                  secureTextEntry={!showPpPass}
+                  placeholder="Passwort eingeben"
+                  placeholderTextColor={c.textTer}
+                  autoFocus
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  maxLength={128}
+                  editable={!ppBusy}
+                />
+                <TouchableOpacity
+                  style={s.eyeBtn}
+                  onPress={() => setShowPpPass(v => !v)}
+                  activeOpacity={0.7}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                >
+                  <Icon name={showPpPass ? 'eye-off' : 'eye'} size={rs(17)} color={c.textTer} />
+                </TouchableOpacity>
+              </View>
               {!!ppErr && <Text style={s.pinError}>{ppErr}</Text>}
               <View style={s.pinBtns}>
                 <TouchableOpacity style={s.pinCancelBtn} onPress={() => !ppBusy && setPp(null)} activeOpacity={0.7} disabled={ppBusy}>
@@ -1167,6 +1261,31 @@ const s = StyleSheet.create({
   sliderDotActive: {
     backgroundColor: c.accent,
     height: rs(10),
+  },
+
+  // Password field with eye toggle (shared across PIN change + modals)
+  passField: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: rs(11),
+    backgroundColor: c.inset,
+    borderRadius: radius.input,
+    borderWidth: 1,
+    borderColor: c.border2,
+    paddingHorizontal: rs(14),
+    height: rs(58),
+    marginBottom: rs(12),
+  },
+  passInput: {
+    flex: 1,
+    fontFamily: font.mono,
+    fontSize: rs(16),
+    color: c.text,
+    letterSpacing: rs(0.6),
+    padding: 0,
+  },
+  eyeBtn: {
+    padding: rs(6),
   },
 
   // PIN change page

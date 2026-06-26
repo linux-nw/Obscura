@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Obscura FileVault</title>
+<link rel="stylesheet" href="obscura/notx-tokens.css" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Space+Mono:wght@400;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" />
+<link rel="stylesheet" href="obscura/theme.css" />
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #060607; overflow: hidden; }
+  #stage {
+    position: fixed; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    background: #060607;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.018) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.018) 1px, transparent 1px);
+    background-size: 34px 34px;
+  }
+  #scaler { transform-origin: center center; }
+  .device-host { position: relative; }
+  ::selection { background: rgba(233,162,59,0.3); }
+</style>
+</head>
+<body>
+  <div id="stage">
+    <div id="scaler">
+      <div id="root"></div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+  <script src="obscura/data.js"></script>
+  <script type="text/babel" src="frames/android-frame.jsx"></script>
+  <script type="text/babel" src="tweaks-panel.jsx"></script>
+  <script type="text/babel" src="obscura/icons.jsx"></script>
+  <script type="text/babel" src="obscura/components.jsx"></script>
+  <script type="text/babel" src="obscura/modals.jsx"></script>
+  <script type="text/babel" src="obscura/screens.jsx"></script>
+  <script type="text/babel" src="obscura/main.jsx"></script>
+  <script type="text/babel" src="obscura/app.jsx"></script>
+
+  <script type="text/babel">
+    const { useEffect } = React;
+
+    const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+      "accent": "#E9A23B",
+      "warmth": "Nacht",
+      "unlockSeconds": 4,
+      "maxAttempts": 5,
+      "startEmpty": false,
+      "jumpTo": "Sperrbildschirm"
+    }/*EDITMODE-END*/;
+
+    function Root() {
+      const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
+
+      // map "warmth" radio to the boolean app prop name
+      const tw = {
+        accent: t.accent,
+        warmth: t.warmth === 'Kohle' ? 'Warm' : 'Kühl',
+        unlockSeconds: t.unlockSeconds,
+        maxAttempts: t.maxAttempts,
+        startEmpty: t.startEmpty,
+        jumpTo: t.jumpTo,
+      };
+
+      return (
+        <>
+          <div className="device-host">
+            <AndroidDevice dark width={412} height={892} bg={t.warmth === 'Kohle' ? '#100E0C' : '#0A0A0C'}>
+              <ObscuraApp tw={tw} />
+            </AndroidDevice>
+          </div>
+
+          <TweaksPanel title="Tweaks">
+            <TweakSection label="Erscheinung" />
+            <TweakColor label="Signalfarbe" value={t.accent}
+              options={['#E9A23B', '#C8702A', '#D94F4F', '#5BA8B0', '#9A8Cff', '#9AA23B']}
+              onChange={(v) => setTweak('accent', v)} />
+            <TweakRadio label="Gehäuse" value={t.warmth} options={['Nacht', 'Kohle']}
+              onChange={(v) => setTweak('warmth', v)} />
+
+            <TweakSection label="Verhalten" />
+            <TweakSlider label="Entsperr-Dauer" value={t.unlockSeconds} min={0.5} max={15} step={0.5} unit="s"
+              onChange={(v) => setTweak('unlockSeconds', v)} />
+            <TweakSlider label="Max. Versuche" value={t.maxAttempts} min={3} max={6} step={1}
+              onChange={(v) => setTweak('maxAttempts', v)} />
+            <TweakToggle label="Tresor leer starten" value={t.startEmpty}
+              onChange={(v) => setTweak('startEmpty', v)} />
+
+            <TweakSection label="Zustand anspringen" />
+            <TweakSelect label="Screen" value={t.jumpTo}
+              options={['Ersteinrichtung', 'Sperrbildschirm', 'Entsperren läuft', 'Tresor (entsperrt)', 'Lockout / Wipe']}
+              onChange={(v) => setTweak('jumpTo', v)} />
+          </TweaksPanel>
+        </>
+      );
+    }
+
+    /* ---- viewport scaling: fit the 402×874 device into the stage ---- */
+    function fitDevice() {
+      const W = 412, H = 892, margin = 24;
+      const sw = window.innerWidth - margin * 2;
+      const sh = window.innerHeight - margin * 2;
+      const scale = Math.min(sw / W, sh / H, 1.1);
+      const sc = document.getElementById('scaler');
+      if (sc) sc.style.transform = `scale(${scale})`;
+    }
+    window.addEventListener('resize', fitDevice);
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<Root />);
+    requestAnimationFrame(fitDevice);
+    setTimeout(fitDevice, 120);
+    setTimeout(fitDevice, 600);
+  </script>
+</body>
+</html>
