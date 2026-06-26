@@ -472,13 +472,30 @@ JS (@noble) implementations locked to the **same** constant so they are byte-ide
 | XChaCha20-Poly1305-IETF | draft-irtf-cfrg-xchacha-03 §A.3.1 (ct `bd6d…b52e`, tag `c087…cf49`) | `__tests__/XChaCha20KAT.test.ts` (@noble/ciphers) | `androidTest/XChaCha20BridgeTest.kt::xchacha20_official_kat_a31` (libsodium) — **same constants** |
 | Constant-time compare | `sodium_memcmp` equal→0 / differ→≠0 | `__tests__/ConstantTimeEquals.test.ts` (JS fallback correctness) | `androidTest/ConstantTimeMemcmpTest.kt` (production `sodium_memcmp` path) |
 
-**Verification status: on-device VERIFIED on 2026-06-24** (working tree atop commit
-`4059f92`), AVD `Medium_Phone_API_36.1` (Android 16 / API 36, x86_64), libsodium via
-`lazysodium-android:5.1.0`. `./gradlew :app:connectedDebugAndroidTest` reported
-`tests=9, failures=0, errors=0`: `nativeArgon2idMatchesKnownAnswer`,
-`xchacha20_official_kat_a31` (+roundtrip/tamper/AAD/determinism), and the three
-`sodium_memcmp` cases all passed. Each native KAT produced byte-identical output to the
-published IETF/RFC vector AND to its JS counterpart's pinned constant.
+**Verification status: on-device VERIFIED (x86_64) on 2026-06-24, re-verified
+2026-06-26** — AVD `Medium_Phone_API_36.1` (Android 16 / API 36, x86_64), libsodium via
+`lazysodium-android:5.1.0`. `./gradlew :app:connectedDebugAndroidTest
+-PreactNativeArchitectures=x86_64` reported `tests=15, failures=0, errors=0`: the three
+native KATs — `nativeArgon2idMatchesKnownAnswer`, `xchacha20_official_kat_a31`
+(+roundtrip/tamper/AAD/determinism), the three `sodium_memcmp` cases — plus the six
+end-to-end bridge-roundtrip cases (§13.2). Each native KAT produced byte-identical output
+to the published IETF/RFC vector AND to its JS counterpart's pinned constant.
+
+**arm64-v8a: NOT verified on this host (documented limitation, not a crypto defect).**
+The arm64 APK builds correctly (`lib/arm64-v8a/libsodium.so` + `libreactnative.so`
+packaged) and installs as `primaryCpuAbi=arm64-v8a`, but it cannot run on an x86_64
+emulator's arm64-translation layer: React Native's SoLoader resolves the in-APK native
+folder from the device's *primary* ABI, which the emulator reports as `x86_64`
+(`Build.SUPPORTED_ABIS[0]`). It therefore looks for `base.apk!/lib/x86_64`, which the
+arm64-only APK does not contain, so `libreactnative.so` is never found and
+`MainApplication.onCreate` crashes before any instrumentation test executes (`tests=0`).
+Because every `androidTest` runs the app `Application.onCreate` first, there is no
+KAT-only path around this. Real arm64 verification therefore requires an arm64 runtime
+where the primary ABI is `arm64-v8a` — a physical arm64 device (the app's actual target)
+or a self-hosted arm64 runner — running the SAME, ABI-agnostic test sources with
+`-PreactNativeArchitectures=arm64-v8a`. libsodium and @noble are endianness-correct and
+arm64 is little-endian like x86_64, so byte-equality is expected but remains formally
+unverified until run on real arm64 hardware.
 
 Cross-impl equality (Argon2id, XChaCha20) is therefore established, not assumed: each
 native KAT asserts the identical bytes its JS counterpart asserts, and both match the
@@ -489,9 +506,15 @@ is absent.
 
 ### 13.2 Remaining coverage gaps
 
-- **End-to-end JNI glue:** the KATs above pin the libsodium primitives and the JS glue
-  separately. A single test that drives `RNFileVaultModule.encrypt/decrypt/argon2id`
-  through the React bridge end-to-end still runs on-device only.
+- **End-to-end JNI glue (closed on x86_64):** `androidTest/RNFileVaultBridgeRoundtripTest.kt`
+  drives `RNFileVaultModule.encrypt`→`decrypt` through the real bridge surface
+  (`ReadableMap` in, `Promise` out), exercising the marshalling the primitive KATs skip:
+  Base64 of the payload, hex parse of key/nonce/tag, the detached-tag split, and the
+  AAD-from-hex path. Covers empty / 1-byte / >1 MiB roundtrips, a one-byte-flip tamper
+  case (Poly1305 must reject), and an AAD-mismatch case. Verified `tests=15, failures=0`
+  on x86_64 (2026-06-26). The `argon2id` bridge method is still only covered at the
+  primitive level. arm64 execution of this test is blocked by the SoLoader limitation in
+  §13.1 (needs real arm64 hardware).
 - **`HardwareKeystoreService`:** tested only indirectly (via BackupService). No unit test
   exercises its wrapper methods in isolation.
 
@@ -583,3 +606,12 @@ as protection against future key leakage, not as a secure wipe of old data.
 | TS-fix | — | `PanicService.triggerPanicAction` switch had unreachable `case 'decoy'`/`case 'all'` (TS2678) after `triggerAction` was narrowed to `'wipe' \| 'lock'`. Verified the narrowing was an **uncommitted working-tree change** (HEAD `4059f92` compiled clean), not pre-existing in the last commit and not from the S1 KDF edit. Removed the dead cases (load-time coercion already forced `wipe`/`lock`, so zero runtime change; decoy is reached via the decoy PIN). `tsc --noEmit` now passes with 0 errors. |
 | CI | — | `.github/workflows/android-kat.yml` runs `connectedDebugAndroidTest` on a `reactivecircus/android-emulator-runner` emulator (primes the missing debug AARs, x86_64 ABI) so the on-device proof is re-verified automatically instead of manually. |
 | Spec | — | §13/§13.1 updated: JS suite is **91 tests / 20 suites**; native verification status "on-device VERIFIED on 2026-06-24". |
+
+### Change Log — Round 6.1 (secure + close residual gaps)
+
+| ID | Severity | Fix |
+|----|----------|-----|
+| Secure | — | Round 6 working tree committed onto branch `feat/round6-crypto-final` as three clean Round-6 commits (native KAT+CI / honest crypto backend names / PanicService TS2678) plus two labelled sweep commits (support test+service layer, non-crypto WIP), `git status` clean. `tsc --noEmit` 0 errors and JS suite **20 suites / 91 tests** green verified *after* committing. |
+| Bridge | High | New `androidTest/RNFileVaultBridgeRoundtripTest.kt` drives `RNFileVaultModule.encrypt`→`decrypt` through the real bridge (`ReadableMap`/`Promise`), covering the marshalling the primitive KATs skip (Base64/hex/detached-tag-split/AAD), with empty/1-byte/>1 MiB roundtrips, a Poly1305 tamper case and an AAD-mismatch case. Verified **`tests=15, failures=0`** on x86_64 (2026-06-26) — the §13.2 "end-to-end JNI glue" gap is closed on x86_64. |
+| arm64 | — | Attempted arm64-v8a on-device run via the API-36 emulator's arm64 translation. The arm64 APK builds and installs correctly (`primaryCpuAbi=arm64-v8a`) but crashes at `MainApplication.onCreate`: RN's SoLoader looks up `base.apk!/lib/x86_64` (the emulator's *primary* ABI) while the arm64-only APK has no `lib/x86_64`, so `libreactnative.so` is not found and **0 tests run**. Documented in §13.1 as a host/translation limitation (not a crypto defect); real arm64 verification needs a physical arm64 device or self-hosted arm64 runner. **Not** marked verified. |
+| CI | — | `android-kat.yml`: arm64 emulator matrix is **not** added — verified infeasible on GitHub-hosted runners (`ubuntu-24.04-arm` has no `/dev/kvm`; x86_64 runners hit the same SoLoader/translation wall as above). arm64 left as a documented manual/self-hosted step. |

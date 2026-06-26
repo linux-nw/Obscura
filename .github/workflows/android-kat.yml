@@ -1,9 +1,18 @@
 name: Android Native Crypto KAT (S4/S7)
 
 # Runs the on-device libsodium Known-Answer Tests (Argon2id crypto_pwhash,
-# XChaCha20-Poly1305 §A.3.1, sodium_memcmp) on an emulator, so the native half of the
+# XChaCha20-Poly1305 §A.3.1, sodium_memcmp) AND the end-to-end bridge roundtrip
+# (RNFileVaultBridgeRoundtripTest) on an x86_64 emulator, so the native half of the
 # "native == published vector == JS" cross-impl proof is re-verified automatically and
-# does not depend on a manual run. See CRYPTO_PROTOCOL_SPEC.md §13.1.
+# does not depend on a manual run. See CRYPTO_PROTOCOL_SPEC.md §13.1 / §13.2.
+#
+# arm64-v8a is intentionally NOT a matrix entry here. It is not runnable on GitHub-hosted
+# runners: `ubuntu-24.04-arm` has no /dev/kvm (no hardware-accelerated emulator), and on
+# x86_64 runners an arm64-only APK crashes at startup because React Native's SoLoader
+# resolves native libs from the device's primary ABI (x86_64) while the APK ships only
+# lib/arm64-v8a — see §13.1. Real arm64 verification is a documented manual/self-hosted
+# step on a physical arm64 device (the app's actual target) running the SAME test sources
+# with `-PreactNativeArchitectures=arm64-v8a`.
 
 on:
   push:
