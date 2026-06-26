@@ -72,6 +72,8 @@ export default function App() {
     // AutoLock-Callback: sperrt UI wenn Timer abläuft oder App in Background geht
     AutoLockService.setLockCallback(() => {
       CryptoService.clearAllCaches();
+      // Layer 5: drop any decrypted view-temp plaintext from the cache on lock.
+      FileManager.cleanupViewTemps().catch(() => {});
       setIsAuthenticated(false);
     });
 
@@ -263,9 +265,14 @@ export default function App() {
         await NotesService.deleteNote(note.id);
       }
 
+      // Layer 5 crypto-shred: destroying the master key renders every remaining blob
+      // permanently undecryptable, regardless of whether the ciphertext bytes still linger
+      // on flash (wear-leveling makes overwrite unreliable; key destruction does not).
+      // deleteEncryptionKey + deletePinData read-back-verify the secrets are gone.
       await CryptoService.deletePinData();
       await CryptoService.deleteEncryptionKey();
       CryptoService.clearAllCaches();
+      await FileManager.cleanupViewTemps();
       await CryptoService.setAppInitialized(false);
 
       setIsFirstLaunch(true);

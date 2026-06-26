@@ -73,6 +73,8 @@ class SecureFileManager {
       }
       // H3: drop any leftover .tmp from an interrupted atomic write.
       await cleanupTempFiles(this.VAULT_DIR);
+      // Layer 5: sweep any plaintext view-temp left in cache by a previous crash/kill.
+      await this.cleanupViewTemps();
     } catch (error) {
       console.error('Error initializing vault:', error);
       throw new Error('Konnte Tresor nicht initialisieren');
@@ -367,8 +369,50 @@ class SecureFileManager {
     try {
       const cacheDir = FileSystem.cacheDirectory || '';
       if (uri && cacheDir && uri.startsWith(cacheDir)) {
-        await FileSystem.deleteAsync(uri, { idempotent: true });
+        await this.overwriteThenDelete(uri);
       }
+    } catch {
+      // best-effort
+    }
+  }
+
+  /**
+   * Layer 5: best-effort overwrite of a plaintext cache temp with zeros before deleting,
+   * then delete. NAND-Disclaimer: on flash/wear-leveling the overwrite may hit a fresh
+   * block, so this is defense-in-depth, not a guarantee — the reliable protection is that
+   * the temp is short-lived and swept on lock/start (cleanupViewTemps), and that the
+   * vault's at-rest data is crypto-shredded (master-key destruction) on wipe.
+   */
+  private static async overwriteThenDelete(uri: string): Promise<void> {
+    try {
+      const info = await FileSystem.getInfoAsync(uri);
+      if (info.exists && typeof info.size === 'number' && info.size > 0) {
+        const cap = Math.min(info.size, 2 * 1024 * 1024); // cap overwrite work at 2 MiB
+        // base64 of zero bytes: 'AAAA' encodes 3 zero bytes → length scaled to cap.
+        const zeros = 'A'.repeat(Math.ceil(cap / 3) * 4);
+        await FileSystem.writeAsStringAsync(uri, zeros, { encoding: FileSystem.EncodingType.Base64 });
+      }
+    } catch {
+      // overwrite is best-effort; still attempt deletion below
+    }
+    await FileSystem.deleteAsync(uri, { idempotent: true });
+  }
+
+  /**
+   * Layer 5: sweep every leftover plaintext view-temp (vault_view_*) from the cache dir.
+   * Called on app start and on lock so a crash/kill that left a decrypted temp behind does
+   * not leave plaintext in the sandbox cache.
+   */
+  static async cleanupViewTemps(): Promise<void> {
+    try {
+      const cacheDir = FileSystem.cacheDirectory || '';
+      if (!cacheDir) return;
+      const entries = await FileSystem.readDirectoryAsync(cacheDir);
+      await Promise.all(
+        entries
+          .filter(name => name.startsWith('vault_view_'))
+          .map(name => this.overwriteThenDelete(`${cacheDir}${name}`).catch(() => {})),
+      );
     } catch {
       // best-effort
     }
