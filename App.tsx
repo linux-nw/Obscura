@@ -58,6 +58,11 @@ export default function App() {
   const [isCryptoReady, setIsCryptoReady]     = useState(false);
   const [securityStatus, setSecurityStatus]   = useState<'secure' | 'warning' | 'critical'>('secure');
   const [isDecoy, setIsDecoy]                 = useState(false);
+  // Layer 1: privacy overlay shown whenever the app is not in the foreground, so any frame
+  // the OS or an onlooker could capture during a transition shows a blank brand screen
+  // instead of vault content. FLAG_SECURE (MainActivity) is the primary Recents-snapshot
+  // defense; this overlay is additional cover for the in-app transition frame.
+  const [obscured, setObscured]               = useState(false);
 
   const isAuthRef = useRef(false);
   isAuthRef.current = isAuthenticated;
@@ -71,6 +76,8 @@ export default function App() {
     });
 
     const appStateSubscription = AppState.addEventListener('change', (nextAppState: AppStateStatus) => {
+      // Show the privacy overlay for any non-foreground state (background / iOS inactive).
+      setObscured(nextAppState !== 'active');
       if (nextAppState === 'background') {
         // F2/Picker: skip the lock+clear when a system picker is open — that
         // backgrounding is an expected, controlled in-app action and the master
@@ -270,6 +277,11 @@ export default function App() {
           onWipeVault={handleWipeVault}
         />
       )}
+      {obscured && (
+        <View style={styles.privacyOverlay} pointerEvents="none">
+          <VaultMark size={64} />
+        </View>
+      )}
     </View>
     </SafeAreaProvider>
   );
@@ -278,4 +290,11 @@ export default function App() {
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#0A0A0C' },
   splash: { flex: 1, backgroundColor: '#0A0A0C', alignItems: 'center', justifyContent: 'center' },
+  privacyOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: '#0A0A0C',
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 9999,
+  },
 });
