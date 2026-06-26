@@ -1,0 +1,87 @@
+name: Android Native Crypto KAT (S4/S7)
+
+# Runs the on-device libsodium Known-Answer Tests (Argon2id crypto_pwhash,
+# XChaCha20-Poly1305 §A.3.1, sodium_memcmp) on an emulator, so the native half of the
+# "native == published vector == JS" cross-impl proof is re-verified automatically and
+# does not depend on a manual run. See CRYPTO_PROTOCOL_SPEC.md §13.1.
+
+on:
+  push:
+    paths:
+      - 'android/**'
+      - 'src/native/**'
+      - '__tests__/XChaCha20KAT.test.ts'
+      - '__tests__/Argon2idReal.test.ts'
+      - '.github/workflows/android-kat.yml'
+  pull_request:
+    paths:
+      - 'android/**'
+      - 'src/native/**'
+  workflow_dispatch:
+
+jobs:
+  androidTest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # KVM is required for a hardware-accelerated emulator on GitHub-hosted runners.
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm ci
+
+      # The offline local-maven cache ships only the *-release* AARs of react-android /
+      # hermes-android. connectedDebugAndroidTest needs the *-debug* variants; because the
+      # local-maven Gradle Module Metadata (.module) declares them, Gradle resolves from
+      # local-maven and will NOT fall back to Maven Central for the missing file. Prime the
+      # missing debug AARs from Maven Central (their bytes match the .module-declared
+      # size/sha256, so Gradle verification passes). This is exactly the manual fix used to
+      # get the first on-device run green.
+      - name: Prime missing debug AARs into local-maven
+        working-directory: android/local-maven
+        run: |
+          set -euo pipefail
+          BASE="https://repo1.maven.org/maven2"
+          find . -name '*-release.aar' | while read -r rel; do
+            dbg="${rel/-release.aar/-debug.aar}"
+            if [ ! -f "$dbg" ]; then
+              # ./com/facebook/react/react-android/0.81.5/react-android-0.81.5-release.aar
+              path="${dbg#./}"
+              echo "Downloading $path"
+              curl -fsSL -o "$dbg" "$BASE/$path"
+            fi
+          done
+
+      - name: Run on-device crypto KATs
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          NODE_ENV: development
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          force-avd-creation: false
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          disable-animations: true
+          script: ./android/gradlew -p android :app:connectedDebugAndroidTest -PreactNativeArchitectures=x86_64 --console=plain -x lint
+
+      - name: Upload androidTest report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-kat-report
+          path: android/app/build/reports/androidTests/connected/**
