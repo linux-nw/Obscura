@@ -481,21 +481,19 @@ native KATs — `nativeArgon2idMatchesKnownAnswer`, `xchacha20_official_kat_a31`
 end-to-end bridge-roundtrip cases (§13.2). Each native KAT produced byte-identical output
 to the published IETF/RFC vector AND to its JS counterpart's pinned constant.
 
-**arm64-v8a: NOT verified on this host (documented limitation, not a crypto defect).**
-The arm64 APK builds correctly (`lib/arm64-v8a/libsodium.so` + `libreactnative.so`
-packaged) and installs as `primaryCpuAbi=arm64-v8a`, but it cannot run on an x86_64
-emulator's arm64-translation layer: React Native's SoLoader resolves the in-APK native
-folder from the device's *primary* ABI, which the emulator reports as `x86_64`
-(`Build.SUPPORTED_ABIS[0]`). It therefore looks for `base.apk!/lib/x86_64`, which the
-arm64-only APK does not contain, so `libreactnative.so` is never found and
-`MainApplication.onCreate` crashes before any instrumentation test executes (`tests=0`).
-Because every `androidTest` runs the app `Application.onCreate` first, there is no
-KAT-only path around this. Real arm64 verification therefore requires an arm64 runtime
-where the primary ABI is `arm64-v8a` — a physical arm64 device (the app's actual target)
-or a self-hosted arm64 runner — running the SAME, ABI-agnostic test sources with
-`-PreactNativeArchitectures=arm64-v8a`. libsodium and @noble are endianness-correct and
-arm64 is little-endian like x86_64, so byte-equality is expected but remains formally
-unverified until run on real arm64 hardware.
+**arm64-v8a: on-device VERIFIED on 2026-06-26** — physical device Samsung **SM-S906B**
+(Galaxy S22+, arm64-v8a), Android 16, libsodium via `lazysodium-android:5.1.0`, branch
+`feat/round6-crypto-final`. `./gradlew :app:connectedDebugAndroidTest
+-PreactNativeArchitectures=arm64-v8a` reported `tests=15, failures=0, errors=0` — the same
+9 native KATs + 6 bridge-roundtrip cases as the x86_64 run, byte-identical to the published
+IETF/RFC vectors AND to the JS constants on native arm64. Cross-impl byte-equality is now
+established on **both** ABIs (x86_64 and arm64-v8a), not assumed.
+
+(Note: the arm64 verification is done on a real device, not the emulator. On an x86_64
+emulator's arm64-translation layer the app crashes at startup, because React Native's
+SoLoader resolves the in-APK native folder from the device's *primary* ABI — `x86_64`
+there — so an arm64-only APK's `libreactnative.so` is not found. A physical arm64 device
+has primary ABI `arm64-v8a`, so the same test sources run unmodified.)
 
 Cross-impl equality (Argon2id, XChaCha20) is therefore established, not assumed: each
 native KAT asserts the identical bytes its JS counterpart asserts, and both match the
@@ -512,9 +510,8 @@ is absent.
   Base64 of the payload, hex parse of key/nonce/tag, the detached-tag split, and the
   AAD-from-hex path. Covers empty / 1-byte / >1 MiB roundtrips, a one-byte-flip tamper
   case (Poly1305 must reject), and an AAD-mismatch case. Verified `tests=15, failures=0`
-  on x86_64 (2026-06-26). The `argon2id` bridge method is still only covered at the
-  primitive level. arm64 execution of this test is blocked by the SoLoader limitation in
-  §13.1 (needs real arm64 hardware).
+  on **both** x86_64 (emulator) and arm64-v8a (device SM-S906B), 2026-06-26. The
+  `argon2id` bridge method is still only covered at the primitive level.
 - **`HardwareKeystoreService`:** tested only indirectly (via BackupService). No unit test
   exercises its wrapper methods in isolation.
 
@@ -613,5 +610,5 @@ as protection against future key leakage, not as a secure wipe of old data.
 |----|----------|-----|
 | Secure | — | Round 6 working tree committed onto branch `feat/round6-crypto-final` as three clean Round-6 commits (native KAT+CI / honest crypto backend names / PanicService TS2678) plus two labelled sweep commits (support test+service layer, non-crypto WIP), `git status` clean. `tsc --noEmit` 0 errors and JS suite **20 suites / 91 tests** green verified *after* committing. |
 | Bridge | High | New `androidTest/RNFileVaultBridgeRoundtripTest.kt` drives `RNFileVaultModule.encrypt`→`decrypt` through the real bridge (`ReadableMap`/`Promise`), covering the marshalling the primitive KATs skip (Base64/hex/detached-tag-split/AAD), with empty/1-byte/>1 MiB roundtrips, a Poly1305 tamper case and an AAD-mismatch case. Verified **`tests=15, failures=0`** on x86_64 (2026-06-26) — the §13.2 "end-to-end JNI glue" gap is closed on x86_64. |
-| arm64 | — | Attempted arm64-v8a on-device run via the API-36 emulator's arm64 translation. The arm64 APK builds and installs correctly (`primaryCpuAbi=arm64-v8a`) but crashes at `MainApplication.onCreate`: RN's SoLoader looks up `base.apk!/lib/x86_64` (the emulator's *primary* ABI) while the arm64-only APK has no `lib/x86_64`, so `libreactnative.so` is not found and **0 tests run**. Documented in §13.1 as a host/translation limitation (not a crypto defect); real arm64 verification needs a physical arm64 device or self-hosted arm64 runner. **Not** marked verified. |
-| CI | — | `android-kat.yml`: arm64 emulator matrix is **not** added — verified infeasible on GitHub-hosted runners (`ubuntu-24.04-arm` has no `/dev/kvm`; x86_64 runners hit the same SoLoader/translation wall as above). arm64 left as a documented manual/self-hosted step. |
+| arm64 | High | arm64-v8a **on-device VERIFIED** on physical device Samsung SM-S906B (Galaxy S22+, arm64-v8a), Android 16, lazysodium 5.1.0, 2026-06-26: `./gradlew :app:connectedDebugAndroidTest -PreactNativeArchitectures=arm64-v8a` → `tests=15, failures=0, errors=0` (9 native KATs + 6 bridge cases), byte-identical to the published vectors and the JS constants on native arm64. Cross-impl byte-equality now established on **both** ABIs. §13.1/§13.2 set to VERIFIED. (Earlier x86_64-emulator arm64-translation attempt failed at startup — RN SoLoader resolves libs by the emulator's primary ABI x86_64; resolved by running on real arm64 hardware where the primary ABI is arm64-v8a.) |
+| CI | — | `android-kat.yml` runs the suite on an x86_64 emulator. An arm64 emulator matrix is deliberately **not** added — infeasible on GitHub-hosted runners (`ubuntu-24.04-arm` has no `/dev/kvm`; x86_64 runners hit the SoLoader/primary-ABI wall). arm64 is verified by the documented manual on-device run above. |
