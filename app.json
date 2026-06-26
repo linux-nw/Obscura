@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "FileVault",
-    "slug": "FileVault",
+    "name": "Obscura",
+    "slug": "obscura",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -26,7 +26,8 @@
           "iCloudContainerEnvironment": "Production"
         }
       ],
-      "expo-secure-store"
+      "expo-secure-store",
+      "expo-video"
     ],
     "ios": {
       "supportsTablet": true,

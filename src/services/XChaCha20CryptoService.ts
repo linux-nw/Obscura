@@ -60,7 +60,7 @@ export class XChaCha20CryptoService {
     console.warn('XChaCha20CryptoService.generateSecureKey() ist veraltet!');
     try {
       const bytes = await CryptoModule.getRandomBytesAsync(32);
-      return bufferToHex(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+      return bufferToHex(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer);
     } catch (error) {
       throw new Error('AES-256 Key Generierung fehlgeschlagen');
     }
@@ -188,7 +188,7 @@ export class XChaCha20CryptoService {
 // Export helper function für Argon2id mit AES-256
 export async function generateArgon2Salt(): Promise<string> {
   const bytes = await CryptoModule.getRandomBytesAsync(16);
-  return bufferToHex(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+  return bufferToHex(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer);
 }
 
 export default XChaCha20CryptoService;

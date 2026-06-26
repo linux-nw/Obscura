@@ -1,6 +1,8 @@
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Crypto from 'expo-crypto';
 import { SecureCryptoService as CryptoService } from './CryptoService';
+import { writeFileAtomic, cleanupTempFiles } from './fsAtomic';
+import { BlobVersionService } from './BlobVersionService';
 
 /**
  * Interface für die Key-Rotation: Re-Verschlüsselung aller Dateien nach PIN-Änderung
@@ -53,6 +55,7 @@ export interface FileMetadata {
   createdAt: Date;
   iv: string;
   mac: string;
+  version: number; // A3: blob version bound into the AAD
 }
 
 class SecureFileManager {
@@ -68,6 +71,8 @@ class SecureFileManager {
       if (!dirInfo.exists) {
         await FileSystem.makeDirectoryAsync(this.VAULT_DIR, { intermediates: true });
       }
+      // H3: drop any leftover .tmp from an interrupted atomic write.
+      await cleanupTempFiles(this.VAULT_DIR);
     } catch (error) {
       console.error('Error initializing vault:', error);
       throw new Error('Konnte Tresor nicht initialisieren');
@@ -76,7 +81,7 @@ class SecureFileManager {
 
   /**
    * Speichert eine Datei im Tresor
-   * - Verschlüsselt den Dateiinhalt mit AES-256-GCM
+   * - Verschlüsselt den Dateiinhalt mit XChaCha20-Poly1305 (AES-CBC+HMAC als Fallback)
    * - Verschlüsselt Metadaten (Originalname, Type)
    * - Generiert sichere File-ID
    */
@@ -104,61 +109,136 @@ class SecureFileManager {
         });
       }
 
-      // Verschlüsselt Dateiinhalt
-      const { encryptedData, iv, mac } = await CryptoService.encryptFile(fileContent);
-
-      // Generiert sichere File-ID
+      // Generiert sichere File-ID zuerst — wird als AAD-Kontext gebunden (H2)
       const fileId = await this.generateSecureFileId();
       const fileName = `file_${fileId}`;
+      // A3: neue Version für dieses Objekt (Files sind immutable → bleibt v1).
+      const version = await BlobVersionService.nextVersion(fileId);
 
-      // Verschlüsselt Metadaten
-      const { encryptedData: encryptedOriginalName, iv: ivName, mac: macName } = await CryptoService.encryptMetadata(originalName);
-      const { encryptedData: encryptedType, iv: ivType, mac: macType } = await CryptoService.encryptMetadata(type);
+      // Verschlüsselt Inhalt + Metadaten, gebunden an fileId:role:vN (H2 + A3)
+      const { encryptedData, iv, mac } = await CryptoService.encryptFile(fileContent, `${fileId}:content:v${version}`);
+      const { encryptedData: encryptedOriginalName, iv: ivName, mac: macName } = await CryptoService.encryptMetadata(originalName, `${fileId}:name:v${version}`);
+      const { encryptedData: encryptedType, iv: ivType, mac: macType } = await CryptoService.encryptMetadata(type, `${fileId}:type:v${version}`);
 
-      // Speichert verschlüsselte Metadaten
-      const encryptedMetadata: EncryptedFileMetadata = {
-        id: fileId,
-        name: fileName,
-        originalName: { data: encryptedOriginalName, iv: ivName, mac: macName },
-        type: { data: encryptedType, iv: ivType, mac: macType },
-        size: encryptedData.length,
-        createdAt: new Date(),
-        iv,
-        mac,
-      };
-
-      await FileSystem.writeAsStringAsync(
+      const createdAt = new Date();
+      await writeFileAtomic(
         `${this.VAULT_DIR}${fileName}.meta.enc`,
         JSON.stringify({
           id: fileId,
-          originalName: encryptedMetadata.originalName,
-          type: encryptedMetadata.type,
-          size: encryptedMetadata.size,
-          createdAt: encryptedMetadata.createdAt.toISOString(),
-          iv: encryptedMetadata.iv,
-          mac: encryptedMetadata.mac,
+          name: fileName,
+          version,
+          originalName: { data: encryptedOriginalName, iv: ivName, mac: macName },
+          type: { data: encryptedType, iv: ivType, mac: macType },
+          size: encryptedData.length,
+          createdAt: createdAt.toISOString(),
+          iv,
+          mac,
         })
       );
+      await writeFileAtomic(`${this.VAULT_DIR}${fileName}`, encryptedData);
 
-      // Speichert verschlüsselten Dateiinhalt
-      await FileSystem.writeAsStringAsync(
-        `${this.VAULT_DIR}${fileName}`,
-        encryptedData
-      );
+      // A3: Floor erst NACH erfolgreichem (atomarem) Write anheben.
+      await BlobVersionService.advanceTo(fileId, version);
+
+      // F2: Lösche die Klartext-Kopie, die expo-document-picker/-image-picker
+      // ins Cache-Verzeichnis gelegt hat. Sonst bleibt das unverschlüsselte
+      // Original forensisch auslesbar im Cache liegen.
+      await this.deletePlaintextCacheCopy(fileUri);
 
       return {
-        id: encryptedMetadata.id,
-        name: encryptedMetadata.name,
+        id: fileId,
+        name: fileName,
         originalName: originalName, // Für UI: Klartext-Name
         type: type as 'image' | 'video' | 'document', // Für UI: Klartext-Type
-        size: encryptedMetadata.size,
-        createdAt: encryptedMetadata.createdAt,
-        iv: encryptedMetadata.iv,
-        mac: encryptedMetadata.mac,
+        size: encryptedData.length,
+        createdAt,
+        iv,
+        mac,
+        version,
       };
     } catch (error) {
       console.error('Error saving file:', error);
       throw new Error('Konnte Datei nicht speichern');
+    }
+  }
+
+  /**
+   * Importiert eine Datei aus bereits vorliegendem Base64-Klartext (z.B. beim
+   * Backup-Restore). Verschlüsselt Inhalt + Metadaten mit dem AKTUELLEN Master-Key
+   * und legt sie wie saveFile im Tresor ab.
+   */
+  static async importFile(
+    base64Content: string,
+    type: 'image' | 'video' | 'document',
+    originalName: string,
+    createdAtIso?: string
+  ): Promise<FileMetadata> {
+    await this.initialize();
+
+    if (this.containsPathTraversal(originalName)) {
+      throw new Error('Ungültiger Dateiname');
+    }
+
+    const fileId = await this.generateSecureFileId();
+    const fileName = `file_${fileId}`;
+    const createdAt = createdAtIso ? new Date(createdAtIso) : new Date();
+    const version = await BlobVersionService.nextVersion(fileId);
+
+    const { encryptedData, iv, mac } = await CryptoService.encryptFile(base64Content, `${fileId}:content:v${version}`);
+    const { encryptedData: encryptedOriginalName, iv: ivName, mac: macName } = await CryptoService.encryptMetadata(originalName, `${fileId}:name:v${version}`);
+    const { encryptedData: encryptedType, iv: ivType, mac: macType } = await CryptoService.encryptMetadata(type, `${fileId}:type:v${version}`);
+
+    await writeFileAtomic(
+      `${this.VAULT_DIR}${fileName}.meta.enc`,
+      JSON.stringify({
+        id: fileId,
+        name: fileName,
+        version,
+        originalName: { data: encryptedOriginalName, iv: ivName, mac: macName },
+        type: { data: encryptedType, iv: ivType, mac: macType },
+        size: encryptedData.length,
+        createdAt: createdAt.toISOString(),
+        iv,
+        mac,
+      })
+    );
+    await writeFileAtomic(`${this.VAULT_DIR}${fileName}`, encryptedData);
+    await BlobVersionService.advanceTo(fileId, version);
+
+    return {
+      id: fileId,
+      name: fileName,
+      originalName,
+      type,
+      size: encryptedData.length,
+      createdAt,
+      iv,
+      mac,
+      version,
+    };
+  }
+
+  /**
+   * F2: Entfernt die vom Picker im Cache abgelegte Klartext-Kopie.
+   *
+   * Sicherheitsregel: löscht NUR Dateien innerhalb von FileSystem.cacheDirectory
+   * — niemals Nutzer-Originale aus der Galerie/Storage. Die Picker kopieren das
+   * gewählte Asset in unser App-Cache (DocumentPicker copyToCacheDirectory,
+   * ImagePicker standardmäßig), daher liegt die URI im Cache.
+   *
+   * NAND-Disclaimer: deleteAsync entfernt nur den Verzeichniseintrag; auf
+   * Flash-Speicher können Restblöcke bis zum Wear-Leveling-Überschreiben
+   * verbleiben (nicht software-seitig garantiert tilgbar).
+   */
+  private static async deletePlaintextCacheCopy(fileUri: string): Promise<void> {
+    try {
+      if (!fileUri || fileUri.startsWith('data:')) return;
+      const cacheDir = FileSystem.cacheDirectory || '';
+      if (cacheDir && fileUri.startsWith(cacheDir)) {
+        await FileSystem.deleteAsync(fileUri, { idempotent: true });
+      }
+    } catch {
+      // best-effort: ein verbleibender Cache-Rest darf den Import nicht scheitern lassen
     }
   }
 
@@ -180,20 +260,32 @@ class SecureFileManager {
             `${this.VAULT_DIR}${metaFile}`
           );
           const encryptedMeta = JSON.parse(metaContent);
+          const version: number = encryptedMeta.version ?? 1;
 
-          // Entschlüsselt Metadaten
-          const originalName = await CryptoService.decryptMetadata(encryptedMeta.originalName);
-          const type = await CryptoService.decryptMetadata(encryptedMeta.type);
+          // A3: rollback check — a blob whose version is below the monotonic floor
+          // was rolled back to a stale state. Skip it (do not surface stale content).
+          const floor = await BlobVersionService.getFloor(encryptedMeta.id);
+          if (version < floor) {
+            console.warn(`[A3] rollback detected for file ${encryptedMeta.id}: v${version} < floor v${floor} — skipping`);
+            continue;
+          }
 
+          // Entschlüsselt Metadaten (H2 + A3: an fileId:role:vN gebunden)
+          const originalName = await CryptoService.decryptMetadata(encryptedMeta.originalName, `${encryptedMeta.id}:name:v${version}`);
+          const type = await CryptoService.decryptMetadata(encryptedMeta.type, `${encryptedMeta.id}:type:v${version}`);
+
+          // Fallback für ältere Metadaten ohne name-Feld: aus Metadatei-Name ableiten
+          const fileName = encryptedMeta.name ?? metaFile.replace('.meta.enc', '');
           loadedFiles.push({
             id: encryptedMeta.id,
-            name: encryptedMeta.name,
+            name: fileName,
             originalName,
             type: type as 'image' | 'video' | 'document',
             size: encryptedMeta.size,
             createdAt: new Date(encryptedMeta.createdAt),
             iv: encryptedMeta.iv,
             mac: encryptedMeta.mac,
+            version,
           });
         } catch (error) {
           console.error('Error loading file metadata:', error);
@@ -227,11 +319,108 @@ class SecureFileManager {
         `${this.VAULT_DIR}${file.name}`
       );
 
-      // Entschlüsselt mit HMAC-Verifizierung
-      return await CryptoService.decryptFile(encryptedData, file.iv, file.mac);
+      // Entschlüsselt mit HMAC-Verifizierung (H2 + A3: an fileId:content:vN gebunden)
+      return await CryptoService.decryptFile(encryptedData, file.iv, file.mac, `${file.id}:content:v${file.version}`);
     } catch (error) {
       console.error('Error getting file content:', error);
       throw new Error('Konnte Dateiinhalt nicht laden');
+    }
+  }
+
+  /**
+   * Entschlüsselt eine Datei in eine TEMPORÄRE Klartext-Datei im App-Cache und
+   * liefert deren file://-URI zurück. Wird vom In-App-Viewer für Inhalte gebraucht,
+   * die nur über einen Datei-URI darstellbar sind (Video/Audio via expo-video) oder
+   * an eine externe App übergeben werden (expo-sharing, z.B. PDF).
+   *
+   * SICHERHEIT: schreibt KLARTEXT in FileSystem.cacheDirectory (App-privat). Der
+   * Aufrufer MUSS nach Gebrauch deleteTempFile(uri) aufrufen (Viewer-Close). Solange
+   * die Datei existiert, liegt der Inhalt unverschlüsselt im App-Sandbox-Cache.
+   *
+   * NAND-Disclaimer: deleteAsync entfernt nur den Verzeichniseintrag; Restblöcke
+   * können bis zum Wear-Leveling-Überschreiben verbleiben.
+   */
+  static async exportToTempFile(fileId: string): Promise<string> {
+    const files = await this.getFiles();
+    const file = files.find(f => f.id === fileId);
+    if (!file) throw new Error('Datei nicht gefunden');
+
+    const base64 = await this.getFileContent(fileId);
+
+    const cacheDir = FileSystem.cacheDirectory || '';
+    const ext = this.extensionOf(file.originalName);
+    // Zufälliger Name, KEIN Originalname (kein Metadaten-Leak über Dateinamen).
+    const rand = await this.generateSecureFileId();
+    const tempUri = `${cacheDir}vault_view_${rand}${ext}`;
+
+    await FileSystem.writeAsStringAsync(tempUri, base64, {
+      encoding: FileSystem.EncodingType.Base64,
+    });
+    return tempUri;
+  }
+
+  /**
+   * Löscht eine via exportToTempFile erzeugte Klartext-Kopie. Löscht NUR innerhalb
+   * von cacheDirectory (defensiv gegen versehentliches Löschen von Nutzerdaten).
+   */
+  static async deleteTempFile(uri: string): Promise<void> {
+    try {
+      const cacheDir = FileSystem.cacheDirectory || '';
+      if (uri && cacheDir && uri.startsWith(cacheDir)) {
+        await FileSystem.deleteAsync(uri, { idempotent: true });
+      }
+    } catch {
+      // best-effort
+    }
+  }
+
+  /**
+   * Liefert die Dateiendung (inkl. Punkt, klein geschrieben) eines Namens, oder ''.
+   */
+  private static extensionOf(name: string): string {
+    const m = /\.([A-Za-z0-9]{1,8})$/.exec(name || '');
+    return m ? `.${m[1].toLowerCase()}` : '';
+  }
+
+  /**
+   * Re-verschlüsselt ALLE Datei-Inhalte + Metadaten vom alten auf den neuen
+   * Master-Key (Key-Rotation). Pro Blob idempotent via CryptoService.recryptBlob,
+   * daher crash-sicher wiederholbar.
+   */
+  static async reencryptAll(oldKey: string, newKey: string): Promise<void> {
+    await this.initialize();
+    const files = await FileSystem.readDirectoryAsync(this.VAULT_DIR);
+    const metaFiles = files.filter(f => f.endsWith('.meta.enc'));
+
+    for (const metaFile of metaFiles) {
+      const metaPath = `${this.VAULT_DIR}${metaFile}`;
+      const meta = JSON.parse(await FileSystem.readAsStringAsync(metaPath));
+      const fileName = meta.name ?? metaFile.replace('.meta.enc', '');
+      const contentPath = `${this.VAULT_DIR}${fileName}`;
+
+      // Datei-Inhalt (Ciphertext separat, iv/mac in der Metadatei).
+      // A3: dieselbe Version in alter+neuer AAD bewahren (recryptBlob ändert sie nicht).
+      const contentData = await FileSystem.readAsStringAsync(contentPath);
+      const fid = meta.id;
+      const v = meta.version ?? 1;
+      const newContent = await CryptoService.recryptBlob(
+        { data: contentData, iv: meta.iv, mac: meta.mac },
+        oldKey,
+        newKey,
+        `${fid}:content:v${v}`
+      );
+      const newOriginalName = await CryptoService.recryptBlob(meta.originalName, oldKey, newKey, `${fid}:name:v${v}`);
+      const newType = await CryptoService.recryptBlob(meta.type, oldKey, newKey, `${fid}:type:v${v}`);
+
+      // Inhalt zuerst, dann Metadatei schreiben (per-Blob-Idempotenz macht die
+      // Reihenfolge unkritisch — ein Abbruch dazwischen wird sauber resümiert).
+      // H3: atomic temp+rename so a crash never truncates a blob.
+      await writeFileAtomic(contentPath, newContent.data);
+      meta.iv = newContent.iv;
+      meta.mac = newContent.mac;
+      meta.originalName = newOriginalName;
+      meta.type = newType;
+      await writeFileAtomic(metaPath, JSON.stringify(meta));
     }
   }
 
@@ -249,6 +438,7 @@ class SecureFileManager {
 
       await FileSystem.deleteAsync(`${this.VAULT_DIR}${file.name}`);
       await FileSystem.deleteAsync(`${this.VAULT_DIR}${file.name}.meta.enc`);
+      await BlobVersionService.remove(fileId); // A3: random fileIds are never reused
     } catch (error) {
       console.error('Error deleting file:', error);
       throw new Error('Konnte Datei nicht löschen');
@@ -292,7 +482,8 @@ class SecureFileManager {
   // ─────────────────────────────── Hilfsfunktionen ───────────────────────────────
 
   /**
-   * Generiert eine nicht vorhersagbare File-ID
+   * Generiert eine nicht vorhersagbare File-ID (ohne Präfix).
+   * Der Aufrufer ist verantwortlich für das Präfix im Dateinamen.
    */
   private static async generateSecureFileId(): Promise<string> {
     try {
@@ -302,7 +493,7 @@ class SecureFileManager {
         .map(b => b.toString(16).padStart(2, '0'))
         .join('');
 
-      return `file_${timestamp}_${randomHex}`;
+      return `${timestamp}_${randomHex}`;
     } catch (error) {
       console.error('Error generating file ID:', error);
       throw new Error('Konnte File-ID nicht generieren');

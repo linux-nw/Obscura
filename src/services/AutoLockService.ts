@@ -11,6 +11,7 @@
 
 import { Platform, Vibration, AppState } from 'react-native';
 import * as SecureStore from 'expo-secure-store';
+import { SettingsService } from './SettingsService';
 
 export interface AutoLockSettings {
   enabled: boolean;
@@ -23,15 +24,48 @@ export class AutoLockService {
   private static readonly LAST_ACTIVITY_KEY = 'filevault_last_activity';
   private static readonly LOCKED_KEY = 'filevault_auto_locked';
 
-  private static timeoutId: NodeJS.Timeout | null = null;
+  private static timeoutId: ReturnType<typeof setTimeout> | null = null;
+  private static lockCallback: (() => void) | null = null;
+
+  // F2/Picker: while a system picker (image/document) is open, the app
+  // necessarily goes to background. Suppress the background-lock during that
+  // controlled window so the master key survives until the picked file is saved.
+  // Set ONLY around an explicit in-app picker launch; always cleared in finally.
+  private static pickerActive = false;
+
   private static settings: AutoLockSettings = {
     enabled: true,
-    timeoutSeconds: 60, // Default 60 seconds
+    timeoutSeconds: 300, // Default 5 Minuten (aus SettingsService)
     lastActivity: Date.now(),
   };
 
+  /** True while a system picker launched from within the app is in progress. */
+  static isPickerActive(): boolean {
+    return this.pickerActive;
+  }
+
+  /** Call immediately BEFORE launching a system picker (document/image). */
+  static beginPickerSession(): void {
+    this.pickerActive = true;
+  }
+
+  /** Call in a finally AFTER the picker flow (incl. save) completes or cancels. */
+  static endPickerSession(): void {
+    this.pickerActive = false;
+    // Reset the inactivity timer: the picker round-trip counts as activity.
+    this.resetTimer();
+  }
+
   /**
-   * Initialisiert den Auto Lock Service
+   * Setzt den Lock-Callback der aufgerufen wird wenn der Tresor gesperrt wird.
+   * Wird von App.tsx gesetzt um setIsAuthenticated(false) auszulösen.
+   */
+  static setLockCallback(callback: () => void): void {
+    this.lockCallback = callback;
+  }
+
+  /**
+   * Initialisiert den Auto Lock Service und liest Timeout aus SettingsService.
    */
   static async initialize(): Promise<void> {
     try {
@@ -45,13 +79,22 @@ export class AutoLockService {
   }
 
   /**
-   * Lädt Einstellungen
+   * Lädt Einstellungen — liest autoLockTimeout aus SettingsService.
    */
   private static async loadSettings(): Promise<void> {
     try {
-      const value = await SecureStore.getItemAsync(this.SETTINGS_KEY);
-      if (value) {
-        this.settings = { ...this.settings, ...JSON.parse(value) };
+      // Timeout aus SettingsService lesen (Nutzereinstellung hat Priorität)
+      const appSettings = await SettingsService.get();
+      const t = appSettings.autoLockTimeout;
+      if (t === -1) {
+        // "Nie" — no inactivity timer
+        this.settings.enabled = false;
+      } else if (t === 0) {
+        // "Sofort" — no inactivity timer; background locking via App.tsx AppState listener
+        this.settings.enabled = false;
+      } else {
+        this.settings.enabled = true;
+        this.settings.timeoutSeconds = t;
       }
 
       const lastActivity = await SecureStore.getItemAsync(this.LAST_ACTIVITY_KEY);
@@ -158,31 +201,25 @@ export class AutoLockService {
   // ─────────────────────────────── Lock Functions ───────────────────────────────
 
   /**
-   * Löst sofortigen Lock aus
+   * Löst sofortigen Lock aus und benachrichtigt App via Callback.
    */
   static async triggerLock(): Promise<void> {
     try {
-      console.log('AutoLock: Locking vault...');
-
-      // Haptic Feedback (Vibration)
-      if (Platform.OS !== 'web') {
-        if (Platform.OS === 'ios') {
-          // iOS:力度 feedback (iOS 10+)
-          // In native: UIImpactFeedbackGenerator
-          console.log('AutoLock: iOS haptic feedback');
-        } else {
-          // Android: Vibration
-          Vibration.vibrate(200);
-        }
+      // F2/Picker: do not lock while a system picker launched from within the
+      // app is in progress — that backgrounding is expected and controlled.
+      if (this.pickerActive) {
+        return;
+      }
+      if (Platform.OS === 'android') {
+        Vibration.vibrate(100);
       }
 
-      // Lock Flag setzen
       await SecureStore.setItemAsync(this.LOCKED_KEY, 'true');
 
-      // In Produktion: App.tsx setState für Auth state update
-      // this.onLockCallback();
-
-      console.log('AutoLock: Vault locked');
+      // Benachrichtige App.tsx (setzt isAuthenticated = false)
+      if (this.lockCallback) {
+        this.lockCallback();
+      }
     } catch (error) {
       console.error('Error triggering lock:', error);
     }

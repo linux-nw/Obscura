@@ -1,6 +1,8 @@
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Crypto from 'expo-crypto';
 import { SecureCryptoService as CryptoService } from './CryptoService';
+import { writeFileAtomic, cleanupTempFiles } from './fsAtomic';
+import { BlobVersionService } from './BlobVersionService';
 
 /**
  * Notiz-Service mit sicherer Speicherung
@@ -33,6 +35,8 @@ class SecureNotesService {
       if (!dirInfo.exists) {
         await FileSystem.makeDirectoryAsync(this.NOTES_DIR, { intermediates: true });
       }
+      // H3: drop any leftover .tmp from an interrupted atomic write.
+      await cleanupTempFiles(this.NOTES_DIR);
     } catch (error) {
       console.error('Error initializing notes directory:', error);
       throw new Error('Konnte Notizen-Verzeichnis nicht initialisieren');
@@ -54,16 +58,18 @@ class SecureNotesService {
 
       const noteId = await this.generateSecureNoteId();
       const now = new Date();
+      const version = await BlobVersionService.nextVersion(noteId); // A3 (new → v1)
 
-      // Verschlüsselt alle sensiblen Daten
-      const { encryptedData: encryptedTitle, iv: ivTitle, mac: macTitle } = await this.encryptMetadata(title);
-      const { encryptedData: encryptedContent, iv: ivContent, mac: macContent } = await this.encryptContent(content);
-      const { encryptedData: encryptedCategory, iv: ivCategory, mac: macCategory } = await this.encryptMetadata(category || '');
-      const { encryptedData: encryptedTags, iv: ivTags, mac: macTags } = await this.encryptMetadata(JSON.stringify(tags || []));
+      // Verschlüsselt alle sensiblen Daten (H2 + A3: an noteId:role:vN gebunden)
+      const { encryptedData: encryptedTitle, iv: ivTitle, mac: macTitle } = await this.encryptMetadata(title, `${noteId}:title:v${version}`);
+      const { encryptedData: encryptedContent, iv: ivContent, mac: macContent } = await this.encryptContent(content, `${noteId}:content:v${version}`);
+      const { encryptedData: encryptedCategory, iv: ivCategory, mac: macCategory } = await this.encryptMetadata(category || '', `${noteId}:category:v${version}`);
+      const { encryptedData: encryptedTags, iv: ivTags, mac: macTags } = await this.encryptMetadata(JSON.stringify(tags || []), `${noteId}:tags:v${version}`);
 
       // Speichert vollständiges verschlüsseltes Note-Objekt in separater Datei
       const encryptedNote = {
         id: noteId,
+        version,
         title: { data: encryptedTitle, iv: ivTitle, mac: macTitle },
         content: { data: encryptedContent, iv: ivContent, mac: macContent },
         category: { data: encryptedCategory, iv: ivCategory, mac: macCategory },
@@ -72,10 +78,11 @@ class SecureNotesService {
         updatedAt: now.toISOString(),
       };
 
-      await FileSystem.writeAsStringAsync(
+      await writeFileAtomic(
         `${this.NOTES_DIR}note_${noteId}`,
         JSON.stringify(encryptedNote)
       );
+      await BlobVersionService.advanceTo(noteId, version); // A3: floor after write
 
       // Return Klartext-Notiz für UI
       return {
@@ -113,10 +120,20 @@ class SecureNotesService {
           );
           const encryptedNoteData = JSON.parse(noteContent);
 
-          const title = await this.decryptMetadata(encryptedNoteData.title);
-          const content = await this.decryptContent(encryptedNoteData.content);
-          const category = await this.decryptMetadata(encryptedNoteData.category);
-          const tagsRaw = await this.decryptMetadata(encryptedNoteData.tags);
+          const nid = encryptedNoteData.id;
+          const version: number = encryptedNoteData.version ?? 1;
+
+          // A3: reject rolled-back notes (version below the monotonic floor).
+          const floor = await BlobVersionService.getFloor(nid);
+          if (version < floor) {
+            console.warn(`[A3] rollback detected for note ${nid}: v${version} < floor v${floor} — skipping`);
+            continue;
+          }
+
+          const title = await this.decryptMetadata(encryptedNoteData.title, `${nid}:title:v${version}`);
+          const content = await this.decryptContent(encryptedNoteData.content, `${nid}:content:v${version}`);
+          const category = await this.decryptMetadata(encryptedNoteData.category, `${nid}:category:v${version}`);
+          const tagsRaw = await this.decryptMetadata(encryptedNoteData.tags, `${nid}:tags:v${version}`);
           const tags = JSON.parse(tagsRaw || '[]');
 
           notes.push({
@@ -176,36 +193,35 @@ class SecureNotesService {
       const now = new Date();
       const encryptedNoteData = await this.loadEncryptedNoteData(noteId);
 
-      // Update Titel
-      if (updates.title !== undefined) {
-        const { encryptedData, iv, mac } = await this.encryptMetadata(updates.title);
-        encryptedNoteData.title = { data: encryptedData, iv, mac };
-      }
+      // A3: bump version. ALL fields are re-encrypted at the new version (even
+      // unchanged ones) so the whole note shares one version — otherwise an
+      // unchanged field would keep the old version and fail the read AAD check.
+      const version = await BlobVersionService.nextVersion(noteId);
 
-      // Update Inhalt
-      if (updates.content !== undefined) {
-        const { encryptedData, iv, mac } = await this.encryptContent(updates.content);
-        encryptedNoteData.content = { data: encryptedData, iv, mac };
-      }
+      const merged = {
+        title: updates.title !== undefined ? updates.title : existingNote.title,
+        content: updates.content !== undefined ? updates.content : existingNote.content,
+        category: updates.category !== undefined ? (updates.category || '') : (existingNote.category || ''),
+        tags: updates.tags !== undefined ? (updates.tags || []) : (existingNote.tags || []),
+      };
 
-      // Update Kategorie
-      if (updates.category !== undefined) {
-        const { encryptedData, iv, mac } = await this.encryptMetadata(updates.category || '');
-        encryptedNoteData.category = { data: encryptedData, iv, mac };
-      }
+      const t = await this.encryptMetadata(merged.title, `${noteId}:title:v${version}`);
+      const c = await this.encryptContent(merged.content, `${noteId}:content:v${version}`);
+      const cat = await this.encryptMetadata(merged.category, `${noteId}:category:v${version}`);
+      const tg = await this.encryptMetadata(JSON.stringify(merged.tags), `${noteId}:tags:v${version}`);
 
-      // Update Tags
-      if (updates.tags !== undefined) {
-        const { encryptedData, iv, mac } = await this.encryptMetadata(JSON.stringify(updates.tags || []));
-        encryptedNoteData.tags = { data: encryptedData, iv, mac };
-      }
-
+      encryptedNoteData.version = version;
+      encryptedNoteData.title = { data: t.encryptedData, iv: t.iv, mac: t.mac };
+      encryptedNoteData.content = { data: c.encryptedData, iv: c.iv, mac: c.mac };
+      encryptedNoteData.category = { data: cat.encryptedData, iv: cat.iv, mac: cat.mac };
+      encryptedNoteData.tags = { data: tg.encryptedData, iv: tg.iv, mac: tg.mac };
       encryptedNoteData.updatedAt = now.toISOString();
 
-      await FileSystem.writeAsStringAsync(
+      await writeFileAtomic(
         `${this.NOTES_DIR}note_${noteId}`,
         JSON.stringify(encryptedNoteData)
       );
+      await BlobVersionService.advanceTo(noteId, version); // A3: floor after write
 
       return {
         ...existingNote,
@@ -225,6 +241,7 @@ class SecureNotesService {
     try {
       await this.initialize();
       await FileSystem.deleteAsync(`${this.NOTES_DIR}note_${noteId}`);
+      await BlobVersionService.remove(noteId); // A3
       return true;
     } catch (error) {
       console.error('Error deleting note:', error);
@@ -252,6 +269,29 @@ class SecureNotesService {
     }
   }
 
+  /**
+   * Re-verschlüsselt ALLE Notiz-Felder vom alten auf den neuen Master-Key
+   * (Key-Rotation). Pro Feld idempotent via CryptoService.recryptBlob; eine Notiz
+   * wird mit einem einzigen Write komplett geschrieben (kein Feld-Mischzustand).
+   */
+  static async reencryptAll(oldKey: string, newKey: string): Promise<void> {
+    await this.initialize();
+    const files = await FileSystem.readDirectoryAsync(this.NOTES_DIR);
+    const noteFiles = files.filter(file => file.startsWith('note_'));
+
+    for (const noteFile of noteFiles) {
+      const path = `${this.NOTES_DIR}${noteFile}`;
+      const note = JSON.parse(await FileSystem.readAsStringAsync(path));
+      const nid = note.id;
+      const v = note.version ?? 1; // A3: preserve the same version in old+new AAD
+      note.title = await CryptoService.recryptBlob(note.title, oldKey, newKey, `${nid}:title:v${v}`);
+      note.content = await CryptoService.recryptBlob(note.content, oldKey, newKey, `${nid}:content:v${v}`);
+      note.category = await CryptoService.recryptBlob(note.category, oldKey, newKey, `${nid}:category:v${v}`);
+      note.tags = await CryptoService.recryptBlob(note.tags, oldKey, newKey, `${nid}:tags:v${v}`);
+      await writeFileAtomic(path, JSON.stringify(note)); // H3: atomic
+    }
+  }
+
   // ─────────────────────────────── Hilfsfunktionen ───────────────────────────────
 
   private static async loadEncryptedNoteData(noteId: string): Promise<any> {
@@ -265,34 +305,34 @@ class SecureNotesService {
     }
   }
 
-  private static async encryptContent(data: string): Promise<{ encryptedData: string; iv: string; mac: string }> {
+  private static async encryptContent(data: string, aadContext: string = ''): Promise<{ encryptedData: string; iv: string; mac: string }> {
     try {
-      const { encryptedData, iv, mac } = await CryptoService.encryptData(data);
+      const { encryptedData, iv, mac } = await CryptoService.encryptData(data, aadContext);
       return { encryptedData, iv, mac };
     } catch {
       throw new Error('Kann Inhalt nicht verschlüsseln');
     }
   }
 
-  private static async decryptContent(encrypted: { data: string; iv: string; mac: string }): Promise<string> {
+  private static async decryptContent(encrypted: { data: string; iv: string; mac: string }, aadContext: string = ''): Promise<string> {
     try {
-      return await CryptoService.decryptData(encrypted.data, encrypted.iv, encrypted.mac);
+      return await CryptoService.decryptData(encrypted.data, encrypted.iv, encrypted.mac, aadContext);
     } catch {
       throw new Error('Kann Inhalt nicht entschlüsseln');
     }
   }
 
-  private static async encryptMetadata(data: string): Promise<{ encryptedData: string; iv: string; mac: string }> {
+  private static async encryptMetadata(data: string, aadContext: string = ''): Promise<{ encryptedData: string; iv: string; mac: string }> {
     try {
-      return await this.encryptContent(data);
+      return await this.encryptContent(data, aadContext);
     } catch {
       throw new Error('Kann Metadaten nicht verschlüsseln');
     }
   }
 
-  private static async decryptMetadata(encrypted: { data: string; iv: string; mac: string }): Promise<string> {
+  private static async decryptMetadata(encrypted: { data: string; iv: string; mac: string }, aadContext: string = ''): Promise<string> {
     try {
-      return await this.decryptContent(encrypted);
+      return await this.decryptContent(encrypted, aadContext);
     } catch {
       throw new Error('Kann Metadaten nicht entschlüsseln');
     }

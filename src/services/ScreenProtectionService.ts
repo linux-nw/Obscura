@@ -9,16 +9,13 @@
  * - Screen recording detection
  */
 
-import { Platform, NativeEventEmitter, NativeModules, PlatformOSType } from 'react-native';
-
-const { ViewManager } = NativeModules;
-const eventEmitter = new NativeEventEmitter(ViewManager);
-
-export enum ScreenshotEvent {
-  TAKEN = 'ScreenshotTaken',
-  BLOCKED = 'ScreenshotBlocked',
-  RECORDING_STARTED = 'ScreenRecordingStarted',
-}
+import { Platform } from 'react-native';
+import * as SecureStore from 'expo-secure-store';
+// NOT_IMPLEMENTED: expo-screen-capture (FLAG_SECURE) needs a Gradle build with
+// network access to resolve `io.github.lukmccall.pika:pika-api`.
+// Add `expo-screen-capture` to package.json and run `npx expo prebuild`
+// when network/certificate issues are resolved. Then replace the stubs below
+// with `ScreenCapture.preventScreenCaptureAsync()` / `allowScreenCaptureAsync()`.
 
 export enum SecurityFlag {
   SCREENSHOT = 'SecureScreenshot',
@@ -83,29 +80,12 @@ export class ScreenProtectionService {
   // ─────────────────────────────── Native Module Methods ───────────────────────────────
 
   private static async nativeEnableScreenCapture(): Promise<void> {
-    try {
-      if (Platform.OS === 'ios') {
-        // iOS: Flag SECURE auf Root View setzen
-        console.log('ScreenProtection: iOS screen capture blocking enabled');
-        // Native Implementation:
-        // window.rootViewController.view.addFlags(.screenProtection)
-      } else if (Platform.OS === 'android') {
-        // Android: FLAG_SECURE auf alle Windows setzen
-        console.log('ScreenProtection: Android screen capture blocking enabled');
-        // Native Implementation:
-        // window.setFlags(WindowManager.LayoutParams.FLAG_SECURE)
-      }
-    } catch (error) {
-      console.error('Native screen capture enable error:', error);
-    }
+    // NOT_IMPLEMENTED: replace with ScreenCapture.preventScreenCaptureAsync()
+    // once expo-screen-capture is added to the build (see comment at top).
   }
 
   private static async nativeDisableScreenCapture(): Promise<void> {
-    try {
-      console.log('ScreenProtection: Native screen capture disabled');
-    } catch (error) {
-      console.error('Native screen capture disable error:', error);
-    }
+    // NOT_IMPLEMENTED: replace with ScreenCapture.allowScreenCaptureAsync()
   }
 
   // ─────────────────────────────── Event Handling ───────────────────────────────
@@ -273,9 +253,5 @@ export class ScreenProtectionService {
     }
   }
 }
-
-// ─────────────────────────────── SecureStore Import (fehlt im Code) ───────────────────────────────
-// Füge dies hinzu wenn SecureStore noch nicht importiert ist
-import * as SecureStore from 'expo-secure-store';
 
 export default ScreenProtectionService;
