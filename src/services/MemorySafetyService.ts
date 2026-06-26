@@ -297,7 +297,7 @@ export class MemoryProtection {
  * AutoZeroize - Deaktiviert Buffer nach Zeit limit
  */
 export class AutoZeroize {
-  private timer: NodeJS.Timeout | null = null;
+  private timer: ReturnType<typeof setTimeout> | null = null;
   private callback: () => void;
 
   constructor(callback: () => void, timeoutMs: number = 5000) {

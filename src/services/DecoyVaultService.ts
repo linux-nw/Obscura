@@ -15,6 +15,7 @@ import * as FileSystem from 'expo-file-system/legacy';
 import * as SecureStore from 'expo-secure-store';
 import { SecureCryptoService } from './CryptoService';
 import { fastPbkdf2 } from './FastPBKDF2';
+import { Argon2idService, Argon2Params } from './Argon2idService';
 import * as CryptoModule from 'expo-crypto';
 import { SettingsService } from './SettingsService';
 
@@ -39,8 +40,17 @@ export class DecoyVaultService {
   private static readonly DECOY_DIR = (FileSystem.documentDirectory || '') + 'decoy_vault/';
   private static readonly DECOY_PIN_HASH = 'filevault_decoy_pin_hash';
   private static readonly DECOY_PIN_SALT = 'filevault_decoy_pin_salt';
+  // S1: KDF marker. 'argon2id' = current; absent = legacy PBKDF2-10k (migrated on verify).
+  private static readonly DECOY_PIN_ALGO = 'filevault_decoy_pin_algo';
   private static readonly DECOY_ENABLED_KEY = 'filevault_decoy_enabled';
   private static readonly DECOY_CREATED_KEY = 'filevault_decoy_created';
+
+  // S1: same Argon2id hardness class as the vault KEK / Panic PIN. p=1 matches native
+  // libsodium crypto_pwhash (C1); 16-byte salt. Native preferred, @noble JS fallback.
+  private static readonly DECOY_ARGON2: Argon2Params = {
+    version: 0x13, type: 2, memoryKB: 65536, iterations: 3, parallelism: 1, hashLength: 32,
+  };
+  private static readonly LEGACY_PBKDF2_ITERATIONS = 10000;
 
   // ─────────────────────────────── Decoy Vault Setup ───────────────────────────────
 
@@ -181,7 +191,8 @@ export class DecoyVaultService {
       const { hash, salt } = await this.computePinHash(pin);
       await SecureStore.setItemAsync(this.DECOY_PIN_HASH, hash);
       await SecureStore.setItemAsync(this.DECOY_PIN_SALT, salt);
-      console.log('DecoyVault: Decoy PIN set (AES-256)');
+      await SecureStore.setItemAsync(this.DECOY_PIN_ALGO, 'argon2id');
+      console.log('DecoyVault: Decoy PIN set (Argon2id)');
     } catch (error) {
       console.error('Error setting decoy pin:', error);
       throw error instanceof Error ? error : new Error('Konnte Decoy PIN nicht setzen');
@@ -200,8 +211,25 @@ export class DecoyVaultService {
         return false;
       }
 
-      const { hash } = await this.computePinHash(pin, storedSalt);
-      return SecureCryptoService.constantsTimeEquals(hash, storedHash);
+      const algo = await SecureStore.getItemAsync(this.DECOY_PIN_ALGO);
+
+      if (algo === 'argon2id') {
+        const { hash } = await this.computePinHash(pin, storedSalt);
+        return await SecureCryptoService.constantsTimeEquals(hash, storedHash);
+      }
+
+      // S1 migration: legacy PBKDF2-10k hash (no marker). Verify the old way, then
+      // transparently re-hash with Argon2id on success. No lockout for existing users.
+      const legacyHash = await this.computePinHashLegacy(pin, storedSalt);
+      const match = await SecureCryptoService.constantsTimeEquals(legacyHash, storedHash);
+      if (match) {
+        try {
+          await this.setDecoyPin(pin);
+        } catch {
+          // Keep the legacy hash if migration write fails — verification already succeeded.
+        }
+      }
+      return match;
     } catch (error) {
       console.error('DecoyVault: PIN verification error:', error);
       return false;
@@ -209,34 +237,33 @@ export class DecoyVaultService {
   }
 
   /**
-   * Berechnet Decoy PIN Hash mit Argon2id oder PBKDF2
-   * Fallback zu PBKDF2 wenn Argon2id nicht verfügbar ist
+   * Berechnet Decoy PIN Hash mit Argon2id (S1).
+   * Memory-hard (m=64 MiB, t=3, p=1); native libsodium bevorzugt, @noble JS-Fallback.
+   * KEIN stiller PBKDF2-Downgrade.
    */
   private static async computePinHash(
     pin: string,
     salt?: string
   ): Promise<{ hash: string; salt: string }> {
-    try {
-      if (!salt) {
-        // Generiere neuen Salt für Decoy Vault
-        const saltBytes = await CryptoModule.getRandomBytesAsync(16);
-        salt = Array.from(new Uint8Array(saltBytes))
-          .map(b => b.toString(16).padStart(2, '0'))
-          .join('');
-      }
-
-      const iterations = 100000; // Lower than vault KEK — decoy data is fake, timing parity not required here
-      const keyLength = 32; // 32 bytes = 256 bits
-      // R-03: NFC-normalisieren, sonst leiten NFD/NFC-Eingaben verschiedene Keys ab.
-      const derivedKey = await fastPbkdf2(pin.normalize('NFC'), salt, iterations, keyLength);
-
-      return {
-        hash: derivedKey,
-        salt,
-      };
-    } catch {
-      return { hash: '', salt: '' };
+    if (!salt) {
+      // 16-byte salt (crypto_pwhash_SALTBYTES).
+      const saltBytes = await CryptoModule.getRandomBytesAsync(16);
+      salt = Array.from(new Uint8Array(saltBytes))
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('');
     }
+    // R-03: NFC-normalisieren, sonst leiten NFD/NFC-Eingaben verschiedene Keys ab.
+    const saltBuffer = SecureCryptoService.hexToBuffer(salt);
+    const derived = await Argon2idService.deriveKey(pin.normalize('NFC'), saltBuffer, this.DECOY_ARGON2);
+    return { hash: SecureCryptoService.bufferToHex(derived), salt };
+  }
+
+  /**
+   * Legacy-Verifikationspfad (PBKDF2-10k): NUR zum Prüfen und anschließenden Migrieren
+   * vorhandener pre-S1-Hashes. Wird nie mehr zum Speichern verwendet.
+   */
+  private static async computePinHashLegacy(pin: string, salt: string): Promise<string> {
+    return fastPbkdf2(pin.normalize('NFC'), salt, this.LEGACY_PBKDF2_ITERATIONS, 32);
   }
 
   // ─────────────────────────────── Decoy Data Access ───────────────────────────────
@@ -327,6 +354,7 @@ export class DecoyVaultService {
       await SecureStore.deleteItemAsync(this.DECOY_ENABLED_KEY);
       await SecureStore.deleteItemAsync(this.DECOY_PIN_HASH);
       await SecureStore.deleteItemAsync(this.DECOY_PIN_SALT);
+      await SecureStore.deleteItemAsync(this.DECOY_PIN_ALGO);
 
       console.log('DecoyVault: Vault destroyed');
     } catch (error) {

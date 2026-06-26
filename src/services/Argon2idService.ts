@@ -13,7 +13,7 @@
  */
 
 import * as CryptoModule from 'expo-crypto';
-import { argon2id as hashWasmArgon2id } from 'hash-wasm';
+import { argon2idAsync } from '@noble/hashes/argon2.js';
 import { NativeModules } from 'react-native';
 import { argon2id as nativeArgon2id } from '../native/RNFileVault';
 
@@ -37,7 +37,9 @@ export const DEFAULT_ARGON2_PARAMS: Argon2Params = {
   type: 2, // Argon2id (hybrid)
   memoryKB: 65536, // 64 MB
   iterations: 3, // Erhöht von 2 auf 3 für besseren Schutz gegen GPU-Attacken
-  parallelism: 4,
+  // C1: p=1 — libsodium crypto_pwhash (native path) hardcodes lanes=1 and cannot do
+  // p>1, so the hash-wasm fallback must match. OWASP recommends p=1 anyway.
+  parallelism: 1,
   hashLength: 32, // 32 bytes
 };
 
@@ -50,10 +52,11 @@ export const DEFAULT_ARGON2_PARAMS: Argon2Params = {
  * einer memory-hard Funktion, die resistent gegenüber GPU/ASIC Angriffen ist.
  *
  * Implementierung:
- * - Primary: Native Module (RNFileVault argon2id)
- * - Fallback: hash-wasm (WebAssembly)
- * - Kein CryptoJS Fallback - die App weigert sich, Keys abzuleiten, wenn kein
- *   echter Argon2id verfügbar ist
+ * - Primary: Native Module (RNFileVault argon2id, libsodium crypto_pwhash)
+ * - Fallback: @noble/hashes Argon2id (reines JavaScript, läuft unter Hermes —
+ *    KEIN WebAssembly nötig, anders als das frühere hash-wasm)
+ * - Kein PBKDF2/CryptoJS Fallback - beide Pfade sind echtes Argon2id und liefern
+ *   byte-identische Keys (siehe C1 + Argon2idReal.test.ts)
  */
 export class Argon2idService {
   /**
@@ -74,23 +77,38 @@ export class Argon2idService {
       return this.deriveKeyNative(password, salt, params);
     }
 
-    // Fallback zu hash-wasm (WebAssembly)
+    // Fallback: pure-JS Argon2id (@noble/hashes, RFC 9106).
+    //
+    // Replaces the former hash-wasm path, which instantiated a WebAssembly module.
+    // React Native's Hermes engine has NO WebAssembly runtime, so hash-wasm threw
+    // at derivation time → "No secure Argon2id implementation available" whenever
+    // the native module was absent (e.g. running in Expo Go). @noble/hashes is
+    // plain JavaScript and runs everywhere Hermes runs.
+    //
+    // C1: salt MUST be passed as RAW bytes (not Base64) and parallelism pinned to 1,
+    // identical to the native libsodium crypto_pwhash path — the native bridge does
+    // Base64.decode(saltB64) → raw 16 bytes and libsodium hardcodes lanes=1. Any
+    // divergence here would derive a DIFFERENT KEK than native → vault lockout.
+    // Byte-equality with the native/libsodium output is pinned by the KAT in
+    // __tests__/Argon2idReal.test.ts.
     try {
-      const options = {
-        password: password,
-        salt: this.bufferToBase64(salt),
-        type: params.type,
+      const derived = await argon2idAsync(password, new Uint8Array(salt), {
+        t: params.iterations,
+        m: params.memoryKB, // memory cost in kibibytes
+        p: 1,               // see C1 — must match libsodium lanes=1
         version: params.version,
-        memorySize: params.memoryKB, // hash-wasm uses memorySize in KB
-        iterations: params.iterations,
-        parallelism: params.parallelism,
-        hashLength: params.hashLength,
-        outputType: 'hex' as const,
-      };
-      const hash = await hashWasmArgon2id(options);
-      return this.hexToBuffer(hash);
-    } catch {
-      throw new Error('No secure Argon2id implementation available');
+        dkLen: params.hashLength,
+        asyncTick: 16,      // yield to the JS thread so the UI stays responsive
+      });
+      // Copy into a fresh ArrayBuffer (noble may return a view into a pooled buffer).
+      const out = new Uint8Array(derived.length);
+      out.set(derived);
+      return out.buffer;
+    } catch (e) {
+      throw new Error(
+        'No secure Argon2id implementation available: ' +
+        (e instanceof Error ? e.message : String(e))
+      );
     }
   }
 
@@ -123,7 +141,7 @@ export class Argon2idService {
   static async generateSalt(length: number = 16): Promise<ArrayBuffer> {
     try {
       const bytes = await CryptoModule.getRandomBytesAsync(length);
-      return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+      return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
     } catch (error) {
       console.error('Error generating salt:', error);
       throw new Error('Konnte Salt nicht generieren');
@@ -166,6 +184,7 @@ export class Argon2idService {
     try {
       // Konvertiere ArrayBuffer zu Base64 für native API
       const saltB64 = this.bufferToBase64(salt);
+      const t0 = Date.now();
       const hash = await nativeArgon2id(
         password,
         saltB64,
@@ -173,6 +192,7 @@ export class Argon2idService {
         params.memoryKB,
         params.hashLength
       );
+      console.log(`[KDF] native Argon2id ran (libsodium crypto_pwhash, ${params.memoryKB}KB/${params.iterations}it) in ${Date.now() - t0}ms`);
       return this.base64ToBuffer(hash);
     } catch (error) {
       console.error('Native Argon2id failed:', error);
