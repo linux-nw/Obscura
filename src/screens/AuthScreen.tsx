@@ -375,6 +375,11 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
             value={currentVal}
             onChangeText={v => { setCurrentVal(v); }}
             secureTextEntry={!showPass}
+            keyboardType={showPass ? 'visible-password' : 'default'}
+            autoComplete="off"
+            textContentType="none"
+            importantForAutofill="no"
+            spellCheck={false}
             placeholder="Passphrase eingeben"
             placeholderTextColor={c.textFaint}
             autoFocus

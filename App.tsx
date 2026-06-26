@@ -162,6 +162,19 @@ export default function App() {
         }
       } catch {}
 
+      // Layer 2: warn (once) if a third-party (non-system) keyboard is active. A
+      // malicious IME can capture every keystroke incl. the passphrase. Best-effort
+      // signal only — a system IME could still be malicious on a compromised device.
+      try {
+        const ds = (NativeModules as any).DeviceSecurity;
+        if (ds?.getActiveInputMethod) {
+          const ime = await ds.getActiveInputMethod();
+          if (ime && ime.isSystem === false) {
+            console.warn(`[security][IME] Third-party keyboard active (${ime.packageName}). A malicious IME can read everything you type, including the passphrase. Prefer the system keyboard for unlock.`);
+          }
+        }
+      } catch {}
+
     } catch (error) {
       console.error('Fehler beim Initialisieren von Services:', error);
       try {

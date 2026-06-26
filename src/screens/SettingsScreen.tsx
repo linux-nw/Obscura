@@ -489,13 +489,17 @@ export default function SettingsScreen({
                 style={s.passInput}
                 value={pinValue}
                 onChangeText={v => { setPinValue(v.slice(0, 128)); setPinError(''); }}
-                keyboardType="default"
+                keyboardType={showPinPass ? 'visible-password' : 'default'}
                 secureTextEntry={!showPinPass}
                 placeholder="Passwort eingeben"
                 placeholderTextColor={c.textTer}
                 autoFocus
                 autoCapitalize="none"
                 autoCorrect={false}
+                autoComplete="off"
+                textContentType="none"
+                importantForAutofill="no"
+                spellCheck={false}
                 maxLength={128}
               />
               <TouchableOpacity
@@ -990,6 +994,11 @@ export default function SettingsScreen({
                   value={spNew}
                   onChangeText={(v) => { setSpNew(v.slice(0, 128)); setSpErr(''); }}
                   secureTextEntry={!showSpNew}
+                  keyboardType={showSpNew ? 'visible-password' : 'default'}
+                  autoComplete="off"
+                  textContentType="none"
+                  importantForAutofill="no"
+                  spellCheck={false}
                   placeholder="Neue PIN (min. 8 Zeichen)"
                   placeholderTextColor={c.textTer}
                   autoFocus
@@ -1014,6 +1023,11 @@ export default function SettingsScreen({
                   value={spConfirm}
                   onChangeText={(v) => { setSpConfirm(v.slice(0, 128)); setSpErr(''); }}
                   secureTextEntry={!showSpConfirm}
+                  keyboardType={showSpConfirm ? 'visible-password' : 'default'}
+                  autoComplete="off"
+                  textContentType="none"
+                  importantForAutofill="no"
+                  spellCheck={false}
                   placeholder="PIN bestätigen"
                   placeholderTextColor={c.textTer}
                   autoCapitalize="none"
@@ -1064,6 +1078,11 @@ export default function SettingsScreen({
                   value={ppVal}
                   onChangeText={(v) => { setPpVal(v.slice(0, 128)); setPpErr(''); }}
                   secureTextEntry={!showPpPass}
+                  keyboardType={showPpPass ? 'visible-password' : 'default'}
+                  autoComplete="off"
+                  textContentType="none"
+                  importantForAutofill="no"
+                  spellCheck={false}
                   placeholder="Passwort eingeben"
                   placeholderTextColor={c.textTer}
                   autoFocus
