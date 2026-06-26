@@ -3,7 +3,7 @@
  *
  * Sicherheitsmerkmale:
  * - 256-bit kryptographisch sichere Zufallsschlüssel pro Datei
- * - Key Wrapping mit SecureCryptoService (XChaCha20/FastAES/CryptoJS)
+ * - Key Wrapping mit SecureCryptoService (XChaCha20/AES-CBC+HMAC/CryptoJS)
  * - HMAC-SHA-256 für Integritätsprüfung
  * - Secure Store Integration für verschlüsselte Schlüsselspeicherung
  * - Key Rotation Support (Re-encrypt mit Master-Key)
@@ -57,7 +57,7 @@ export async function generateFileKey(): Promise<string> {
   try {
     const bytes = await CryptoModule.getRandomBytesAsync(32);
     // Slice to exact bytes (same fix as CryptoService.generateSecureBytes)
-    const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    const buffer = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
     return SecureCryptoService.bufferToHex(buffer);
   } catch (error) {
     console.error('Error generating file key:', error);
@@ -68,7 +68,7 @@ export async function generateFileKey(): Promise<string> {
 /**
  * Wraps (encrypts) a file key with the master key
  * Delegiert an SecureCryptoService.encryptFileKey() für Backend-Selektion
- * (XChaCha20 > FastAES > CryptoJS)
+ * (XChaCha20 > AES-CBC+HMAC > CryptoJS)
  * @param fileKey - 64 hex char file key to wrap
  * @returns EncryptedFileKey with iv, mac, and encryptedKey
  */
@@ -79,7 +79,7 @@ export async function wrapFileKey(fileKey: string): Promise<EncryptedFileKey> {
 /**
  * Unwraps (decrypts) a file key with the master key
  * Delegiert an SecureCryptoService.decryptFileKey() für Backend-Selektion
- * (XChaCha20 > FastAES > CryptoJS)
+ * (XChaCha20 > AES-CBC+HMAC > CryptoJS)
  * @param encryptedKey - EncryptedFileKey object
  * @returns 64 hex char file key
  */
