@@ -120,6 +120,13 @@ export default function NoteEditor({ note, onClose, onSaved }: Props) {
             returnKeyType="next"
             maxLength={120}
             onSubmitEditing={() => {}}
+            // L2 (self-audit fix): typed note content is vault data — keep it off cloud
+            // keyboards, autofill and dictionaries. No secureTextEntry (content is read back).
+            autoComplete="off"
+            textContentType="none"
+            importantForAutofill="no"
+            autoCorrect={false}
+            spellCheck={false}
           />
           <TextInput
             style={s.categoryInput}
@@ -130,6 +137,11 @@ export default function NoteEditor({ note, onClose, onSaved }: Props) {
             returnKeyType="next"
             autoCapitalize="words"
             maxLength={40}
+            autoComplete="off"
+            textContentType="none"
+            importantForAutofill="no"
+            autoCorrect={false}
+            spellCheck={false}
           />
           <View style={s.divider} />
           <TextInput
@@ -141,6 +153,11 @@ export default function NoteEditor({ note, onClose, onSaved }: Props) {
             multiline
             textAlignVertical="top"
             scrollEnabled={false}
+            autoComplete="off"
+            textContentType="none"
+            importantForAutofill="no"
+            autoCorrect={false}
+            spellCheck={false}
           />
         </ScrollView>
       </KeyboardAvoidingView>

@@ -43,13 +43,25 @@ class HardwareKeystoreModule(reactContext: ReactApplicationContext) :
 
             generateAesKey(keyId, useStrongBox)
 
+            // L4 (self-audit fix): report the REAL security level of the key just generated,
+            // read from KeyInfo — NOT a hardcoded isHardwareBacked=true. On a device that fell
+            // back to the software keystore, generateAesKey still succeeds but the key is
+            // SOFTWARE; the previous hardcoded `true` (and the "device has StrongBox feature"
+            // guess for isStrongBoxEnabled) would have falsely claimed hardware backing.
+            val keystoreAlias = "filevault_$keyId"
+            val key = keyStore.getKey(keystoreAlias, null) as SecretKey
+            val keyInfo = SecretKeyFactory.getInstance(key.algorithm, "AndroidKeyStore")
+                .getKeySpec(key, KeyInfo::class.java) as KeyInfo
+            val (levelName, hardware) = securityLevelOf(keyInfo)
+
             val result = Arguments.createMap()
             result.putBoolean("success", true)
             result.putBoolean("keyExists", true)
             val attestation = Arguments.createMap()
             attestation.putString("algorithm", "AES")
-            attestation.putBoolean("isHardwareBacked", true)
-            attestation.putBoolean("isStrongBoxEnabled", useStrongBox && isStrongBoxAvailableInternal())
+            attestation.putBoolean("isHardwareBacked", hardware)
+            attestation.putString("securityLevel", levelName)
+            attestation.putBoolean("isStrongBoxEnabled", levelName == "STRONGBOX")
             attestation.putInt("keySize", 256)
             attestation.putDouble("creationDate", System.currentTimeMillis().toDouble())
             result.putMap("attestation", attestation)
