@@ -563,7 +563,95 @@ as protection against future key leakage, not as a secure wipe of old data.
 
 ---
 
-## 15. Change Log — Audit Round 4
+## 15. Endpoint Threat Model (Endpoint-Hardening, Layers 1-7)
+
+§14 covers the **at-rest** crypto (untouched by this work). §15 covers the **endpoint** on a
+potentially compromised or seized device: where the key lives in RAM, what leaks through the
+screen and keyboard, how device integrity is attested, how data is destroyed, what happens
+under coercion, and supply-chain integrity. Each layer states what it **covers**, what it
+**deliberately does not**, and **against which attacker** it holds.
+
+**Structural out-of-scope (stated honestly):** an active kernel exploit on a rooted, *live*,
+*unlocked* device with attacker-held root. A userspace app cannot structurally win that — the
+attacker shares the process' address space and the unlocked keystore. Everything below raises
+cost against weaker, more realistic attackers; none of it defeats live attacker-root.
+
+### 15.1 Per-layer summary
+
+| Layer | Covers | Deliberately NOT | Primary attacker | Proof |
+|-------|--------|------------------|------------------|-------|
+| 1 UI leakage | `FLAG_SECURE` set natively in `MainActivity.onCreate` (pre-JS, always-on): blocks screenshot, screen-record, Recents thumbnail. Privacy overlay (VaultMark) when app backgrounded. | Reading the framebuffer with root; *detecting* a screenshot from userspace (impossible on Android — reported honestly as `false`). | Shoulder-surf, casual screenshot, Recents leak, non-root screen-record. | `dumpsys` shows `FLAG_SECURE`; manual on-device. |
+| 2 IME capture | All secret fields: `visible-password` keyboard, `autoComplete=off`, `textContentType=none`, `importantForAutofill=no`, `spellCheck=false`. Runtime warning if the active IME is not a system keyboard. | A malicious **system** IME or a root keylogger — you must type into *some* keyboard. | 3rd-party keyboard cloud-sync, autofill/clipboard/dictionary capture. | Native `getActiveInputMethod`; field props; `tsc`. |
+| 3 RAM key lifetime | Long-lived master key held as a zeroable `Uint8Array`, `.fill(0)` on lock. Native Kotlin zeroes key + plaintext byte arrays immediately after each crypto op. | Transient **hex-string** copies in the JS heap (strings are immutable — cannot be wiped, only dropped for GC); live-process forensics on an unlocked device. | Post-lock heap-residue scrape. | `__tests__/L3_KeyZeroing`; native `androidTest`. |
+| 4 Device integrity | Real `KeyInfo.securityLevel` (STRONGBOX / TRUSTED_ENVIRONMENT / SOFTWARE); `setUnlockedDeviceRequired(true)` gated on a secure lockscreen; key-attestation cert-chain export (challenge → root-of-trust `verifiedBootState`+`deviceLocked`). | Defeating a TEE/StrongBox bypass; providing hardware backing where the device has none (degrades to SOFTWARE, **warned**, not blocked). | Detect software-only keystore / tampered boot state (informational signal). | `HardwareKeystoreAttestTest.kt` on-device (2 tests). |
+| 5 Crypto-shredding | No per-file content keys exist → destroying the master key (wrapped key in SecureStore **and** the in-memory copy) makes **every** blob permanently undecryptable, regardless of flash residue. Plaintext view-temp cache swept (overwrite+delete). | Guaranteed *physical* erasure of flash blocks (NAND wear-leveling may retain old blocks); recovering a key the attacker already extracted while unlocked. | Post-wipe forensic recovery of vault content. | `__tests__/L5_CryptoShred`. |
+| 6 Duress / coercion | Panic PIN (Argon2id) → wipe or permanent-lock. Guest/decoy vault: own Argon2id PIN, neutral `guest/`+`filevault_guest_*` naming, content **XChaCha20-encrypted** with a guest-PIN-derived key (separate KDF salt, never stored) → on disk indistinguishable from the real vault. | True plausible deniability — see §15.2. The hidden-vault *existence* stays provable. | Casual coercion + low-tier / string-grep forensics. | `__tests__/L6_DecoyEncryption`; §15.2. |
+| 7 Supply-chain / APK integrity | *(pending — next commit)* | | | |
+
+### 15.2 Layer 6 deniability boundary — precise, against which attacker it holds
+
+Layer 6 **raises the bar** against casual coercion and low-tier forensics. It is **NOT full
+deniability.** Stated precisely:
+
+**What it HOLDS against:**
+- **Casual coercion ("unlock it now").** Entering the guest PIN clears the real master key from
+  RAM (the parallel `unlock()` that loaded it is wiped) and shows the guest session; the real
+  vault is inaccessible. An attacker who does not image the device sees a plausible guest vault.
+- **Naive forensic string-grep.** After the rename, a disk image / SecureStore dump contains no
+  literal "decoy"; guest artifacts blend with the real `filevault_*` / `vault/` / `notes/`
+  family. The per-artifact "this one is the fake" label is gone.
+- **Low-tier "which file is obviously the fake" forensics.** Pre-L6 the decoy was *plaintext*
+  while the real vault was ciphertext — an instant differential that, by elimination, fingered
+  the real vault. Now both are opaque XChaCha20 ciphertext; on-disk content no longer
+  self-identifies as fake.
+
+**What it does NOT do (does NOT hold against):**
+1. **An analyst who recognises the app.** The UI openly ships a "Täusch-Tresor"/guest feature;
+   anyone who identifies the binary *knows* a guest+real vault can coexist and will demand the
+   second credential. Renaming hides *which* artifact is which, never the *feature*.
+2. **Hidden-vault existence denial.** Two independent credential sets (real + guest
+   `filevault_*_pin_hash`) and two populated encrypted directories (`vault/` + `guest/`) are
+   both present and visible. Their coexistence *proves* a second vault exists. This is the
+   structural ceiling: unlike a VeraCrypt hidden volume (one container whose slack space may or
+   may not hold a hidden volume), Android app storage exposes discrete files/keys — a coexisting
+   encrypted real vault is provably there. VeraCrypt-style hidden-volume deniability is **not
+   achievable** on this storage model.
+3. **Storage-size / backup / FS-metadata differential.** `guest/` and `vault/` differ in size,
+   file count and mtimes. The guest content is written **once** at PIN-set and never touched, so
+   its mtimes are frozen while the real vault's churn — a behavioural tell that survives into
+   any cloud/OS backup or repeated `ls -la` snapshot.
+4. **Interactive coercion.** The in-app decoy view currently shows an **empty** vault
+   (`getFakeFiles`/`getFakeNotes` are not wired to a screen). The encryption improves the
+   *image-the-disk* picture, not the *make-the-user-open-it* picture — a coercer who makes the
+   user open the guest vault sees nothing, itself suspicious. A populated decoy browser is
+   deferred.
+5. **Image-then-coerce.** A forensically-aware coercer clones the device **before** demanding a
+   PIN, pre-empting the panic-PIN wipe and capturing *both* vaults. Panic helps against an
+   unsophisticated coercer, not one who images first.
+6. **Bundle/symbol residue.** The JS class identifier (`DecoyVaultService`) and German UI labels
+   ("Täusch-PIN") persist in the Hermes bundle; grepping the APK still reveals the feature.
+   Closing this needs a source rename + UI relabel — deferred (low marginal value while the
+   feature is visibly in the UI).
+
+**Attacker matrix (Layer 6):**
+
+| Coercion scenario | Result |
+|-------------------|--------|
+| Casual "open it", no device imaging | **HOLDS** — guest shown, real key cleared from RAM |
+| Forensic string-grep for "decoy" | **HOLDS** — neutral `guest` naming |
+| "Which file is the obvious fake?" | **HOLDS** — both vaults opaque ciphertext |
+| Analyst knows the app, demands 2nd PIN | **FAILS** — feature known; 2nd credential set visible |
+| Image-then-coerce (clone before PIN) | **FAILS** — panic pre-empted; both vaults captured |
+| Make-user-open-decoy interactively | **WEAK** — in-app decoy view shows empty (not wired) |
+| Storage-size / mtime / backup correlation | **FAILS** — `guest/` vs `vault/` distinguishable, frozen mtimes |
+
+**One-line honest summary:** Layer 6 defeats casual coercion and naive/low-tier forensics; it is
+**not** full plausible deniability — storage size, backups and filesystem metadata continue to
+leak the existence, and likely the identity, of the real vault.
+
+---
+
+## 16. Change Log — Audit Round 4
 
 | ID | Severity | Fix |
 |----|----------|-----|
