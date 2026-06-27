@@ -164,12 +164,14 @@ export class SecureCryptoService {
    * Konvertiert ArrayBuffer zu Hex-String
    */
   static bufferToHex(buffer: ArrayBuffer): string {
+    // O(n) via array-join. The previous `hex += ...` per byte is O(n^2) in Hermes and
+    // HANGS on tens-of-KB inputs (surfaced by L6 decoy content). Output is byte-identical.
     const bytes = new Uint8Array(buffer);
-    let hex = '';
+    const out = new Array<string>(bytes.byteLength);
     for (let i = 0; i < bytes.byteLength; i++) {
-      hex += (bytes[i] < 16 ? '0' : '') + bytes[i].toString(16);
+      out[i] = (bytes[i] < 16 ? '0' : '') + bytes[i].toString(16);
     }
-    return hex;
+    return out.join('');
   }
 
   /**
@@ -193,10 +195,13 @@ export class SecureCryptoService {
    * Verschlüsselung von Notizen mit Nicht-Latin1-Zeichen auf dem Gerät fehl.
    */
   private static utf8ToBase64(str: string): string {
+    // O(n) chunked. Per-byte `binary += String.fromCharCode(...)` is O(n^2) in Hermes and
+    // HANGS on tens-of-KB inputs (surfaced by L6 decoy content). Output is byte-identical.
     const bytes = new TextEncoder().encode(str);
     let binary = '';
-    for (let i = 0; i < bytes.length; i++) {
-      binary += String.fromCharCode(bytes[i]);
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK) as unknown as number[]);
     }
     return btoa(binary);
   }
@@ -207,12 +212,13 @@ export class SecureCryptoService {
    * nicht zwischen Objekten/Rollen vertauscht werden können.
    */
   private static utf8ToHex(s: string): string {
+    // O(n) via array-join (same identical-output rationale as bufferToHex).
     const bytes = new TextEncoder().encode(s);
-    let hex = '';
+    const out = new Array<string>(bytes.length);
     for (let i = 0; i < bytes.length; i++) {
-      hex += (bytes[i] < 16 ? '0' : '') + bytes[i].toString(16);
+      out[i] = (bytes[i] < 16 ? '0' : '') + bytes[i].toString(16);
     }
-    return hex;
+    return out.join('');
   }
 
   /**

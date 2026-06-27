@@ -281,10 +281,18 @@ export class DecoyVaultService {
    * encryption. Random bytes encrypt to ciphertext indistinguishable from a real file.
    */
   private static async randomHex(nBytes: number): Promise<string> {
-    const buf = await CryptoModule.getRandomBytesAsync(nBytes);
-    return Array.from(new Uint8Array(buf))
+    // Decoy filler of the claimed file size (tens of KB). It is XChaCha20-sealed before it
+    // ever hits disk, so the on-disk blob is full-size opaque ciphertext regardless of the
+    // plaintext's entropy — the plaintext is never exposed without the guest PIN. So instead
+    // of thousands of CSPRNG bytes (expo-crypto caps getRandomBytesAsync at 1024/call, and
+    // chunking it into ~hundreds of bridge calls HANGS on-device), take one small random seed
+    // and expand it. One bridge call, O(n), and within the 1024 cap.
+    const seedBuf = await CryptoModule.getRandomBytesAsync(256);
+    const seed = Array.from(new Uint8Array(seedBuf))
       .map(b => b.toString(16).padStart(2, '0'))
-      .join('');
+      .join(''); // 512 hex chars
+    const target = nBytes * 2; // 2 hex chars per byte
+    return seed.repeat(Math.ceil(target / seed.length)).slice(0, target);
   }
 
   /**
