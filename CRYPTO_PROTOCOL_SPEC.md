@@ -586,7 +586,7 @@ cost against weaker, more realistic attackers; none of it defeats live attacker-
 | 4 Device integrity | Real `KeyInfo.securityLevel` (STRONGBOX / TRUSTED_ENVIRONMENT / SOFTWARE); `setUnlockedDeviceRequired(true)` gated on a secure lockscreen; key-attestation cert-chain export (challenge → root-of-trust `verifiedBootState`+`deviceLocked`). | Defeating a TEE/StrongBox bypass; providing hardware backing where the device has none (degrades to SOFTWARE, **warned**, not blocked). | Detect software-only keystore / tampered boot state (informational signal). | `HardwareKeystoreAttestTest.kt` on-device (2 tests). |
 | 5 Crypto-shredding | No per-file content keys exist → destroying the master key (wrapped key in SecureStore **and** the in-memory copy) makes **every** blob permanently undecryptable, regardless of flash residue. Plaintext view-temp cache swept (overwrite+delete). | Guaranteed *physical* erasure of flash blocks (NAND wear-leveling may retain old blocks); recovering a key the attacker already extracted while unlocked. | Post-wipe forensic recovery of vault content. | `__tests__/L5_CryptoShred`. |
 | 6 Duress / coercion | Panic PIN (Argon2id) → wipe or permanent-lock. Guest/decoy vault: own Argon2id PIN, neutral `guest/`+`filevault_guest_*` naming, content **XChaCha20-encrypted** with a guest-PIN-derived key (separate KDF salt, never stored) → on disk indistinguishable from the real vault. | True plausible deniability — see §15.2. The hidden-vault *existence* stays provable. | Casual coercion + low-tier / string-grep forensics. | `__tests__/L6_DecoyEncryption`; §15.2. |
-| 7 Supply-chain / APK integrity | *(pending — next commit)* | | | |
+| 7 Supply-chain / APK integrity | Native `verifyPinnedSignature()` compares the running APK's signing-cert SHA-256 against a **build-time-pinned** `BuildConfig.SIGNING_CERT_SHA256` (constant-time, **fail-closed**); JS `IntegrityService.checkSignature` maps it to `valid`/`invalid`/`unverifiable` and fails the aggregate only on a true `invalid`. Shipped Hermes bundle isolated from the toolchain advisories (all critical/high are dev/test-only). npm lockfile carries 871 SRI hashes (`npm ci`-enforced); react/hermes AARs pinned by `.sha1`. | Defeating an attacker who **patches out the self-check** before re-signing (any on-device check is bypassable — this is not attestation); server-verified Play Integrity (app is offline, no server); checksum-pinning the Maven-Central `lazysodium`/`jna` AARs (no Gradle `verification-metadata.xml` yet — §15.3). | Naive repackaging / re-signing; side-load from an untrusted source; a tampered/cloned APK. | `__tests__/L7_SignatureVerification` (9 tests); `IntegrityModule.kt` review; §15.3. |
 
 ### 15.2 Layer 6 deniability boundary — precise, against which attacker it holds
 
@@ -648,6 +648,92 @@ deniability.** Stated precisely:
 **One-line honest summary:** Layer 6 defeats casual coercion and naive/low-tier forensics; it is
 **not** full plausible deniability — storage size, backups and filesystem metadata continue to
 leak the existence, and likely the identity, of the real vault.
+
+### 15.3 Layer 7 boundary — APK integrity and supply-chain, against which attacker it holds
+
+Layer 7 has two halves with very different ceilings.
+
+**APK signature self-check.** The native `verifyPinnedSignature()` reads the running package's
+signing-cert SHA-256 from `PackageManager` and compares it, constant-time, to
+`BuildConfig.SIGNING_CERT_SHA256` — a value compiled into the APK at build time from the
+`FILEVAULT_SIGNING_CERT_SHA256` gradle property (never committed; derived from the release
+keystore with `keytool`).
+
+**What it HOLDS against:**
+- **Naive repackaging / re-signing.** An attacker who decompiles, modifies and re-signs the APK
+  with their own key changes the signing cert; the runtime cert no longer matches the pinned
+  hash → verdict `invalid` → the integrity check fails. Trojanised clones produced by automated
+  tooling that did not strip the check are caught.
+- **Side-load provenance (advisory).** `checkInstallerIntegrity()` flags installs from an
+  untrusted source vs a known store. Informational, not enforced.
+
+**What it does NOT do (does NOT hold against):**
+1. **An attacker who patches out the check.** The verification runs *inside* the code the attacker
+   is repackaging. A competent adversary NOPs the call (or forces the `valid` branch) before
+   re-signing. R8/minify only raises the cost of locating it. **No on-device self-check is a
+   trust anchor** — only server-verified attestation (Play Integrity) is, and this app is offline
+   with no server, so that is **deliberately out of scope**.
+2. **Fail-open on absence.** By design `unverifiable` (native module missing, or an unpinned debug
+   build) does **not** fail the check — a false positive must never lock out a legitimate user.
+   So the check adds assurance only in a properly pinned release build; it is silent elsewhere.
+3. **Response.** The verdict is surfaced (warning), not wired to an automatic wipe. JS-evaluated
+   anti-tamper auto-destruction is intentionally avoided (false-positive bricking risk; consistent
+   with `DeviceSecurityService`'s no-JS-heuristics rule). Enforcement is an opt-in pending
+   on-device tuning.
+
+**Supply-chain.**
+- **npm.** `package-lock.json` carries 871 Subresource-Integrity (`sha512`) hashes; `npm ci`
+  refuses to install anything whose tarball hash drifts. `npm audit` reports 39 advisories
+  (1 critical, 3 high). **All critical/high are build/dev/test-only** and are **not** linked into
+  the shipped Hermes bundle: `shell-quote` (critical) ← `react-devtools-core`; `form-data` (high)
+  ← `jsdom` ← `jest-expo` (test); `undici`/`ws` (high) ← `@expo/cli` + `metro` (dev server /
+  bundler). The release bundle is the app's own JS plus the runtime deps it actually imports.
+- **Native AARs.** `react-android` / `hermes-android` are vendored in `android/local-maven` with
+  `.sha1`/`.md5`. The Maven-Central `com.goterl:lazysodium-android:5.1.0` and
+  `net.java.dev.jna:jna:5.17.0` (the crypto-bearing libs) are pulled by coordinate **without** a
+  Gradle `verification-metadata.xml` checksum gate — a named residual. Closing it:
+  `./gradlew --write-verification-metadata sha256` against a clean cache, then commit the
+  generated metadata. Not generated here: real checksums require a clean Gradle resolve in a build
+  environment, and fabricating them would be worse than declaring the gap.
+
+**Structural residual (both halves):** an attacker who controls the **build host** wins
+regardless — they can mint a matching signature pin and tamper the bundle before it is signed.
+Supply-chain integrity ultimately rests on the build machine and signing key being trusted; the
+on-device checks defend only the *distribution* path after a clean build.
+
+**Attacker matrix (Layer 7):**
+
+| Scenario | Result |
+|----------|--------|
+| Repackaged + re-signed APK, check left intact | **HOLDS** — cert mismatch → `invalid` |
+| Side-load from untrusted installer | **DETECTED** (advisory) |
+| Attacker patches out the self-check, then re-signs | **FAILS** — on-device check is not a trust anchor |
+| Tampered dev-server / bundler dependency at build time | **FAILS** — build host is the trust root |
+| Drifted npm tarball | **HOLDS** — `npm ci` SRI mismatch |
+| Swapped `lazysodium`/`jna` AAR from Maven Central | **WEAK** — no checksum pin yet (verification-metadata pending) |
+
+**One-line honest summary:** Layer 7 raises the bar against naive repackaging and catches npm
+tarball drift, but an on-device signature check is not attestation and a compromised build host
+defeats the whole chain — the un-pinned native AARs and the absent server-side attestation are the
+named residuals.
+
+### 15.4 Aggregate status (Layers 1-7)
+
+| Layer | Status | Proof artifact | Principal residual risk |
+|-------|--------|----------------|-------------------------|
+| 1 UI leakage & `FLAG_SECURE` | Done | `dumpsys` + manual on-device | Framebuffer read with root |
+| 2 IME / keyboard | Done | native `getActiveInputMethod`; field props; `tsc` | Malicious **system** IME / root keylogger |
+| 3 Master key out of JS heap | Done | `__tests__/L3_KeyZeroing`; native `androidTest` | Immutable hex-string copies until GC |
+| 4 Device integrity / attestation | Done | `HardwareKeystoreAttestTest.kt` (2, on-device) | No hardware backing → SOFTWARE (warned) |
+| 5 Crypto-shredding | Done | `__tests__/L5_CryptoShred` | NAND wear-levelling physical residue |
+| 6 Duress / coercion | Done | `__tests__/L6_DecoyEncryption`; §15.2 | Hidden-vault *existence* stays provable |
+| 7 Supply-chain / APK integrity | Done (host-verified pending) | `__tests__/L7_SignatureVerification` (9); §15.3 | Self-check bypassable; AARs un-pinned; no server attestation |
+
+**Verification note.** Layers 1-7 are proven deterministically on the host (Jest `tsc`) and, for
+the native halves (L3/L4 crypto JNI), by on-device `androidTest` KATs previously green on the
+SM-S906B (`tests=15, failures=0`). The Layer 6/7 **interactive on-device smoke** (drive the guest
+vault; install a re-signed APK and observe `invalid`) is **blocked**: the SM-S906B is not
+currently attached (both adb servers report no devices). Reported, not faked.
 
 ---
 
