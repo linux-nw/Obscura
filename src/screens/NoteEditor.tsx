@@ -4,15 +4,17 @@ import {
   KeyboardAvoidingView, Platform, StatusBar, Alert, ScrollView,
 } from 'react-native';
 import { NotesService, Note } from '../services/NotesService';
+import { DecoyVaultService } from '../services/DecoyVaultService';
 import { c, rs, font, SAFE_TOP, SAFE_BOTTOM, useBottomInset } from '../theme';
 
 interface Props {
   note?: Note | null;
+  isDecoy?: boolean;
   onClose: () => void;
   onSaved: () => void;
 }
 
-export default function NoteEditor({ note, onClose, onSaved }: Props) {
+export default function NoteEditor({ note, isDecoy = false, onClose, onSaved }: Props) {
   const safeBot = useBottomInset();
   const [title,    setTitle]    = useState(note?.title ?? '');
   const [content,  setContent]  = useState(note?.content ?? '');
@@ -54,7 +56,16 @@ export default function NoteEditor({ note, onClose, onSaved }: Props) {
     }
     setSaving(true);
     try {
-      if (note) {
+      if (isDecoy) {
+        // L6: write into the guest vault (sealed with the guest key), never the real
+        // master-key path. updateNote re-uses the same id; create generates a fresh one.
+        await DecoyVaultService.saveNote(
+          title.trim(),
+          content.trim(),
+          category.trim() || undefined,
+          note?.id,
+        );
+      } else if (note) {
         await NotesService.updateNote(note.id, {
           title: title.trim(),
           content: content.trim(),

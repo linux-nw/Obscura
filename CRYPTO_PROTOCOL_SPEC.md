@@ -585,7 +585,7 @@ cost against weaker, more realistic attackers; none of it defeats live attacker-
 | 3 RAM key lifetime **(PARTIAL — see §15.5)** | Long-lived master-key cache held as a zeroable `Uint8Array` (`CryptoService.ts:1245`), actively `.fill(0)` on every reassignment and on lock (`:1251`). Native Kotlin zeroes its key + plaintext byte arrays immediately after each crypto op (`RNFileVaultModule.kt:58,106,116,167`). | **Raw key still transits the JS heap**: `getMasterKey()` → getter `:1248` materialises a fresh **immutable hex string** per call (unzeroable, GC-only). Native zeroing is Kotlin `ByteArray.fill(0)`, **not** `sodium_memzero`/`sodium_mlock` → pages swappable, GC-copy residue possible. True 0-JS-lifetime would need native-only key custody (opaque handle, AEAD in native) — a crypto-core rearchitecture, out of scope. | Post-lock heap-residue scrape. | `__tests__/L3_KeyZeroing`; native `androidTest`; §15.5. |
 | 4 Device integrity | Real `KeyInfo.securityLevel` (STRONGBOX / TRUSTED_ENVIRONMENT / SOFTWARE); `setUnlockedDeviceRequired(true)` gated on a secure lockscreen; key-attestation cert-chain export (challenge → root-of-trust `verifiedBootState`+`deviceLocked`). | Defeating a TEE/StrongBox bypass; providing hardware backing where the device has none (degrades to SOFTWARE, **warned**, not blocked). | Detect software-only keystore / tampered boot state (informational signal). | `HardwareKeystoreAttestTest.kt` on-device (2 tests). |
 | 5 Crypto-shredding | No per-file content keys exist → destroying the master key (wrapped key in SecureStore **and** the in-memory copy) makes **every** blob permanently undecryptable, regardless of flash residue. Plaintext view-temp cache swept (overwrite+delete). | Guaranteed *physical* erasure of flash blocks (NAND wear-leveling may retain old blocks); recovering a key the attacker already extracted while unlocked. | Post-wipe forensic recovery of vault content. | `__tests__/L5_CryptoShred`. |
-| 6 Duress / coercion | Panic PIN (Argon2id) → wipe or permanent-lock. Guest/decoy vault: own Argon2id PIN, neutral `guest/`+`filevault_guest_*` naming, content **XChaCha20-encrypted** with a guest-PIN-derived key (separate KDF salt, never stored) → on disk indistinguishable from the real vault. | True plausible deniability — see §15.2. The hidden-vault *existence* stays provable. | Casual coercion + low-tier / string-grep forensics. | `__tests__/L6_DecoyEncryption`; §15.2. |
+| 6 Duress / coercion | Panic PIN (Argon2id) → wipe or permanent-lock. Guest/decoy vault: own Argon2id PIN, neutral `guest/`+`filevault_guest_*` naming, content **XChaCha20-encrypted** with a guest-PIN-derived key (separate KDF salt, never stored) → on disk indistinguishable from the real vault. **Interactive read+write** wired to the guest key (fail-closed; never the master key), persistent across restarts, isolated from the real vault. | True plausible deniability — see §15.2. The hidden-vault *existence* stays provable. | Casual coercion + low-tier / string-grep forensics. | `__tests__/L6_DecoyEncryption` + `L6_DecoyWrite`; on-device §15.6; §15.2. |
 | 7 Supply-chain / APK integrity | Native `verifyPinnedSignature()` compares the running APK's signing-cert SHA-256 against a **build-time-pinned** `BuildConfig.SIGNING_CERT_SHA256` (constant-time, **fail-closed**); JS `IntegrityService.checkSignature` maps it to `valid`/`invalid`/`unverifiable` and fails the aggregate only on a true `invalid`. Shipped Hermes bundle isolated from the toolchain advisories (all critical/high are dev/test-only). npm lockfile carries 871 SRI hashes (`npm ci`-enforced); react/hermes AARs pinned by `.sha1`. | Defeating an attacker who **patches out the self-check** before re-signing (any on-device check is bypassable — this is not attestation); server-verified Play Integrity (app is offline, no server); checksum-pinning the Maven-Central `lazysodium`/`jna` AARs (no Gradle `verification-metadata.xml` yet — §15.3). | Naive repackaging / re-signing; side-load from an untrusted source; a tampered/cloned APK. | `__tests__/L7_SignatureVerification` (9 tests); `IntegrityModule.kt` review; §15.3. |
 
 ### 15.2 Layer 6 deniability boundary — precise, against which attacker it holds
@@ -620,11 +620,14 @@ deniability.** Stated precisely:
    file count and mtimes. The guest content is written **once** at PIN-set and never touched, so
    its mtimes are frozen while the real vault's churn — a behavioural tell that survives into
    any cloud/OS backup or repeated `ls -la` snapshot.
-4. **Interactive coercion.** The in-app decoy view currently shows an **empty** vault
-   (`getFakeFiles`/`getFakeNotes` are not wired to a screen). The encryption improves the
-   *image-the-disk* picture, not the *make-the-user-open-it* picture — a coercer who makes the
-   user open the guest vault sees nothing, itself suspicious. A populated decoy browser is
-   deferred.
+4. **Interactive coercion.** *Resolved* (device-verified, §15.6). The in-app guest view is now
+   wired to `getFakeNotes`/`getFakeFiles` for reads **and** to `DecoyVaultService.saveNote`/
+   `saveFile`/`deleteNote`/`deleteFile` for writes — every write sealed with the guest key into
+   `guest/`, fail-closed without it, never the master-key path. A coercer who makes the user open
+   the guest vault sees a populated, usable vault (browse, add, open, delete) that persists across
+   restarts, not an empty/read-only shell. Cross-vault isolation and the absence of any shared
+   counter/id are pinned by `__tests__/L6_DecoyWrite`. Remaining caveat: a guest who uses only the
+   decoy PIN bumps the crypto lock-counter A on each login and self-locks after 5 (§15.6 follow-up).
 5. **Image-then-coerce.** A forensically-aware coercer clones the device **before** demanding a
    PIN, pre-empting the panic-PIN wipe and capturing *both* vaults. Panic helps against an
    unsophisticated coercer, not one who images first.
@@ -642,7 +645,7 @@ deniability.** Stated precisely:
 | "Which file is the obvious fake?" | **HOLDS** — both vaults opaque ciphertext |
 | Analyst knows the app, demands 2nd PIN | **FAILS** — feature known; 2nd credential set visible |
 | Image-then-coerce (clone before PIN) | **FAILS** — panic pre-empted; both vaults captured |
-| Make-user-open-decoy interactively | **WEAK** — in-app decoy view shows empty (not wired) |
+| Make-user-open-decoy interactively | **HOLDS** — guest view reads+writes, persists, isolated (§15.6); was empty pre-fix |
 | Storage-size / mtime / backup correlation | **FAILS** — `guest/` vs `vault/` distinguishable, frozen mtimes |
 
 **One-line honest summary:** Layer 6 defeats casual coercion and naive/low-tier forensics; it is
@@ -726,7 +729,7 @@ named residuals.
 | 3 Master key out of JS heap | **Partial** | `__tests__/L3_KeyZeroing`; native `androidTest`; §15.5 | raw key transits JS heap as immutable hex string per op; native zero is `fill(0)` not `mlock`/`memzero` |
 | 4 Device integrity / attestation | Done (verdict from real KeyInfo; hardcoded-`true` wart fixed) | `HardwareKeystoreService.ts:98`→`securityLevelOf`; `HardwareKeystoreAttestTest.kt` (on-device) | No hardware backing → SOFTWARE (warned) |
 | 5 Crypto-shredding | Done (test-pinned) | `__tests__/L5_CryptoShred` (post-shred decrypt `rejects.toThrow`); `F2_CacheCleanup`; FileViewer per-close temp delete | NAND wear-levelling physical residue |
-| 6 Duress / coercion | Done (rename complete; content encrypted) | `__tests__/L6_DecoyEncryption`; grep for old `decoy` names clean; §15.2 | Hidden-vault *existence* stays provable |
+| 6 Duress / coercion | Done (**device-verified**: decoy read+write, persistence, isolation) | `__tests__/L6_DecoyEncryption` + `L6_DecoyWrite` (write/cross-vault/no-shared-counter); on-device §15.6; §15.2 | Hidden-vault *existence* stays provable; decoy login bumps lock-counter A (§15.6 follow-up) |
 | 7 Supply-chain / APK integrity | Done (**device-verified** valid + invalid) | `__tests__/L7_SignatureVerification` (9); on-device §15.6; §15.3 | Self-check bypassable; AARs un-pinned (verification-metadata gen failed, §15.3); no server attestation |
 
 **Self-audit (this round).** Each "Done" was re-checked against its *enforcing* line, assuming guilt.
@@ -756,16 +759,40 @@ SM-S906B; verdicts read from `logcat`. Results:
    which **hung** on tens-of-KB blobs (decoy file content). Now O(n); byte-identical output (full
    crypto suite green). The `expo-crypto` mock now enforces the 1024 cap so neither regresses silently.
 
-**L6 status — host-proven; on-device file round-trip not completed via the test harness.** The guest
-**notes** encrypted and wrote successfully on-device. The full guest **file** round-trip could not be
-driven through a boot-time instrumentation hook: a 64 MB Argon2id (`crypto_pwhash`) invoked during app
-*init* intermittently stalls when crammed alongside startup crypto (the same KDF runs fine for normal
-unlock and in the on-device KATs, `tests=15, failures=0`), and RN `setTimeout` does not fire reliably
-post-init, so a deferred run was not possible either. This is a **test-harness/init-timing artifact,
-not a demonstrated product bug** — the L6 logic is proven by `__tests__/L6_DecoyEncryption` with the
-now-realistic capped mock, and the two device-found bugs above are fixed. **Recommended close-out:**
-verify the guest file flow through the real Settings UI (set the decoy PIN on an idle app), where the
-KDF runs without init contention.
+**L6 decoy WRITE — device-found bug, fixed, and device-verified green (commit pending).** Driving the
+guest vault through the real UI surfaced a genuine bug (not the earlier init-timing artifact): every
+interactive **write** in the decoy view failed —
+`E/ReactNativeJS 'Error saving file:', [Error: Dateiverschlüsselung fehlgeschlagen]` and
+`'Error creating note:', [Error: Kann Metadaten nicht verschlüsseln]`. Root cause: the editor / file-
+import paths called `NotesService.createNote` / `FileManager.saveFile`, which encrypt with the **master
+key** — never derived in a decoy session (only the guest content key is). The decoy view had read
+shims but no write path, and the regression suite covered only reads. Fix: routed all guest writes
+through `DecoyVaultService.{saveNote,saveFile,getFakeFileContent,exportFakeToTempFile,deleteNote,
+deleteFile}` (sealed with the guest key into `guest/`, fail-closed without it, no `BlobVersionService`
+and no shared SecureStore counter), and wired `NotesScreen`/`NoteEditor`/`FilesView`/`FileViewer` to
+read+write the guest vault in decoy mode. Regression coverage added: `__tests__/L6_DecoyWrite` (5 tests)
+— write→reopen→read for note+file, cross-vault leakage both directions, and a metadata-isolation check
+(real note registers `filevault_blobver_<id>`, the guest note registers no such counter and its id
+appears in no SecureStore key). On-device verification (SM-S906B, pinned release, four passes):
+(1) decoy note + file save with **zero** save-errors in logcat; (2) both persist across full
+swipe-kill + reopen and re-open from ciphertext; (3) the real vault is unchanged; (4) no decoy entry
+is visible in the real vault. `tsc` 0, jest 25 suites / 110 tests.
+
+**L6 follow-up (deferred, not fixed this round).** A guest who uses only the decoy PIN bumps the crypto
+timed-lock counter A (`filevault_failed_attempts`) on every login: the parallel real-`unlock()` fails
+(decoy PIN ≠ real passphrase) and increments it (`CryptoService.ts:803-805`); it is reset only by a
+successful **real** unlock, so after 5 decoy logins the vault times-out for 300s. A legitimate guest
+self-locks. Fix (deferred): clear counter A in the decoy/panic branch of `checkLoginPass`, or suppress
+the increment when a decoy/panic match wins the parallel race. The wipe counter B is unaffected (it
+resets on any real/decoy success). The PanicService 3-attempt auto-wipe is dead code (no caller).
+
+**One honest logcat observation (pre-existing, unrelated to L6).** During the real-vault pass one
+`'Error loading file metadata:', [Error: Metadaten-Entschlüsselung fehlgeschlagen]` fired:
+`FileManager.getFiles` hit a single blob whose metadata would not decrypt and **skipped it gracefully**
+(per-file try/catch, `FileManager.ts:293`) — the rest of the vault loaded. This device's real vault has
+accumulated blobs across many cross-build reinstalls; the most likely cause is one stale blob written
+under a superseded master key. Not a save-error, not from the decoy path, did not block verification —
+flagged for a separate look on a clean install rather than buried.
 
 **L3** stays honestly **Partial** (§15.5) — not upgraded. **L4 SOFTWARE-fallback** branch remains
 device-unverifiable on this hardware (the S22 has StrongBox + TEE; it cannot produce a software-only

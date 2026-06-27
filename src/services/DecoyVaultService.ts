@@ -465,6 +465,7 @@ export class DecoyVaultService {
               title: data.title,
               content: data.content,
               createdAt: new Date(data.createdAt),
+              category: data.category,
             });
           } catch {
             // wrong key or tampered blob → skip
@@ -476,6 +477,121 @@ export class DecoyVaultService {
     } catch {
       return [];
     }
+  }
+
+  // ─────────────────────────────── Guest Writes (L6) ───────────────────────────────
+  //
+  // Interactive writes INTO the guest vault. The decoy view must be writable to be
+  // credible (a guest who can only read is a tell). Every write is sealed with the guest
+  // content key into guest/ — never the master key, never notes/ or vault/. Crucially the
+  // guest path uses NO BlobVersionService and NO shared SecureStore counter: a guest write
+  // leaves no identifier (version, counter, sequential id) that an analyst could correlate
+  // with the real vault, consistent with the §15.2 deniability boundary. IDs are the same
+  // base36-timestamp+random shape the real vault already uses, so they add no new
+  // distinguisher. Fail-closed: without the guest content key these THROW rather than
+  // writing anything in the clear.
+
+  /**
+   * L6: create/update a note inside the guest vault. Sealed with the guest key.
+   */
+  static async saveNote(
+    title: string,
+    content: string,
+    category?: string,
+    id?: string,
+  ): Promise<DecoyNote> {
+    const keyHex = this._contentKeyHex;
+    if (!keyHex) {
+      throw new Error('Guest content key not unlocked — set the guest PIN first');
+    }
+    await this.initialize();
+    const noteId = id ?? this.generateId();
+    const createdAt = new Date().toISOString();
+    const payload = JSON.stringify({ id: noteId, title, content, category: category || undefined, createdAt });
+    await FileSystem.writeAsStringAsync(
+      `${this.DECOY_DIR}note_${noteId}`,
+      await this.seal(payload, keyHex, `guest:note:${noteId}`),
+    );
+    return { id: noteId, title, content, category: category || undefined, createdAt: new Date(createdAt) };
+  }
+
+  /**
+   * L6: import a file into the guest vault. Reads the picked file's bytes (base64) and
+   * seals content + metadata separately, mirroring createFakeFiles' on-disk layout.
+   */
+  static async saveFile(
+    fileUri: string,
+    type: 'image' | 'video' | 'document',
+    originalName: string,
+  ): Promise<DecoyFile> {
+    const keyHex = this._contentKeyHex;
+    if (!keyHex) {
+      throw new Error('Guest content key not unlocked — set the guest PIN first');
+    }
+    await this.initialize();
+
+    let base64: string;
+    if (fileUri.startsWith('data:')) {
+      base64 = fileUri.split(',')[1] ?? '';
+    } else {
+      base64 = await FileSystem.readAsStringAsync(fileUri, { encoding: FileSystem.EncodingType.Base64 });
+    }
+
+    const fileId = this.generateId();
+    const filePath = `${this.DECOY_DIR}file_${fileId}`;
+    const size = Math.floor((base64.length * 3) / 4); // approx decoded byte length
+
+    await FileSystem.writeAsStringAsync(filePath, await this.seal(base64, keyHex, `guest:file:${fileId}`));
+    const meta = { name: `file_${fileId}`, originalName, type, size };
+    await FileSystem.writeAsStringAsync(`${filePath}.meta`, await this.seal(JSON.stringify(meta), keyHex, `guest:meta:${fileId}`));
+
+    return { id: fileId, name: `file_${fileId}`, originalName, type, size, createdAt: new Date() };
+  }
+
+  /**
+   * L6: decrypt a guest file's content to base64. Fail-closed (throws without the key).
+   */
+  static async getFakeFileContent(id: string): Promise<string> {
+    const keyHex = this._contentKeyHex;
+    if (!keyHex) {
+      throw new Error('Guest content key not unlocked — set the guest PIN first');
+    }
+    const envelope = await FileSystem.readAsStringAsync(`${this.DECOY_DIR}file_${id}`);
+    return this.open(envelope, keyHex, `guest:file:${id}`);
+  }
+
+  /**
+   * L6: decrypt a guest file into a temporary plaintext cache copy for the in-app viewer.
+   * Mirrors FileManager.exportToTempFile — caller MUST FileManager.deleteTempFile(uri) on
+   * close (the L5 plaintext-cache sweep covers the same cacheDirectory).
+   */
+  static async exportFakeToTempFile(id: string): Promise<string> {
+    const files = await this.getFakeFiles();
+    const file = files.find(f => f.id === id);
+    if (!file) throw new Error('Datei nicht gefunden');
+
+    const base64 = await this.getFakeFileContent(id);
+    const cacheDir = FileSystem.cacheDirectory || '';
+    const dot = file.originalName.lastIndexOf('.');
+    const ext = dot >= 0 ? file.originalName.slice(dot) : '';
+    const tempUri = `${cacheDir}vault_view_${this.generateId()}${ext}`;
+    await FileSystem.writeAsStringAsync(tempUri, base64, { encoding: FileSystem.EncodingType.Base64 });
+    return tempUri;
+  }
+
+  /**
+   * L6: delete a guest note.
+   */
+  static async deleteNote(id: string): Promise<void> {
+    await FileSystem.deleteAsync(`${this.DECOY_DIR}note_${id}`).catch(() => {});
+  }
+
+  /**
+   * L6: delete a guest file (content + metadata).
+   */
+  static async deleteFile(id: string): Promise<void> {
+    await FileSystem.deleteAsync(`${this.DECOY_DIR}file_${id}`).catch(() => {});
+    await FileSystem.deleteAsync(`${this.DECOY_DIR}file_${id}.meta`).catch(() => {});
   }
 
   // ─────────────────────────────── Decoy Security ───────────────────────────────
