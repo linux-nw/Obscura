@@ -199,6 +199,9 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
         setFailedAttempts(0);
         await SecureStore.deleteItemAsync(ATTEMPTS_KEY);
         try {
+          // L6: derive + cache the guest content key for this decoy session so the
+          // guest vault's encrypted blobs are readable.
+          await DecoyVaultService.unlockDecoyContent(entered);
           await SecureStore.setItemAsync('filevault_guest_active', 'true');
         } catch {
           showError('Fehler beim Aktivieren des Täusch-Tresors');

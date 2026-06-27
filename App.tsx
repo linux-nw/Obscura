@@ -234,6 +234,7 @@ export default function App() {
    */
   const handleLogout = () => {
     CryptoService.clearAllCaches();
+    DecoyVaultService.clearDecoyCache(); // L6: drop cached guest content key
     // Clear decoy flag so next real login shows real data.
     SecureStore.deleteItemAsync('filevault_guest_active').catch(() => {});
     setIsDecoy(false);

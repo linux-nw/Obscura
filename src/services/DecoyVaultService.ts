@@ -51,6 +51,9 @@ export class DecoyVaultService {
   private static readonly DECOY_PIN_ALGO = 'filevault_guest_pin_algo';
   private static readonly DECOY_ENABLED_KEY = 'filevault_guest_enabled';
   private static readonly DECOY_CREATED_KEY = 'filevault_guest_created';
+  // L6: salt for the content-encryption KDF — SEPARATE from the PIN-hash salt so the
+  // stored PIN hash can never double as the content key. Public; the key is never stored.
+  private static readonly DECOY_KDF_SALT = 'filevault_guest_kdf_salt';
 
   // S1: same Argon2id hardness class as the vault KEK / Panic PIN. p=1 matches native
   // libsodium crypto_pwhash (C1); 16-byte salt. Native preferred, @noble JS fallback.
@@ -58,6 +61,14 @@ export class DecoyVaultService {
     version: 0x13, type: 2, memoryKB: 65536, iterations: 3, parallelism: 1, hashLength: 32,
   };
   private static readonly LEGACY_PBKDF2_ITERATIONS = 10000;
+
+  // L6: guest content-encryption key (hex), derived from the guest PIN via Argon2id over
+  // DECOY_KDF_SALT. Held ONLY in memory for the active guest session — never persisted, so
+  // a SecureStore dump alone cannot decrypt the guest blobs; recovering the key costs the
+  // same Argon2id work as cracking the PIN. Populated by setDecoyPin()/unlockDecoyContent(),
+  // wiped by clearDecoyCache() on logout. (JS strings are immutable so this lingers until
+  // GC — the same residual as the real master-key cache; see §15 Layer 3.)
+  private static _contentKeyHex: string | null = null;
 
   // ─────────────────────────────── Decoy Vault Setup ───────────────────────────────
 
@@ -119,26 +130,39 @@ export class DecoyVaultService {
    * Erstellt Fake Dateien im Decoy Vault
    */
   static async createFakeFiles(): Promise<void> {
+    const keyHex = this._contentKeyHex;
+    if (!keyHex) {
+      throw new Error('Guest content key not unlocked — set the guest PIN first');
+    }
     try {
-      // Fake Bilder
+      await this.initialize();
+      await this.clearEntries('file_'); // also clears file_*.meta
+
+      // L6: credible, size-matched fakes. Content is CSPRNG bytes (rendered as hex) then
+      // XChaCha20-encrypted with the guest key — on disk an opaque blob, not the old
+      // 'fake_data_placeholder' stub. `size` equals the bytes actually generated, so there
+      // is no claimed-vs-actual size differential to flag the file as fake. The metadata
+      // itself is encrypted too (no plaintext filenames/sizes on disk).
       const fakeFiles = [
-        { name: 'holiday_photo.jpg', type: 'image', size: 245678 },
-        { name: 'family_video.mp4', type: 'video', size: 12345678 },
-        { name: 'work_document.pdf', type: 'document', size: 456789 },
+        { originalName: 'holiday_photo.jpg', type: 'image' as const, bytes: 65536 },
+        { originalName: 'family_clip.mp4', type: 'video' as const, bytes: 98304 },
+        { originalName: 'work_document.pdf', type: 'document' as const, bytes: 32768 },
       ];
 
-      for (const file of fakeFiles) {
+      for (const f of fakeFiles) {
         const fileId = this.generateId();
         const filePath = `${this.DECOY_DIR}file_${fileId}`;
         const metaPath = `${filePath}.meta`;
 
-        // In Produktion: verschlüsselte Fake Daten
-        await FileSystem.writeAsStringAsync(filePath, 'fake_data_placeholder');
-        await FileSystem.writeAsStringAsync(metaPath, JSON.stringify(file));
+        const content = await this.randomHex(f.bytes);
+        await FileSystem.writeAsStringAsync(filePath, await this.seal(content, keyHex, `guest:file:${fileId}`));
+
+        const meta = { name: `file_${fileId}`, originalName: f.originalName, type: f.type, size: f.bytes };
+        await FileSystem.writeAsStringAsync(metaPath, await this.seal(JSON.stringify(meta), keyHex, `guest:meta:${fileId}`));
       }
 
       await SecureStore.setItemAsync(this.DECOY_CREATED_KEY, Date.now().toString());
-      console.log('GuestVault: Fake files created');
+      console.log('GuestVault: Fake files created (encrypted)');
     } catch (error) {
       console.error('GuestVault: Failed to create fake files:', error);
     }
@@ -148,29 +172,34 @@ export class DecoyVaultService {
    * Erstellt Fake Notizen
    */
   static async createFakeNotes(): Promise<void> {
+    const keyHex = this._contentKeyHex;
+    if (!keyHex) {
+      throw new Error('Guest content key not unlocked — set the guest PIN first');
+    }
     try {
+      await this.initialize();
+      await this.clearEntries('note_');
+
       const fakeNotes = [
-        { title: 'Bank Account', content: 'Bank: XYZ Bank, Account: 123456789' },
-        { title: 'Password List', content: 'Gmail: password123\nFacebook: mypassword\n' },
-        { title: 'Secret Recipe', content: 'Grandmas secret cookie recipe...' },
+        { title: 'Bank Account', content: 'Bank: XYZ Bank, IBAN: DE00 1234 5678 9012 3456 78' },
+        { title: 'Password List', content: 'Gmail: sunshine2021\nFacebook: hunter2!\nNetflix: family#vault' },
+        { title: 'Secret Recipe', content: "Grandma's cookie recipe: 250g butter, 200g sugar, 1 egg, vanilla..." },
       ];
 
       for (const note of fakeNotes) {
         const noteId = this.generateId();
         const notePath = `${this.DECOY_DIR}note_${noteId}`;
-
-        await FileSystem.writeAsStringAsync(
-          notePath,
-          JSON.stringify({
-            id: noteId,
-            title: note.title,
-            content: note.content,
-            createdAt: new Date().toISOString(),
-          })
-        );
+        const payload = JSON.stringify({
+          id: noteId,
+          title: note.title,
+          content: note.content,
+          createdAt: new Date().toISOString(),
+        });
+        // L6: encrypted on disk (was plaintext JSON) — no readable fake notes leaking.
+        await FileSystem.writeAsStringAsync(notePath, await this.seal(payload, keyHex, `guest:note:${noteId}`));
       }
 
-      console.log('GuestVault: Fake notes created');
+      console.log('GuestVault: Fake notes created (encrypted)');
     } catch (error) {
       console.error('GuestVault: Failed to create fake notes:', error);
     }
@@ -181,6 +210,97 @@ export class DecoyVaultService {
    */
   private static generateId(): string {
     return (Date.now().toString(36) + Math.random().toString(36).substring(2, 8));
+  }
+
+  // ─────────────────────────────── Content Encryption (L6) ───────────────────────────────
+
+  /**
+   * L6: get-or-create the 16-byte content-KDF salt. Separate from the PIN-hash salt
+   * (DECOY_PIN_SALT). Salt is public, so storing it leaks nothing.
+   */
+  private static async getOrCreateContentKdfSalt(): Promise<string> {
+    let salt = await SecureStore.getItemAsync(this.DECOY_KDF_SALT);
+    if (!salt) {
+      const saltBytes = await CryptoModule.getRandomBytesAsync(16);
+      salt = Array.from(new Uint8Array(saltBytes))
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('');
+      await SecureStore.setItemAsync(this.DECOY_KDF_SALT, salt);
+    }
+    return salt;
+  }
+
+  /**
+   * L6: derive the 32-byte guest content key from the guest PIN via Argon2id (same
+   * hardness class as the vault KEK). Never stored.
+   */
+  private static async deriveContentKey(pin: string): Promise<string> {
+    const saltHex = await this.getOrCreateContentKdfSalt();
+    const saltBuffer = SecureCryptoService.hexToBuffer(saltHex);
+    const derived = await Argon2idService.deriveKey(pin.normalize('NFC'), saltBuffer, this.DECOY_ARGON2);
+    return SecureCryptoService.bufferToHex(derived);
+  }
+
+  /**
+   * L6: derive + cache the guest content key for the active session. Call when the guest
+   * PIN unlocks the decoy view (AuthScreen). Without this getFake*() cannot read anything.
+   */
+  static async unlockDecoyContent(pin: string): Promise<void> {
+    this._contentKeyHex = await this.deriveContentKey(pin);
+  }
+
+  /**
+   * L6: drop the in-memory guest content key (call on logout).
+   */
+  static clearDecoyCache(): void {
+    this._contentKeyHex = null;
+  }
+
+  /**
+   * L6: encrypt a string into an on-disk envelope using the guest content key. Reuses the
+   * vault's XChaCha20-Poly1305 AEAD via encryptDataWith() with an EXPLICIT key — it never
+   * touches the master-key cache, so the real vault crypto path is unaffected. aadContext
+   * binds the blob to its slot (prevents swapping). On disk the result is opaque ciphertext,
+   * indistinguishable from a real vault blob.
+   */
+  private static async seal(plaintext: string, keyHex: string, aadContext: string): Promise<string> {
+    const { encryptedData, iv, mac } = await SecureCryptoService.encryptDataWith(plaintext, keyHex, aadContext);
+    return JSON.stringify({ c: encryptedData, iv, mac });
+  }
+
+  /**
+   * L6: inverse of seal(). Throws if the key is wrong or the blob is tampered (AEAD fail).
+   */
+  private static async open(envelope: string, keyHex: string, aadContext: string): Promise<string> {
+    const { c, iv, mac } = JSON.parse(envelope);
+    return SecureCryptoService.decryptDataWith(c, iv, mac, keyHex, aadContext);
+  }
+
+  /**
+   * L6: nBytes of CSPRNG output rendered as hex — the credible "file payload" before
+   * encryption. Random bytes encrypt to ciphertext indistinguishable from a real file.
+   */
+  private static async randomHex(nBytes: number): Promise<string> {
+    const buf = await CryptoModule.getRandomBytesAsync(nBytes);
+    return Array.from(new Uint8Array(buf))
+      .map(b => b.toString(16).padStart(2, '0'))
+      .join('');
+  }
+
+  /**
+   * L6: delete existing guest entries with the given prefix (idempotent re-create).
+   */
+  private static async clearEntries(prefix: string): Promise<void> {
+    try {
+      const files = await FileSystem.readDirectoryAsync(this.DECOY_DIR);
+      for (const file of files) {
+        if (file.startsWith(prefix)) {
+          await FileSystem.deleteAsync(`${this.DECOY_DIR}${file}`).catch(() => {});
+        }
+      }
+    } catch {
+      // dir may not exist yet — nothing to clear
+    }
   }
 
   // ─────────────────────────────── Decoy PIN Management ───────────────────────────────
@@ -199,6 +319,11 @@ export class DecoyVaultService {
       await SecureStore.setItemAsync(this.DECOY_PIN_HASH, hash);
       await SecureStore.setItemAsync(this.DECOY_PIN_SALT, salt);
       await SecureStore.setItemAsync(this.DECOY_PIN_ALGO, 'argon2id');
+      // L6: (re)key guest content. A fresh content-KDF salt is generated so changing the
+      // guest PIN re-keys every guest blob; cache the derived key so createFake*() can
+      // encrypt immediately after.
+      await SecureStore.deleteItemAsync(this.DECOY_KDF_SALT);
+      this._contentKeyHex = await this.deriveContentKey(pin);
       console.log('GuestVault: guest PIN set (Argon2id)');
     } catch (error) {
       console.error('Error setting guest pin:', error);
@@ -279,31 +404,28 @@ export class DecoyVaultService {
    * Lädt Fake Dateien
    */
   static async getFakeFiles(): Promise<DecoyFile[]> {
+    const keyHex = this._contentKeyHex;
+    if (!keyHex) return []; // guest content key not unlocked → nothing readable
     try {
       const files = await FileSystem.readDirectoryAsync(this.DECOY_DIR);
       const decoyFiles: DecoyFile[] = [];
 
       for (const file of files) {
-        if (file.startsWith('file_') && !file.endsWith('.meta')) {
-          const filePath = `${this.DECOY_DIR}${file}`;
-          const metaPath = `${filePath}.meta`;
-
+        if (file.startsWith('file_') && file.endsWith('.meta')) {
+          const id = file.replace('file_', '').replace('.meta', '');
           try {
-            const info = await FileSystem.getInfoAsync(metaPath);
-            if (info.exists) {
-              const meta = await FileSystem.readAsStringAsync(metaPath);
-              const data = JSON.parse(meta);
-              decoyFiles.push({
-                id: file.replace('file_', ''),
-                name: file,
-                originalName: data.originalName,
-                type: data.type,
-                size: data.size,
-                createdAt: new Date(),
-              });
-            }
+            const envelope = await FileSystem.readAsStringAsync(`${this.DECOY_DIR}${file}`);
+            const data = JSON.parse(await this.open(envelope, keyHex, `guest:meta:${id}`));
+            decoyFiles.push({
+              id,
+              name: data.name,
+              originalName: data.originalName, // L6: now present (was never written before)
+              type: data.type,
+              size: data.size,
+              createdAt: new Date(),
+            });
           } catch {
-            // Skip invalid files
+            // wrong key or tampered blob → skip
           }
         }
       }
@@ -318,21 +440,27 @@ export class DecoyVaultService {
    * Lädt Fake Notizen
    */
   static async getFakeNotes(): Promise<DecoyNote[]> {
+    const keyHex = this._contentKeyHex;
+    if (!keyHex) return []; // guest content key not unlocked → nothing readable
     try {
       const files = await FileSystem.readDirectoryAsync(this.DECOY_DIR);
       const decoyNotes: DecoyNote[] = [];
 
       for (const file of files) {
         if (file.startsWith('note_')) {
-          const filePath = `${this.DECOY_DIR}${file}`;
-          const content = await FileSystem.readAsStringAsync(filePath);
-          const data = JSON.parse(content);
-          decoyNotes.push({
-            id: data.id,
-            title: data.title,
-            content: data.content,
-            createdAt: new Date(data.createdAt),
-          });
+          const id = file.replace('note_', '');
+          try {
+            const envelope = await FileSystem.readAsStringAsync(`${this.DECOY_DIR}${file}`);
+            const data = JSON.parse(await this.open(envelope, keyHex, `guest:note:${id}`));
+            decoyNotes.push({
+              id: data.id,
+              title: data.title,
+              content: data.content,
+              createdAt: new Date(data.createdAt),
+            });
+          } catch {
+            // wrong key or tampered blob → skip
+          }
         }
       }
 
@@ -362,6 +490,8 @@ export class DecoyVaultService {
       await SecureStore.deleteItemAsync(this.DECOY_PIN_HASH);
       await SecureStore.deleteItemAsync(this.DECOY_PIN_SALT);
       await SecureStore.deleteItemAsync(this.DECOY_PIN_ALGO);
+      await SecureStore.deleteItemAsync(this.DECOY_KDF_SALT); // L6: content-KDF salt
+      this._contentKeyHex = null; // L6: drop any cached guest content key
 
       console.log('GuestVault: Vault destroyed');
     } catch (error) {
