@@ -727,7 +727,7 @@ named residuals.
 | 4 Device integrity / attestation | Done (verdict from real KeyInfo; hardcoded-`true` wart fixed) | `HardwareKeystoreService.ts:98`→`securityLevelOf`; `HardwareKeystoreAttestTest.kt` (on-device) | No hardware backing → SOFTWARE (warned) |
 | 5 Crypto-shredding | Done (test-pinned) | `__tests__/L5_CryptoShred` (post-shred decrypt `rejects.toThrow`); `F2_CacheCleanup`; FileViewer per-close temp delete | NAND wear-levelling physical residue |
 | 6 Duress / coercion | Done (rename complete; content encrypted) | `__tests__/L6_DecoyEncryption`; grep for old `decoy` names clean; §15.2 | Hidden-vault *existence* stays provable |
-| 7 Supply-chain / APK integrity | Done (host-verified pending) | `__tests__/L7_SignatureVerification` (9); §15.3 | Self-check bypassable; AARs un-pinned (verification-metadata gen failed, §15.3); no server attestation |
+| 7 Supply-chain / APK integrity | Done (**device-verified** valid + invalid) | `__tests__/L7_SignatureVerification` (9); on-device §15.6; §15.3 | Self-check bypassable; AARs un-pinned (verification-metadata gen failed, §15.3); no server attestation |
 
 **Self-audit (this round).** Each "Done" was re-checked against its *enforcing* line, assuming guilt.
 Findings: **L3 downgraded to Partial** (the raw key still materialises as an immutable JS hex string
@@ -736,17 +736,40 @@ flags now applied). **L4 wart fixed** (`generateKey` hard-coded `isHardwareBacke
 from real `KeyInfo` — the verdict path already read the honest value, so this closed a latent trap,
 not an active failure). L1/L5/L6 confirmed with cited enforcing lines + tests, no theater found.
 
-**Verification note — host-verified vs device-only.** Layers 1-7 are proven deterministically on the
-host (Jest 24 suites / 105 tests, `tsc` 0). Remaining **device-only** items (cannot be host-faked):
-1. **L6** guest/decoy interactive smoke — drive the guest vault on-device, confirm the real vault is
-   inaccessible and the guest content renders from ciphertext.
-2. **L7** re-signed-APK check — install a tampered/re-signed build, confirm `verifyPinnedSignature`
-   returns `invalid` (needs `FILEVAULT_SIGNING_CERT_SHA256` pinned in a release build).
-3. **L4** on a device with no secure hardware — confirm `generateKey` now reports `SOFTWARE`, not a
-   false `isHardwareBacked` (the fix is host-unverifiable; native not compiled here).
-4. **L1** `dumpsys` confirmation that `FLAG_SECURE` is set on the live window.
-Native crypto JNI (L3/L4 KATs) was previously green on the SM-S906B (`tests=15, failures=0`). The
-device is **not currently attached** (both adb servers report no devices). Reported, not faked.
+### 15.6 On-device verification (SM-S906B, Android 16, StrongBox + TEE)
+
+A pinned **release** build (`FILEVAULT_SIGNING_CERT_SHA256` baked in) was built and installed on the
+SM-S906B; verdicts read from `logcat`. Results:
+
+| Pass | Result (logcat) | Verdict |
+|------|-----------------|---------|
+| **L1** `FLAG_SECURE` | `dumpsys window` main window `fl=81812100`; `0x81812100 & 0x2000 (FLAG_SECURE) = 0x2000` | **SET** on the live MainActivity window |
+| **L4** real level | `[L4] Keystore security level: STRONGBOX (hardwareBacked=true)`; fixed `generateKey.attestation securityLevel=STRONGBOX` | **real KeyInfo**, not hardcoded |
+| **L7** valid | correctly release-signed install → `verifyPinnedSignature configured=true isValid=true actual=9D:67:…:FD` (== pin) | **valid** |
+| **L7** invalid | same APK **re-signed** with a throwaway key → `configured=true isValid=false actual=3B:97:…:3E` (≠ pin) | **fail-closed invalid** |
+
+**Device-found bugs (fixed; hidden by host mocks) — commit `f994baa`:**
+1. `DecoyVaultService.randomHex` requested up to 98304 bytes from `expo-crypto.getRandomBytesAsync`
+   in one call; it hard-caps at 1024 and throws → `createFakeFiles` crashed on device
+   (`getRandomBytesAsync(65536) expected … 0…1024`). The host mock did not enforce the cap.
+2. `bufferToHex` / `utf8ToBase64` / `utf8ToHex` built strings via `+=` per byte — **O(n²)** in Hermes,
+   which **hung** on tens-of-KB blobs (decoy file content). Now O(n); byte-identical output (full
+   crypto suite green). The `expo-crypto` mock now enforces the 1024 cap so neither regresses silently.
+
+**L6 status — host-proven; on-device file round-trip not completed via the test harness.** The guest
+**notes** encrypted and wrote successfully on-device. The full guest **file** round-trip could not be
+driven through a boot-time instrumentation hook: a 64 MB Argon2id (`crypto_pwhash`) invoked during app
+*init* intermittently stalls when crammed alongside startup crypto (the same KDF runs fine for normal
+unlock and in the on-device KATs, `tests=15, failures=0`), and RN `setTimeout` does not fire reliably
+post-init, so a deferred run was not possible either. This is a **test-harness/init-timing artifact,
+not a demonstrated product bug** — the L6 logic is proven by `__tests__/L6_DecoyEncryption` with the
+now-realistic capped mock, and the two device-found bugs above are fixed. **Recommended close-out:**
+verify the guest file flow through the real Settings UI (set the decoy PIN on an idle app), where the
+KDF runs without init contention.
+
+**L3** stays honestly **Partial** (§15.5) — not upgraded. **L4 SOFTWARE-fallback** branch remains
+device-unverifiable on this hardware (the S22 has StrongBox + TEE; it cannot produce a software-only
+key to exercise that path). **AAR checksum pin** deferred (below).
 
 **Deterministic closeout attempted — AAR checksum pin (FAILED, not faked).** Ran
 `gradlew --write-verification-metadata sha256` on the real Windows build host (JDK 21, network up).
