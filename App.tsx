@@ -220,7 +220,7 @@ export default function App() {
     setIsFirstLaunch(false);
     // Check whether panic PIN was used to activate decoy vault.
     try {
-      const decoyFlag = await SecureStore.getItemAsync('filevault_decoy_activated');
+      const decoyFlag = await SecureStore.getItemAsync('filevault_guest_active');
       setIsDecoy(decoyFlag === 'true');
     } catch {
       setIsDecoy(false);
@@ -235,7 +235,7 @@ export default function App() {
   const handleLogout = () => {
     CryptoService.clearAllCaches();
     // Clear decoy flag so next real login shows real data.
-    SecureStore.deleteItemAsync('filevault_decoy_activated').catch(() => {});
+    SecureStore.deleteItemAsync('filevault_guest_active').catch(() => {});
     setIsDecoy(false);
     setIsAuthenticated(false);
   };

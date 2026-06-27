@@ -37,13 +37,20 @@ export interface DecoyNote {
 }
 
 export class DecoyVaultService {
-  private static readonly DECOY_DIR = (FileSystem.documentDirectory || '') + 'decoy_vault/';
-  private static readonly DECOY_PIN_HASH = 'filevault_decoy_pin_hash';
-  private static readonly DECOY_PIN_SALT = 'filevault_decoy_pin_salt';
+  // L6: deniable naming. On-disk/SecureStore artifacts MUST NOT contain the literal
+  // string "decoy" — that single word lets a forensic string-grep flag exactly which
+  // credential set / directory is the fake one (and, by elimination, prove the real
+  // vault is the hidden one). Everything is framed as a benign "guest" profile, blending
+  // with the real vault's filevault_* / vault/ / notes/ / backups/ naming family. This
+  // defeats naive grep forensics; it does NOT hide the feature from an analyst who
+  // recognises the app (see §15 Layer 6 deniability ceiling).
+  private static readonly DECOY_DIR = (FileSystem.documentDirectory || '') + 'guest/';
+  private static readonly DECOY_PIN_HASH = 'filevault_guest_pin_hash';
+  private static readonly DECOY_PIN_SALT = 'filevault_guest_pin_salt';
   // S1: KDF marker. 'argon2id' = current; absent = legacy PBKDF2-10k (migrated on verify).
-  private static readonly DECOY_PIN_ALGO = 'filevault_decoy_pin_algo';
-  private static readonly DECOY_ENABLED_KEY = 'filevault_decoy_enabled';
-  private static readonly DECOY_CREATED_KEY = 'filevault_decoy_created';
+  private static readonly DECOY_PIN_ALGO = 'filevault_guest_pin_algo';
+  private static readonly DECOY_ENABLED_KEY = 'filevault_guest_enabled';
+  private static readonly DECOY_CREATED_KEY = 'filevault_guest_created';
 
   // S1: same Argon2id hardness class as the vault KEK / Panic PIN. p=1 matches native
   // libsodium crypto_pwhash (C1); 16-byte salt. Native preferred, @noble JS fallback.
@@ -63,9 +70,9 @@ export class DecoyVaultService {
       if (!dirInfo.exists) {
         await FileSystem.makeDirectoryAsync(this.DECOY_DIR, { intermediates: true });
       }
-      console.log('DecoyVault: Service initialized with AES-256');
+      console.log('GuestVault: Service initialized with AES-256');
     } catch (error) {
-      console.error('Error initializing DecoyVault:', error);
+      console.error('Error initializing GuestVault:', error);
     }
   }
 
@@ -76,9 +83,9 @@ export class DecoyVaultService {
     try {
       await this.initialize();
       await SecureStore.setItemAsync(this.DECOY_ENABLED_KEY, 'true');
-      console.log('DecoyVault: Decoy vault enabled');
+      console.log('GuestVault: guest vault enabled');
     } catch (error) {
-      console.error('Error enabling decoy vault:', error);
+      console.error('Error enabling guest vault:', error);
     }
   }
 
@@ -88,9 +95,9 @@ export class DecoyVaultService {
   static async disableDecoyVault(): Promise<void> {
     try {
       await SecureStore.deleteItemAsync(this.DECOY_ENABLED_KEY);
-      console.log('DecoyVault: Decoy vault disabled');
+      console.log('GuestVault: guest vault disabled');
     } catch (error) {
-      console.error('Error disabling decoy vault:', error);
+      console.error('Error disabling guest vault:', error);
     }
   }
 
@@ -131,9 +138,9 @@ export class DecoyVaultService {
       }
 
       await SecureStore.setItemAsync(this.DECOY_CREATED_KEY, Date.now().toString());
-      console.log('DecoyVault: Fake files created');
+      console.log('GuestVault: Fake files created');
     } catch (error) {
-      console.error('DecoyVault: Failed to create fake files:', error);
+      console.error('GuestVault: Failed to create fake files:', error);
     }
   }
 
@@ -163,9 +170,9 @@ export class DecoyVaultService {
         );
       }
 
-      console.log('DecoyVault: Fake notes created');
+      console.log('GuestVault: Fake notes created');
     } catch (error) {
-      console.error('DecoyVault: Failed to create fake notes:', error);
+      console.error('GuestVault: Failed to create fake notes:', error);
     }
   }
 
@@ -192,10 +199,10 @@ export class DecoyVaultService {
       await SecureStore.setItemAsync(this.DECOY_PIN_HASH, hash);
       await SecureStore.setItemAsync(this.DECOY_PIN_SALT, salt);
       await SecureStore.setItemAsync(this.DECOY_PIN_ALGO, 'argon2id');
-      console.log('DecoyVault: Decoy PIN set (Argon2id)');
+      console.log('GuestVault: guest PIN set (Argon2id)');
     } catch (error) {
-      console.error('Error setting decoy pin:', error);
-      throw error instanceof Error ? error : new Error('Konnte Decoy PIN nicht setzen');
+      console.error('Error setting guest pin:', error);
+      throw error instanceof Error ? error : new Error('Konnte PIN nicht setzen');
     }
   }
 
@@ -231,7 +238,7 @@ export class DecoyVaultService {
       }
       return match;
     } catch (error) {
-      console.error('DecoyVault: PIN verification error:', error);
+      console.error('GuestVault: PIN verification error:', error);
       return false;
     }
   }
@@ -342,7 +349,7 @@ export class DecoyVaultService {
    */
   static async destroyDecoyVault(): Promise<void> {
     try {
-      console.log('DecoyVault: Destroying vault...');
+      console.log('GuestVault: Destroying vault...');
 
       // Lösche alle Dateien
       const files = await FileSystem.readDirectoryAsync(this.DECOY_DIR);
@@ -356,9 +363,9 @@ export class DecoyVaultService {
       await SecureStore.deleteItemAsync(this.DECOY_PIN_SALT);
       await SecureStore.deleteItemAsync(this.DECOY_PIN_ALGO);
 
-      console.log('DecoyVault: Vault destroyed');
+      console.log('GuestVault: Vault destroyed');
     } catch (error) {
-      console.error('DecoyVault: Destroy failed:', error);
+      console.error('GuestVault: Destroy failed:', error);
     }
   }
 
@@ -370,9 +377,9 @@ export class DecoyVaultService {
       await this.destroyDecoyVault();
       await this.createFakeFiles();
       await this.createFakeNotes();
-      console.log('DecoyVault: Vault reset complete');
+      console.log('GuestVault: Vault reset complete');
     } catch (error) {
-      console.error('DecoyVault: Reset failed:', error);
+      console.error('GuestVault: Reset failed:', error);
     }
   }
 

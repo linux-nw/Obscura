@@ -199,7 +199,7 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
         setFailedAttempts(0);
         await SecureStore.deleteItemAsync(ATTEMPTS_KEY);
         try {
-          await SecureStore.setItemAsync('filevault_decoy_activated', 'true');
+          await SecureStore.setItemAsync('filevault_guest_active', 'true');
         } catch {
           showError('Fehler beim Aktivieren des Täusch-Tresors');
           setPass('');
