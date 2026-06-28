@@ -196,24 +196,6 @@ export class PanicService {
   }
 
   /**
-   * Aktiviert den Decoy Vault
-   */
-  private static async activateDecoyVault(): Promise<void> {
-    try {
-      console.log('Panic: Activating decoy vault...');
-
-      // Decoy Vault Ordner erstellen
-      // In Produktion: separate Vault mit fake Daten
-      // Dekrypted: falsche Dateien, falsche Notizen
-
-      await SecureStore.setItemAsync('filevault_decoy_activated', 'true');
-      console.log('Panic: Decoy vault activated');
-    } catch (error) {
-      console.error('Panic: Decoy vault activation failed:', error);
-    }
-  }
-
-  /**
    * Löscht alle Daten
    */
   private static async wipeAllData(): Promise<void> {

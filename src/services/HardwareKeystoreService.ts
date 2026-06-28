@@ -21,6 +21,7 @@
  */
 
 import * as SecureStore from 'expo-secure-store';
+import { NativeModules } from 'react-native';
 
 function baseOptions(requireAuthentication: boolean): SecureStore.SecureStoreOptions {
   return {
@@ -78,6 +79,45 @@ export class HardwareBackedStorage {
       return { likelyHardwareBacked: false, enrolled: false, reason: 'no biometric/secure hardware detected' };
     } catch {
       return { likelyHardwareBacked: false, enrolled: false, reason: 'capability probe failed' };
+    }
+  }
+
+  /**
+   * Layer 4 — REAL per-key security level via the native HardwareKeystore module
+   * (KeyInfo.securityLevel). Generates a throwaway probe key, reads its level, deletes it.
+   * Returns 'STRONGBOX' | 'TRUSTED_ENVIRONMENT' | 'SOFTWARE' | 'HARDWARE' | 'UNKNOWN' |
+   * 'UNAVAILABLE'. This is a definitive per-key check, unlike the biometric heuristic above.
+   */
+  static async assessKeystoreSecurityLevel(): Promise<{ securityLevel: string; isHardwareBacked: boolean }> {
+    try {
+      const HK = (NativeModules as any).HardwareKeystore;
+      if (!HK?.generateKey) return { securityLevel: 'UNAVAILABLE', isHardwareBacked: false };
+      const probeId = `attest_probe_${Date.now()}`;
+      const gen = await HK.generateKey(probeId, { useStrongBox: true });
+      if (!gen?.success) return { securityLevel: 'UNAVAILABLE', isHardwareBacked: false };
+      const att = await HK.getAttestation(probeId);
+      await HK.deleteKey(probeId).catch(() => {});
+      const a = att?.attestation ?? {};
+      return { securityLevel: a.securityLevel ?? 'UNKNOWN', isHardwareBacked: !!a.isHardwareBacked };
+    } catch {
+      return { securityLevel: 'UNAVAILABLE', isHardwareBacked: false };
+    }
+  }
+
+  /**
+   * Layer 4 — export the Key Attestation certificate chain (Base64 DER) for a fresh
+   * challenge, for off-device / server-side root-of-trust verification (Verified Boot
+   * state + deviceLocked live in the leaf cert's attestation extension). `challengeB64`
+   * should be a server- or app-generated random nonce.
+   */
+  static async getAttestationChain(challengeB64: string): Promise<{ chainLength: number; certChainB64: string[] }> {
+    try {
+      const HK = (NativeModules as any).HardwareKeystore;
+      if (!HK?.getAttestationCertChain) return { chainLength: 0, certChainB64: [] };
+      const res = await HK.getAttestationCertChain(challengeB64);
+      return { chainLength: res?.chainLength ?? 0, certChainB64: res?.certChainB64 ?? [] };
+    } catch {
+      return { chainLength: 0, certChainB64: [] };
     }
   }
 }

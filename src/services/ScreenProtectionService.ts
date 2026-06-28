@@ -1,21 +1,35 @@
 /**
- * Screen Protection Service
- * Screenshot und Overlay Blocking für iOS und Android
+ * Screen Protection Service (Endpoint hardening — Layer 1)
  *
- * Sicherheitsmerkmale:
- * - Screen capture blocking
- * - Screenshot detection
- * - Overlay window detection
- * - Screen recording detection
+ * Honest status:
+ * - The real protection is FLAG_SECURE, applied two ways:
+ *   1. ALWAYS-ON baseline, set natively in MainActivity.onCreate (timing-independent;
+ *      covers the Recents/app-switcher snapshot the OS grabs around pause). This is the
+ *      guarantee — it cannot be turned off from JS.
+ *   2. This service additionally calls the native `ScreenSecurity` module
+ *      (window.addFlags(FLAG_SECURE)) at startup as defense-in-depth and to expose a
+ *      runtime toggle / status query.
+ * - FLAG_SECURE blocks screenshots, screen recording (MediaProjection sees black), and
+ *   the Recents thumbnail. It does NOT defend against a physical photo of the screen or a
+ *   root-level framebuffer read — see the residual-risk note in CRYPTO_PROTOCOL_SPEC.md §15.
+ *
+ * NOTE: Android userspace cannot reliably *detect* that a screenshot/recording happened
+ * (no public, non-racy API). We therefore PREVENT capture (FLAG_SECURE) instead of
+ * pretending to detect it. The detection methods below are explicitly unsupported and say
+ * so, rather than returning a fake "all clear".
  */
 
-import { Platform } from 'react-native';
+import { Platform, NativeModules } from 'react-native';
 import * as SecureStore from 'expo-secure-store';
-// NOT_IMPLEMENTED: expo-screen-capture (FLAG_SECURE) needs a Gradle build with
-// network access to resolve `io.github.lukmccall.pika:pika-api`.
-// Add `expo-screen-capture` to package.json and run `npx expo prebuild`
-// when network/certificate issues are resolved. Then replace the stubs below
-// with `ScreenCapture.preventScreenCaptureAsync()` / `allowScreenCaptureAsync()`.
+
+interface ScreenSecurityNative {
+  enable(): Promise<boolean>;
+  disable(): Promise<boolean>;
+  isEnabled(): Promise<boolean>;
+}
+
+const ScreenSecurity: ScreenSecurityNative | undefined =
+  (NativeModules as any).ScreenSecurity;
 
 export enum SecurityFlag {
   SCREENSHOT = 'SecureScreenshot',
@@ -28,166 +42,70 @@ export class ScreenProtectionService {
   private static isProtectionEnabled: boolean = false;
 
   /**
-   * Aktiviert die Screenshott Protection
+   * Enables FLAG_SECURE via the native ScreenSecurity module. This is additive to the
+   * always-on baseline set in MainActivity — calling it is idempotent and safe.
    */
   static async enableScreenCaptureBlocking(): Promise<void> {
     try {
-      if (this.isProtectionEnabled) {
+      if (Platform.OS !== 'android') return;
+      if (!ScreenSecurity) {
+        // Native module missing (e.g. Expo Go). The MainActivity baseline does not apply
+        // there either, so be loud rather than silently claim protection.
+        console.warn(
+          '[ScreenProtection] native ScreenSecurity module unavailable — FLAG_SECURE not ' +
+          'enforced in this runtime (expected only in Expo Go / a dev client without the module).'
+        );
         return;
       }
-
-      await this.nativeEnableScreenCapture();
-
-      // Event Listener für Screenshot Detection
-      this.setupScreenshotListener();
-
+      await ScreenSecurity.enable();
       this.isProtectionEnabled = true;
-      console.log('ScreenProtection: Protection enabled');
-
-      // Speichere Einstellung
       await this.saveSettings(true);
     } catch (error) {
-      console.error('Error enabling screen protection:', error);
+      console.error('[ScreenProtection] enable failed:', error);
     }
   }
 
   /**
-   * Deaktiviert die Screenshott Protection
+   * Clears FLAG_SECURE on the current activity. The MainActivity baseline is re-applied on
+   * the next Activity (re)creation, so this only affects the current foreground window.
    */
   static async disableScreenCaptureBlocking(): Promise<void> {
     try {
-      await this.nativeDisableScreenCapture();
+      if (Platform.OS !== 'android' || !ScreenSecurity) return;
+      await ScreenSecurity.disable();
       this.isProtectionEnabled = false;
-      console.log('ScreenProtection: Protection disabled');
       await this.saveSettings(false);
     } catch (error) {
-      console.error('Error disabling screen protection:', error);
+      console.error('[ScreenProtection] disable failed:', error);
     }
   }
 
   /**
-   * Prüft ob Protection aktiv ist
+   * True when FLAG_SECURE is currently set on the foreground window (queried from native).
    */
-  static async isScreenCaptureDisabled(): Promise<boolean> {
+  static async isScreenCaptureBlocked(): Promise<boolean> {
     try {
-      const settings = await this.loadSettings();
-      return settings?.enabled || false;
+      if (Platform.OS !== 'android' || !ScreenSecurity) return false;
+      return await ScreenSecurity.isEnabled();
     } catch {
       return false;
     }
   }
 
-  // ─────────────────────────────── Native Module Methods ───────────────────────────────
+  // ─────────────────────────────── Unsupported detection (honest) ───────────────────────────────
+  // Android does not expose a reliable, non-racy userspace API to detect that a screenshot
+  // or screen recording occurred. We do not fake it. FLAG_SECURE prevents the capture
+  // instead. These remain only so callers that referenced them keep compiling; they tell
+  // the truth (false = "not detectable here", not "confirmed safe").
 
-  private static async nativeEnableScreenCapture(): Promise<void> {
-    // NOT_IMPLEMENTED: replace with ScreenCapture.preventScreenCaptureAsync()
-    // once expo-screen-capture is added to the build (see comment at top).
-  }
-
-  private static async nativeDisableScreenCapture(): Promise<void> {
-    // NOT_IMPLEMENTED: replace with ScreenCapture.allowScreenCaptureAsync()
-  }
-
-  // ─────────────────────────────── Event Handling ───────────────────────────────
-
-  private static setupScreenshotListener(): void {
-    // In native Module: Screenshot event listening
-    if (Platform.OS === 'ios') {
-      // iOS: Prüfung via applicationWillResignActive + check screenshot
-      console.log('ScreenProtection: iOS screenshot listener set up');
-    } else if (Platform.OS === 'android') {
-      // Android: Prüfung via FileObserver
-      console.log('ScreenProtection: Android screenshot listener set up');
-    }
-  }
-
-  /**
-   * Prüft auf Overlay/Draw Over Apps
-   */
-  static async checkOverlayProtection(): Promise<boolean> {
-    try {
-      if (Platform.OS === 'android') {
-        // Prüft ob Overlay permission gegeben ist
-        // Native: Settings.Secure.canDrawOverlays(context)
-        console.log('ScreenProtection: Android overlay check');
-        // In Produktion: echte Prüfung via native module
-        return false;
-      } else if (Platform.OS === 'ios') {
-        // iOS: Prüft auf overdraw via view hierarchy
-        console.log('ScreenProtection: iOS overlay check');
-        return false;
-      }
-      return false;
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * Prüft auf Screen Recording
-   */
-  static async checkScreenRecording(): Promise<boolean> {
-    try {
-      if (Platform.OS === 'ios') {
-        // iOS: Prüft auf screen recording via UIDevice
-        console.log('ScreenProtection: iOS screen recording check');
-        return false;
-      } else if (Platform.OS === 'android') {
-        // Android: Prüft MediaProjectionManager
-        console.log('ScreenProtection: Android screen recording check');
-        return false;
-      }
-      return false;
-    } catch {
-      return false;
-    }
-  }
-
-  // ─────────────────────────────── Screenshot Detection ───────────────────────────────
-
-  /**
-   * Prüft ob ein Screenshot gemacht wurde
-   * (Nur für Debug/Logging - echter Schutz ist im native Module)
-   */
+  /** Not supported on Android userspace; FLAG_SECURE prevents capture instead. */
   static async detectScreenshot(): Promise<boolean> {
-    try {
-      // In Produktion mit native Module:
-      // iOS: Prüfung auf neuen Screenshot im Photo Library
-      // Android: Prüfung auf neue Files im Pictures directory
-      console.log('ScreenProtection: Screenshot detection triggered');
-      return false;
-    } catch {
-      return false;
-    }
+    return false;
   }
 
-  /**
-   * Event Handler für Screenshot
-   */
-  static async onScreenshotTaken(): Promise<void> {
-    try {
-      console.warn('SECURITY: Screenshot detected!');
-      // In Produktion:
-      // - Warnung anzeigen
-      // - Screenshot speichern (für Beweissicherung)
-      // - Event an Backend senden
-    } catch (error) {
-      console.error('Error handling screenshot:', error);
-    }
-  }
-
-  /**
-   * Event Handler für Overlay Detection
-   */
-  static async onOverlayDetected(): Promise<void> {
-    try {
-      console.warn('SECURITY: Overlay detected!');
-      // In Produktion:
-      // - Sofortige Sperrung
-      // - Wipe Data
-    } catch (error) {
-      console.error('Error handling overlay:', error);
-    }
+  /** Not supported on Android userspace; FLAG_SECURE makes a recording see black. */
+  static async checkScreenRecording(): Promise<boolean> {
+    return false;
   }
 
   // ─────────────────────────────── Settings ───────────────────────────────
@@ -199,58 +117,23 @@ export class ScreenProtectionService {
         JSON.stringify({ enabled, timestamp: Date.now() }),
       );
     } catch (error) {
-      console.error('Error saving settings:', error);
+      console.error('[ScreenProtection] save settings failed:', error);
     }
   }
 
-  private static async loadSettings(): Promise<{ enabled: boolean; timestamp: number } | null> {
-    try {
-      const value = await SecureStore.getItemAsync(this.SETTINGS_KEY);
-      if (!value) return null;
-      return JSON.parse(value);
-    } catch {
-      return null;
-    }
-  }
-
-  // ─────────────────────────────── Helper Methods ───────────────────────────────
-
   /**
-   * Setzt den Root View auf Secure
-   */
-  static setRootViewSecure(viewId: string): void {
-    console.log(`ScreenProtection: Setting view ${viewId} as secure`);
-    // In native: view.setSecure(true)
-  }
-
-  /**
-   * Prüft die Gesamtsicherheit des Screenshotschutzes
+   * Reports the real, native-queried protection status (no fabricated fields).
    */
   static async checkProtectionStatus(): Promise<{
-    screenshotBlocking: boolean;
-    overlayDetection: boolean;
-    screenRecording: boolean;
+    flagSecureActive: boolean;
+    nativeModuleAvailable: boolean;
     lastCheck: number;
   }> {
-    try {
-      const settings = await this.loadSettings();
-      const overlayCheck = await this.checkOverlayProtection();
-      const recordingCheck = await this.checkScreenRecording();
-
-      return {
-        screenshotBlocking: settings?.enabled || false,
-        overlayDetection: !overlayCheck,
-        screenRecording: !recordingCheck,
-        lastCheck: Date.now(),
-      };
-    } catch {
-      return {
-        screenshotBlocking: false,
-        overlayDetection: true,
-        screenRecording: true,
-        lastCheck: Date.now(),
-      };
-    }
+    return {
+      flagSecureActive: await this.isScreenCaptureBlocked(),
+      nativeModuleAvailable: !!ScreenSecurity,
+      lastCheck: Date.now(),
+    };
   }
 }
 

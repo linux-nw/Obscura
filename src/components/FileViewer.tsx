@@ -4,6 +4,7 @@ import {
   ActivityIndicator, TouchableOpacity, Dimensions,
 } from 'react-native';
 import { FileManager, FileMetadata } from '../services/FileManager';
+import { DecoyVaultService } from '../services/DecoyVaultService';
 import Icon from './Icon';
 import { c, rs, font, radius } from '../theme';
 
@@ -91,10 +92,17 @@ function AVPlayer({ uri, audio }: { uri: string; audio: boolean }) {
 
 interface Props {
   file: FileMetadata | null;
+  isDecoy?: boolean;
   onClose: () => void;
 }
 
-export default function FileViewer({ file, onClose }: Props) {
+export default function FileViewer({ file, isDecoy = false, onClose }: Props) {
+  // L6: in the guest vault, read content through DecoyVaultService (guest key) instead of
+  // FileManager's master-key path. Temp-file deletion is cacheDir-based and identical.
+  const readContent = (id: string) =>
+    isDecoy ? DecoyVaultService.getFakeFileContent(id) : FileManager.getFileContent(id);
+  const exportTemp = (id: string) =>
+    isDecoy ? DecoyVaultService.exportFakeToTempFile(id) : FileManager.exportToTempFile(id);
   const [loading, setLoading]   = useState(false);
   const [error, setError]       = useState<string | null>(null);
   const [imageUri, setImageUri] = useState<string | null>(null);
@@ -121,11 +129,11 @@ export default function FileViewer({ file, onClose }: Props) {
       setLoading(true);
       try {
         if (kind === 'image') {
-          const b64 = await FileManager.getFileContent(file.id);
+          const b64 = await readContent(file.id);
           if (cancelled) return;
           setImageUri(`data:${imageMime(ext)};base64,${b64}`);
         } else if (kind === 'text') {
-          const b64 = await FileManager.getFileContent(file.id);
+          const b64 = await readContent(file.id);
           if (cancelled) return;
           // base64 → bytes-Länge ~ 3/4 der b64-Länge
           const approxBytes = Math.floor((b64.length * 3) / 4);
@@ -138,7 +146,7 @@ export default function FileViewer({ file, onClose }: Props) {
           }
         } else {
           // av / external → Klartext-Tempdatei erzeugen
-          const uri = await FileManager.exportToTempFile(file.id);
+          const uri = await exportTemp(file.id);
           if (cancelled) { await FileManager.deleteTempFile(uri); return; }
           setTempUri(uri);
         }

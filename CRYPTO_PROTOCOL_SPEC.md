@@ -563,7 +563,278 @@ as protection against future key leakage, not as a secure wipe of old data.
 
 ---
 
-## 15. Change Log — Audit Round 4
+## 15. Endpoint Threat Model (Endpoint-Hardening, Layers 1-7)
+
+§14 covers the **at-rest** crypto (untouched by this work). §15 covers the **endpoint** on a
+potentially compromised or seized device: where the key lives in RAM, what leaks through the
+screen and keyboard, how device integrity is attested, how data is destroyed, what happens
+under coercion, and supply-chain integrity. Each layer states what it **covers**, what it
+**deliberately does not**, and **against which attacker** it holds.
+
+**Structural out-of-scope (stated honestly):** an active kernel exploit on a rooted, *live*,
+*unlocked* device with attacker-held root. A userspace app cannot structurally win that — the
+attacker shares the process' address space and the unlocked keystore. Everything below raises
+cost against weaker, more realistic attackers; none of it defeats live attacker-root.
+
+### 15.1 Per-layer summary
+
+| Layer | Covers | Deliberately NOT | Primary attacker | Proof |
+|-------|--------|------------------|------------------|-------|
+| 1 UI leakage | `FLAG_SECURE` set natively in `MainActivity.onCreate` (pre-JS, always-on): blocks screenshot, screen-record, Recents thumbnail. Privacy overlay (VaultMark) when app backgrounded. | Reading the framebuffer with root; *detecting* a screenshot from userspace (impossible on Android — reported honestly as `false`). | Shoulder-surf, casual screenshot, Recents leak, non-root screen-record. | `dumpsys` shows `FLAG_SECURE`; manual on-device. |
+| 2 IME capture | All **credential** fields — unlock / decoy-PIN / panic-PIN (shared hardened field `AuthScreen.tsx:380`), app/panic/decoy set-PIN (shared `openSetPinModal`, `SettingsScreen.tsx:998,1027`), backup passphrase (`:1086`): `secureTextEntry`, `autoComplete=off`, `textContentType=none`, `importantForAutofill=no`, `spellCheck=false`. Self-audit fix: **typed note content** (`NoteEditor.tsx` title/category/body) now carries the same anti-capture flags (minus masking). Runtime warning if the active IME is not a system keyboard. | A malicious **system** IME or a root keylogger — you must type into *some* keyboard. | 3rd-party keyboard cloud-sync, autofill/clipboard/dictionary capture. | Native `getActiveInputMethod`; field props; `tsc`. |
+| 3 RAM key lifetime **(PARTIAL — see §15.5)** | Long-lived master-key cache held as a zeroable `Uint8Array` (`CryptoService.ts:1245`), actively `.fill(0)` on every reassignment and on lock (`:1251`). Native Kotlin zeroes its key + plaintext byte arrays immediately after each crypto op (`RNFileVaultModule.kt:58,106,116,167`). | **Raw key still transits the JS heap**: `getMasterKey()` → getter `:1248` materialises a fresh **immutable hex string** per call (unzeroable, GC-only). Native zeroing is Kotlin `ByteArray.fill(0)`, **not** `sodium_memzero`/`sodium_mlock` → pages swappable, GC-copy residue possible. True 0-JS-lifetime would need native-only key custody (opaque handle, AEAD in native) — a crypto-core rearchitecture, out of scope. | Post-lock heap-residue scrape. | `__tests__/L3_KeyZeroing`; native `androidTest`; §15.5. |
+| 4 Device integrity | Real `KeyInfo.securityLevel` (STRONGBOX / TRUSTED_ENVIRONMENT / SOFTWARE); `setUnlockedDeviceRequired(true)` gated on a secure lockscreen; key-attestation cert-chain export (challenge → root-of-trust `verifiedBootState`+`deviceLocked`). | Defeating a TEE/StrongBox bypass; providing hardware backing where the device has none (degrades to SOFTWARE, **warned**, not blocked). | Detect software-only keystore / tampered boot state (informational signal). | `HardwareKeystoreAttestTest.kt` on-device (2 tests). |
+| 5 Crypto-shredding | No per-file content keys exist → destroying the master key (wrapped key in SecureStore **and** the in-memory copy) makes **every** blob permanently undecryptable, regardless of flash residue. Plaintext view-temp cache swept (overwrite+delete). | Guaranteed *physical* erasure of flash blocks (NAND wear-leveling may retain old blocks); recovering a key the attacker already extracted while unlocked. | Post-wipe forensic recovery of vault content. | `__tests__/L5_CryptoShred`. |
+| 6 Duress / coercion | Panic PIN (Argon2id) → wipe or permanent-lock. Guest/decoy vault: own Argon2id PIN, neutral `guest/`+`filevault_guest_*` naming, content **XChaCha20-encrypted** with a guest-PIN-derived key (separate KDF salt, never stored) → on disk indistinguishable from the real vault. **Interactive read+write** wired to the guest key (fail-closed; never the master key), persistent across restarts, isolated from the real vault. | True plausible deniability — see §15.2. The hidden-vault *existence* stays provable. | Casual coercion + low-tier / string-grep forensics. | `__tests__/L6_DecoyEncryption` + `L6_DecoyWrite`; on-device §15.6; §15.2. |
+| 7 Supply-chain / APK integrity | Native `verifyPinnedSignature()` compares the running APK's signing-cert SHA-256 against a **build-time-pinned** `BuildConfig.SIGNING_CERT_SHA256` (constant-time, **fail-closed**); JS `IntegrityService.checkSignature` maps it to `valid`/`invalid`/`unverifiable` and fails the aggregate only on a true `invalid`. Shipped Hermes bundle isolated from the toolchain advisories (all critical/high are dev/test-only). npm lockfile carries 871 SRI hashes (`npm ci`-enforced); react/hermes AARs pinned by `.sha1`. | Defeating an attacker who **patches out the self-check** before re-signing (any on-device check is bypassable — this is not attestation); server-verified Play Integrity (app is offline, no server); checksum-pinning the Maven-Central `lazysodium`/`jna` AARs (no Gradle `verification-metadata.xml` yet — §15.3). | Naive repackaging / re-signing; side-load from an untrusted source; a tampered/cloned APK. | `__tests__/L7_SignatureVerification` (9 tests); `IntegrityModule.kt` review; §15.3. |
+
+### 15.2 Layer 6 deniability boundary — precise, against which attacker it holds
+
+Layer 6 **raises the bar** against casual coercion and low-tier forensics. It is **NOT full
+deniability.** Stated precisely:
+
+**What it HOLDS against:**
+- **Casual coercion ("unlock it now").** Entering the guest PIN clears the real master key from
+  RAM (the parallel `unlock()` that loaded it is wiped) and shows the guest session; the real
+  vault is inaccessible. An attacker who does not image the device sees a plausible guest vault.
+- **Naive forensic string-grep.** After the rename, a disk image / SecureStore dump contains no
+  literal "decoy"; guest artifacts blend with the real `filevault_*` / `vault/` / `notes/`
+  family. The per-artifact "this one is the fake" label is gone.
+- **Low-tier "which file is obviously the fake" forensics.** Pre-L6 the decoy was *plaintext*
+  while the real vault was ciphertext — an instant differential that, by elimination, fingered
+  the real vault. Now both are opaque XChaCha20 ciphertext; on-disk content no longer
+  self-identifies as fake.
+
+**What it does NOT do (does NOT hold against):**
+1. **An analyst who recognises the app.** The UI openly ships a "Täusch-Tresor"/guest feature;
+   anyone who identifies the binary *knows* a guest+real vault can coexist and will demand the
+   second credential. Renaming hides *which* artifact is which, never the *feature*.
+2. **Hidden-vault existence denial.** Two independent credential sets (real + guest
+   `filevault_*_pin_hash`) and two populated encrypted directories (`vault/` + `guest/`) are
+   both present and visible. Their coexistence *proves* a second vault exists. This is the
+   structural ceiling: unlike a VeraCrypt hidden volume (one container whose slack space may or
+   may not hold a hidden volume), Android app storage exposes discrete files/keys — a coexisting
+   encrypted real vault is provably there. VeraCrypt-style hidden-volume deniability is **not
+   achievable** on this storage model.
+3. **Storage-size / backup / FS-metadata differential.** `guest/` and `vault/` differ in size,
+   file count and mtimes. The guest content is written **once** at PIN-set and never touched, so
+   its mtimes are frozen while the real vault's churn — a behavioural tell that survives into
+   any cloud/OS backup or repeated `ls -la` snapshot.
+4. **Interactive coercion.** *Resolved* (device-verified, §15.6). The in-app guest view is now
+   wired to `getFakeNotes`/`getFakeFiles` for reads **and** to `DecoyVaultService.saveNote`/
+   `saveFile`/`deleteNote`/`deleteFile` for writes — every write sealed with the guest key into
+   `guest/`, fail-closed without it, never the master-key path. A coercer who makes the user open
+   the guest vault sees a populated, usable vault (browse, add, open, delete) that persists across
+   restarts, not an empty/read-only shell. Cross-vault isolation and the absence of any shared
+   counter/id are pinned by `__tests__/L6_DecoyWrite`. Remaining caveat: a guest who uses only the
+   decoy PIN bumps the crypto lock-counter A on each login and self-locks after 5 (§15.6 follow-up).
+5. **Image-then-coerce.** A forensically-aware coercer clones the device **before** demanding a
+   PIN, pre-empting the panic-PIN wipe and capturing *both* vaults. Panic helps against an
+   unsophisticated coercer, not one who images first.
+6. **Bundle/symbol residue.** The JS class identifier (`DecoyVaultService`) and German UI labels
+   ("Täusch-PIN") persist in the Hermes bundle; grepping the APK still reveals the feature.
+   Closing this needs a source rename + UI relabel — deferred (low marginal value while the
+   feature is visibly in the UI).
+
+**Attacker matrix (Layer 6):**
+
+| Coercion scenario | Result |
+|-------------------|--------|
+| Casual "open it", no device imaging | **HOLDS** — guest shown, real key cleared from RAM |
+| Forensic string-grep for "decoy" | **HOLDS** — neutral `guest` naming |
+| "Which file is the obvious fake?" | **HOLDS** — both vaults opaque ciphertext |
+| Analyst knows the app, demands 2nd PIN | **FAILS** — feature known; 2nd credential set visible |
+| Image-then-coerce (clone before PIN) | **FAILS** — panic pre-empted; both vaults captured |
+| Make-user-open-decoy interactively | **HOLDS** — guest view reads+writes, persists, isolated (§15.6); was empty pre-fix |
+| Storage-size / mtime / backup correlation | **FAILS** — `guest/` vs `vault/` distinguishable, frozen mtimes |
+
+**One-line honest summary:** Layer 6 defeats casual coercion and naive/low-tier forensics; it is
+**not** full plausible deniability — storage size, backups and filesystem metadata continue to
+leak the existence, and likely the identity, of the real vault.
+
+### 15.3 Layer 7 boundary — APK integrity and supply-chain, against which attacker it holds
+
+Layer 7 has two halves with very different ceilings.
+
+**APK signature self-check.** The native `verifyPinnedSignature()` reads the running package's
+signing-cert SHA-256 from `PackageManager` and compares it, constant-time, to
+`BuildConfig.SIGNING_CERT_SHA256` — a value compiled into the APK at build time from the
+`FILEVAULT_SIGNING_CERT_SHA256` gradle property (never committed; derived from the release
+keystore with `keytool`).
+
+**What it HOLDS against:**
+- **Naive repackaging / re-signing.** An attacker who decompiles, modifies and re-signs the APK
+  with their own key changes the signing cert; the runtime cert no longer matches the pinned
+  hash → verdict `invalid` → the integrity check fails. Trojanised clones produced by automated
+  tooling that did not strip the check are caught.
+- **Side-load provenance (advisory).** `checkInstallerIntegrity()` flags installs from an
+  untrusted source vs a known store. Informational, not enforced.
+
+**What it does NOT do (does NOT hold against):**
+1. **An attacker who patches out the check.** The verification runs *inside* the code the attacker
+   is repackaging. A competent adversary NOPs the call (or forces the `valid` branch) before
+   re-signing. R8/minify only raises the cost of locating it. **No on-device self-check is a
+   trust anchor** — only server-verified attestation (Play Integrity) is, and this app is offline
+   with no server, so that is **deliberately out of scope**.
+2. **Fail-open on absence.** By design `unverifiable` (native module missing, or an unpinned debug
+   build) does **not** fail the check — a false positive must never lock out a legitimate user.
+   So the check adds assurance only in a properly pinned release build; it is silent elsewhere.
+3. **Response.** The verdict is surfaced (warning), not wired to an automatic wipe. JS-evaluated
+   anti-tamper auto-destruction is intentionally avoided (false-positive bricking risk; consistent
+   with `DeviceSecurityService`'s no-JS-heuristics rule). Enforcement is an opt-in pending
+   on-device tuning.
+
+**Supply-chain.**
+- **npm.** `package-lock.json` carries 871 Subresource-Integrity (`sha512`) hashes; `npm ci`
+  refuses to install anything whose tarball hash drifts. `npm audit` reports 39 advisories
+  (1 critical, 3 high). **All critical/high are build/dev/test-only** and are **not** linked into
+  the shipped Hermes bundle: `shell-quote` (critical) ← `react-devtools-core`; `form-data` (high)
+  ← `jsdom` ← `jest-expo` (test); `undici`/`ws` (high) ← `@expo/cli` + `metro` (dev server /
+  bundler). The release bundle is the app's own JS plus the runtime deps it actually imports.
+- **Native AARs.** `react-android` / `hermes-android` are vendored in `android/local-maven` with
+  `.sha1`/`.md5`. The Maven-Central `com.goterl:lazysodium-android:5.1.0` and
+  `net.java.dev.jna:jna:5.17.0` (the crypto-bearing libs) are pulled by coordinate **without** a
+  Gradle `verification-metadata.xml` checksum gate — a named residual. Closing it:
+  `./gradlew --write-verification-metadata sha256` against a clean cache, then commit the
+  generated metadata. Not generated here: real checksums require a clean Gradle resolve in a build
+  environment, and fabricating them would be worse than declaring the gap.
+
+**Structural residual (both halves):** an attacker who controls the **build host** wins
+regardless — they can mint a matching signature pin and tamper the bundle before it is signed.
+Supply-chain integrity ultimately rests on the build machine and signing key being trusted; the
+on-device checks defend only the *distribution* path after a clean build.
+
+**Attacker matrix (Layer 7):**
+
+| Scenario | Result |
+|----------|--------|
+| Repackaged + re-signed APK, check left intact | **HOLDS** — cert mismatch → `invalid` |
+| Side-load from untrusted installer | **DETECTED** (advisory) |
+| Attacker patches out the self-check, then re-signs | **FAILS** — on-device check is not a trust anchor |
+| Tampered dev-server / bundler dependency at build time | **FAILS** — build host is the trust root |
+| Drifted npm tarball | **HOLDS** — `npm ci` SRI mismatch |
+| Swapped `lazysodium`/`jna` AAR from Maven Central | **WEAK** — no checksum pin yet (verification-metadata pending) |
+
+**One-line honest summary:** Layer 7 raises the bar against naive repackaging and catches npm
+tarball drift, but an on-device signature check is not attestation and a compromised build host
+defeats the whole chain — the un-pinned native AARs and the absent server-side attestation are the
+named residuals.
+
+### 15.4 Aggregate status (Layers 1-7)
+
+| Layer | Status | Proof artifact | Principal residual risk |
+|-------|--------|----------------|-------------------------|
+| 1 UI leakage & `FLAG_SECURE` | Done (enforcing line confirmed) | `MainActivity.kt:28` native unconditional; no runtime disabler; `dumpsys` host-unverifiable | Framebuffer read with root |
+| 2 IME / keyboard | Done (all credential fields + note content) | enforcing field props (`AuthScreen:380`, `SettingsScreen:998/1027/1086`, `NoteEditor`); `tsc` | Malicious **system** IME / root keylogger |
+| 3 Master key out of JS heap | **Partial** | `__tests__/L3_KeyZeroing`; native `androidTest`; §15.5 | raw key transits JS heap as immutable hex string per op; native zero is `fill(0)` not `mlock`/`memzero` |
+| 4 Device integrity / attestation | Done (verdict from real KeyInfo; hardcoded-`true` wart fixed) | `HardwareKeystoreService.ts:98`→`securityLevelOf`; `HardwareKeystoreAttestTest.kt` (on-device) | No hardware backing → SOFTWARE (warned) |
+| 5 Crypto-shredding | Done (test-pinned) | `__tests__/L5_CryptoShred` (post-shred decrypt `rejects.toThrow`); `F2_CacheCleanup`; FileViewer per-close temp delete | NAND wear-levelling physical residue |
+| 6 Duress / coercion | Done (**device-verified**: decoy read+write, persistence, isolation) | `__tests__/L6_DecoyEncryption` + `L6_DecoyWrite` (write/cross-vault/no-shared-counter); on-device §15.6; §15.2 | Hidden-vault *existence* stays provable; decoy login bumps lock-counter A (§15.6 follow-up) |
+| 7 Supply-chain / APK integrity | Done (**device-verified** valid + invalid) | `__tests__/L7_SignatureVerification` (9); on-device §15.6; §15.3 | Self-check bypassable; AARs un-pinned (verification-metadata gen failed, §15.3); no server attestation |
+
+**Self-audit (this round).** Each "Done" was re-checked against its *enforcing* line, assuming guilt.
+Findings: **L3 downgraded to Partial** (the raw key still materialises as an immutable JS hex string
+per crypto op — §15.5). **L2 gap fixed** (typed note content was IME-capturable; same anti-capture
+flags now applied). **L4 wart fixed** (`generateKey` hard-coded `isHardwareBacked=true`; now derived
+from real `KeyInfo` — the verdict path already read the honest value, so this closed a latent trap,
+not an active failure). L1/L5/L6 confirmed with cited enforcing lines + tests, no theater found.
+
+### 15.6 On-device verification (SM-S906B, Android 16, StrongBox + TEE)
+
+A pinned **release** build (`FILEVAULT_SIGNING_CERT_SHA256` baked in) was built and installed on the
+SM-S906B; verdicts read from `logcat`. Results:
+
+| Pass | Result (logcat) | Verdict |
+|------|-----------------|---------|
+| **L1** `FLAG_SECURE` | `dumpsys window` main window `fl=81812100`; `0x81812100 & 0x2000 (FLAG_SECURE) = 0x2000` | **SET** on the live MainActivity window |
+| **L4** real level | `[L4] Keystore security level: STRONGBOX (hardwareBacked=true)`; fixed `generateKey.attestation securityLevel=STRONGBOX` | **real KeyInfo**, not hardcoded |
+| **L7** valid | correctly release-signed install → `verifyPinnedSignature configured=true isValid=true actual=9D:67:…:FD` (== pin) | **valid** |
+| **L7** invalid | same APK **re-signed** with a throwaway key → `configured=true isValid=false actual=3B:97:…:3E` (≠ pin) | **fail-closed invalid** |
+
+**Device-found bugs (fixed; hidden by host mocks) — commit `f994baa`:**
+1. `DecoyVaultService.randomHex` requested up to 98304 bytes from `expo-crypto.getRandomBytesAsync`
+   in one call; it hard-caps at 1024 and throws → `createFakeFiles` crashed on device
+   (`getRandomBytesAsync(65536) expected … 0…1024`). The host mock did not enforce the cap.
+2. `bufferToHex` / `utf8ToBase64` / `utf8ToHex` built strings via `+=` per byte — **O(n²)** in Hermes,
+   which **hung** on tens-of-KB blobs (decoy file content). Now O(n); byte-identical output (full
+   crypto suite green). The `expo-crypto` mock now enforces the 1024 cap so neither regresses silently.
+
+**L6 decoy WRITE — device-found bug, fixed, and device-verified green (commit pending).** Driving the
+guest vault through the real UI surfaced a genuine bug (not the earlier init-timing artifact): every
+interactive **write** in the decoy view failed —
+`E/ReactNativeJS 'Error saving file:', [Error: Dateiverschlüsselung fehlgeschlagen]` and
+`'Error creating note:', [Error: Kann Metadaten nicht verschlüsseln]`. Root cause: the editor / file-
+import paths called `NotesService.createNote` / `FileManager.saveFile`, which encrypt with the **master
+key** — never derived in a decoy session (only the guest content key is). The decoy view had read
+shims but no write path, and the regression suite covered only reads. Fix: routed all guest writes
+through `DecoyVaultService.{saveNote,saveFile,getFakeFileContent,exportFakeToTempFile,deleteNote,
+deleteFile}` (sealed with the guest key into `guest/`, fail-closed without it, no `BlobVersionService`
+and no shared SecureStore counter), and wired `NotesScreen`/`NoteEditor`/`FilesView`/`FileViewer` to
+read+write the guest vault in decoy mode. Regression coverage added: `__tests__/L6_DecoyWrite` (5 tests)
+— write→reopen→read for note+file, cross-vault leakage both directions, and a metadata-isolation check
+(real note registers `filevault_blobver_<id>`, the guest note registers no such counter and its id
+appears in no SecureStore key). On-device verification (SM-S906B, pinned release, four passes):
+(1) decoy note + file save with **zero** save-errors in logcat; (2) both persist across full
+swipe-kill + reopen and re-open from ciphertext; (3) the real vault is unchanged; (4) no decoy entry
+is visible in the real vault. `tsc` 0, jest 25 suites / 110 tests.
+
+**L6 follow-up (deferred, not fixed this round).** A guest who uses only the decoy PIN bumps the crypto
+timed-lock counter A (`filevault_failed_attempts`) on every login: the parallel real-`unlock()` fails
+(decoy PIN ≠ real passphrase) and increments it (`CryptoService.ts:803-805`); it is reset only by a
+successful **real** unlock, so after 5 decoy logins the vault times-out for 300s. A legitimate guest
+self-locks. Fix (deferred): clear counter A in the decoy/panic branch of `checkLoginPass`, or suppress
+the increment when a decoy/panic match wins the parallel race. The wipe counter B is unaffected (it
+resets on any real/decoy success). The PanicService 3-attempt auto-wipe is dead code (no caller).
+
+**One honest logcat observation (pre-existing, unrelated to L6).** During the real-vault pass one
+`'Error loading file metadata:', [Error: Metadaten-Entschlüsselung fehlgeschlagen]` fired:
+`FileManager.getFiles` hit a single blob whose metadata would not decrypt and **skipped it gracefully**
+(per-file try/catch, `FileManager.ts:293`) — the rest of the vault loaded. This device's real vault has
+accumulated blobs across many cross-build reinstalls; the most likely cause is one stale blob written
+under a superseded master key. Not a save-error, not from the decoy path, did not block verification —
+flagged for a separate look on a clean install rather than buried.
+
+**L3** stays honestly **Partial** (§15.5) — not upgraded. **L4 SOFTWARE-fallback** branch remains
+device-unverifiable on this hardware (the S22 has StrongBox + TEE; it cannot produce a software-only
+key to exercise that path). **AAR checksum pin** deferred (below).
+
+**Deterministic closeout attempted — AAR checksum pin (FAILED, not faked).** Ran
+`gradlew --write-verification-metadata sha256` on the real Windows build host (JDK 21, network up).
+It failed: `java.lang.IllegalStateException: The root project is not yet available for build` in
+`WriteDependencyVerificationFile.resolveAllConfigurationsConcurrently` — Gradle's verification-metadata
+writer is incompatible with the RN/Expo `includeBuild` composite-build layout. No `verification-metadata.xml`
+was produced; fabricating one was rejected. Realistic alternative (deferred, infra not audit finding):
+vendor `lazysodium-android` + `jna` into `android/local-maven` with committed checksums, matching the
+existing react/hermes pinning pattern.
+
+### 15.5 Layer 3 — why it is Partial, not Done
+
+L3's claim is "master key out of the JS heap". Precisely measured, the **long-lived** copy is handled
+well but the **transient** copies are not, and the native zeroing is weaker than `libsodium`'s.
+
+- **Does raw key material exist in the JS heap?** Yes. (a) The canonical cache `__mkBytes` is a
+  `Uint8Array` that lives the whole unlocked session by design and is `fill(0)`-zeroed on lock
+  (`CryptoService.ts:1251`) — this is the *good* part, genuinely zeroable, not theater. (b) But the
+  string-typed accessor `get _masterKeyCache` (`:1248`) rebuilds a fresh 64-char **hex string** on
+  every read, and `getMasterKey()` (`:694`) returns it on every encrypt/decrypt. Strings are
+  immutable in Hermes — those copies cannot be wiped, only dropped for a GC that is not deterministic.
+- **Do `sodium_mlock` / `sodium_memzero` fire?** No. The native side uses Kotlin `ByteArray.fill(0)`
+  (`RNFileVaultModule.kt:58,106,116,167`), which is best-effort: no `mlock` (key pages may be swapped
+  to disk) and the JVM GC may have already copied the array (compaction) leaving residue. The comment
+  does not over-claim sodium here — but the protection is below what the layer name implies.
+- **Does auto-lock zero the native buffer?** There is no long-lived native key buffer to zero — the
+  native module is stateless per-op (key passed in, `fill(0)`'d after). Lock zeroes the JS `Uint8Array`.
+- **Quantified raw-key JS-heap lifetime:** ≈ the entire unlocked session for the `Uint8Array` (intended),
+  **plus** one immutable hex-string copy per crypto op lingering until the next GC. Not ~0.
+- **What 0-JS-lifetime would require:** keep the key only inside native (mlock'd libsodium buffer),
+  expose an opaque handle across the bridge, and perform all AEAD natively without ever returning the
+  hex key to JS. The current architecture returns the hex key to JS and orchestrates crypto there, so
+  the key structurally must enter the JS heap. Closing this is a crypto-core rearchitecture — out of
+  scope for endpoint hardening, and deliberately **not** attempted here.
+
+---
+
+## 16. Change Log — Audit Round 4
 
 | ID | Severity | Fix |
 |----|----------|-----|

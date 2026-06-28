@@ -58,6 +58,11 @@ export default function App() {
   const [isCryptoReady, setIsCryptoReady]     = useState(false);
   const [securityStatus, setSecurityStatus]   = useState<'secure' | 'warning' | 'critical'>('secure');
   const [isDecoy, setIsDecoy]                 = useState(false);
+  // Layer 1: privacy overlay shown whenever the app is not in the foreground, so any frame
+  // the OS or an onlooker could capture during a transition shows a blank brand screen
+  // instead of vault content. FLAG_SECURE (MainActivity) is the primary Recents-snapshot
+  // defense; this overlay is additional cover for the in-app transition frame.
+  const [obscured, setObscured]               = useState(false);
 
   const isAuthRef = useRef(false);
   isAuthRef.current = isAuthenticated;
@@ -67,10 +72,14 @@ export default function App() {
     // AutoLock-Callback: sperrt UI wenn Timer abläuft oder App in Background geht
     AutoLockService.setLockCallback(() => {
       CryptoService.clearAllCaches();
+      // Layer 5: drop any decrypted view-temp plaintext from the cache on lock.
+      FileManager.cleanupViewTemps().catch(() => {});
       setIsAuthenticated(false);
     });
 
     const appStateSubscription = AppState.addEventListener('change', (nextAppState: AppStateStatus) => {
+      // Show the privacy overlay for any non-foreground state (background / iOS inactive).
+      setObscured(nextAppState !== 'active');
       if (nextAppState === 'background') {
         // F2/Picker: skip the lock+clear when a system picker is open — that
         // backgrounding is an expected, controlled in-app action and the master
@@ -155,6 +164,30 @@ export default function App() {
         }
       } catch {}
 
+      // Layer 4: definitive per-key Keystore security level (KeyInfo via native module),
+      // preferred over the biometric heuristic above. Warn if keys are software-backed.
+      try {
+        const lvl = await HardwareBackedStorage.assessKeystoreSecurityLevel();
+        if (lvl.securityLevel === 'SOFTWARE') {
+          console.warn('[security][L4] Keystore keys are SOFTWARE-backed (no TEE/StrongBox). On a rooted/compromised device the key material is at materially higher risk.');
+        } else if (lvl.securityLevel !== 'UNAVAILABLE') {
+          console.log(`[security][L4] Keystore security level: ${lvl.securityLevel} (hardwareBacked=${lvl.isHardwareBacked}).`);
+        }
+      } catch {}
+
+      // Layer 2: warn (once) if a third-party (non-system) keyboard is active. A
+      // malicious IME can capture every keystroke incl. the passphrase. Best-effort
+      // signal only — a system IME could still be malicious on a compromised device.
+      try {
+        const ds = (NativeModules as any).DeviceSecurity;
+        if (ds?.getActiveInputMethod) {
+          const ime = await ds.getActiveInputMethod();
+          if (ime && ime.isSystem === false) {
+            console.warn(`[security][IME] Third-party keyboard active (${ime.packageName}). A malicious IME can read everything you type, including the passphrase. Prefer the system keyboard for unlock.`);
+          }
+        }
+      } catch {}
+
     } catch (error) {
       console.error('Fehler beim Initialisieren von Services:', error);
       try {
@@ -187,7 +220,7 @@ export default function App() {
     setIsFirstLaunch(false);
     // Check whether panic PIN was used to activate decoy vault.
     try {
-      const decoyFlag = await SecureStore.getItemAsync('filevault_decoy_activated');
+      const decoyFlag = await SecureStore.getItemAsync('filevault_guest_active');
       setIsDecoy(decoyFlag === 'true');
     } catch {
       setIsDecoy(false);
@@ -201,8 +234,9 @@ export default function App() {
    */
   const handleLogout = () => {
     CryptoService.clearAllCaches();
+    DecoyVaultService.clearDecoyCache(); // L6: drop cached guest content key
     // Clear decoy flag so next real login shows real data.
-    SecureStore.deleteItemAsync('filevault_decoy_activated').catch(() => {});
+    SecureStore.deleteItemAsync('filevault_guest_active').catch(() => {});
     setIsDecoy(false);
     setIsAuthenticated(false);
   };
@@ -232,9 +266,14 @@ export default function App() {
         await NotesService.deleteNote(note.id);
       }
 
+      // Layer 5 crypto-shred: destroying the master key renders every remaining blob
+      // permanently undecryptable, regardless of whether the ciphertext bytes still linger
+      // on flash (wear-leveling makes overwrite unreliable; key destruction does not).
+      // deleteEncryptionKey + deletePinData read-back-verify the secrets are gone.
       await CryptoService.deletePinData();
       await CryptoService.deleteEncryptionKey();
       CryptoService.clearAllCaches();
+      await FileManager.cleanupViewTemps();
       await CryptoService.setAppInitialized(false);
 
       setIsFirstLaunch(true);
@@ -270,6 +309,11 @@ export default function App() {
           onWipeVault={handleWipeVault}
         />
       )}
+      {obscured && (
+        <View style={styles.privacyOverlay} pointerEvents="none">
+          <VaultMark size={64} />
+        </View>
+      )}
     </View>
     </SafeAreaProvider>
   );
@@ -278,4 +322,11 @@ export default function App() {
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#0A0A0C' },
   splash: { flex: 1, backgroundColor: '#0A0A0C', alignItems: 'center', justifyContent: 'center' },
+  privacyOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: '#0A0A0C',
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 9999,
+  },
 });

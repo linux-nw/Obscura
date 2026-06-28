@@ -4,6 +4,7 @@ import {
   FlatList, TextInput, Modal, Alert,
 } from 'react-native';
 import { NotesService, Note } from '../services/NotesService';
+import { DecoyVaultService } from '../services/DecoyVaultService';
 import { SecureCryptoService } from '../services/CryptoService';
 import NoteEditor from './NoteEditor';
 import Icon from '../components/Icon';
@@ -37,10 +38,24 @@ export default function NotesScreen({ isDecoy = false }: { isDecoy?: boolean }) 
   // frühere Guard las über einen stale Closure immer initialized=false → die Liste
   // wurde nach dem Speichern nie neu geladen.
   const loadNotes = async () => {
-    if (isDecoy) { setNotes([]); setLoading(false); return; }
     setLoading(true);
     try {
-      setNotes(await NotesService.getNotes());
+      if (isDecoy) {
+        // L6: guest vault — read sealed guest notes, never the real notes/ dir.
+        const guest = await DecoyVaultService.getFakeNotes();
+        setNotes(guest.map(n => ({
+          id: n.id,
+          title: n.title,
+          content: n.content,
+          category: n.category,
+          tags: [],
+          createdAt: n.createdAt,
+          updatedAt: n.createdAt,
+          isEncrypted: true,
+        })));
+      } else {
+        setNotes(await NotesService.getNotes());
+      }
     } catch {
       Alert.alert('Fehler', 'Notizen konnten nicht geladen werden.');
     } finally {
@@ -63,7 +78,11 @@ export default function NotesScreen({ isDecoy = false }: { isDecoy?: boolean }) 
           text: 'Löschen',
           style: 'destructive',
           onPress: async () => {
-            await NotesService.deleteNote(noteId).catch(() => {});
+            if (isDecoy) {
+              await DecoyVaultService.deleteNote(noteId).catch(() => {});
+            } else {
+              await NotesService.deleteNote(noteId).catch(() => {});
+            }
             loadNotes();
           },
         },
@@ -185,6 +204,7 @@ export default function NotesScreen({ isDecoy = false }: { isDecoy?: boolean }) 
         {editorVisible && (
           <NoteEditor
             note={editing}
+            isDecoy={isDecoy}
             onClose={closeEditor}
             onSaved={onSaved}
           />

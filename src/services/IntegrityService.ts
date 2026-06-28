@@ -10,6 +10,7 @@
  */
 
 import * as SecureStore from 'expo-secure-store';
+import { verifyPinnedSignature, type SignatureVerdict } from '../native/IntegrityNative';
 
 export interface IntegrityStatus {
   isIntact: boolean;
@@ -21,8 +22,18 @@ export interface IntegrityStatus {
 export class IntegrityService {
   private static readonly STORAGE_INTEGRITY_RESULT = 'filevault_integrity_result';
   private static readonly STORAGE_LAST_CHECK = 'filevault_last_integrity_check';
-  private static readonly STORAGE_APP_HASH = 'filevault_app_hash';
   private static readonly INTEGRITY_ENABLED_KEY = 'filevault_integrity_enabled';
+
+  /**
+   * L7: real APK signing-cert verdict against the build-time-pinned hash.
+   *   'valid'        cert matches the compiled-in SIGNING_CERT_SHA256
+   *   'invalid'      cert present but mismatched (repackaged / re-signed)
+   *   'unverifiable' native module absent, or the build pinned no hash (debug)
+   * Only 'invalid' is a positive tamper signal — see checkSignature().
+   */
+  static async verifyAppSignature(): Promise<SignatureVerdict> {
+    return verifyPinnedSignature();
+  }
 
   /**
    * Prüft die App Integrität
@@ -70,24 +81,21 @@ export class IntegrityService {
   // ─────────────────────────────── Check Methods ───────────────────────────────
 
   /**
-   * Prüft die APK Signature (Android)
+   * Prüft die APK Signature (Android) gegen den einkompilierten Pin.
+   *
+   * Fail-closed, aber NICHT überreagierend: nur ein 'invalid'-Verdikt (App wurde
+   * neu gepackt/signiert) lässt den Check durchfallen. 'unverifiable' (Native-Modul
+   * fehlt, oder Debug-Build ohne Pin) lässt ihn bestehen — wir können kein Tampering
+   * beweisen, und ein False Positive darf einen legitimen Nutzer nie aussperren.
    */
   private static async checkSignature(): Promise<boolean> {
     try {
-      // In Produktion: Native Module für PackageInfo
-      // Android: getPackageInfo(PACKAGE_NAME_GET_SIGNATURES)
-      // iOS: Code signature check via native
-
-      // Fallback: Simulierter Check
-      const expectedSignature = await SecureStore.getItemAsync(this.STORAGE_APP_HASH);
-      if (!expectedSignature) {
-        // Erster Start - Hash speichern
-        await this.storeAppHash();
-        return true;
+      const verdict = await this.verifyAppSignature();
+      if (verdict === 'invalid') {
+        console.warn('Integrity: APK signing cert does not match the pinned hash');
+        return false;
       }
-
-      // In Produktion: echte Prüfung
-      return true; // Platzhalter
+      return true;
     } catch (error) {
       console.error('Integrity: Signature check failed:', error);
       return false;
@@ -146,23 +154,7 @@ export class IntegrityService {
     }
   }
 
-  // ─────────────────────────────── App Hash Management ───────────────────────────────
-
-  /**
-   * Speichert den App Hash (Signatur)
-   */
-  private static async storeAppHash(): Promise<void> {
-    try {
-      // In Produktion: echte App Hash Berechnung
-      // - Android: Signature bytes
-      // - iOS: Mach-O header hash
-      const appHash = 'expected_app_hash_placeholder';
-
-      await SecureStore.setItemAsync(this.STORAGE_APP_HASH, appHash);
-    } catch (error) {
-      console.error('Integrity: Failed to store app hash:', error);
-    }
-  }
+  // ─────────────────────────────── Compromise State ───────────────────────────────
 
   /**
    * Prüft ob App bereits kompromittiert wurde

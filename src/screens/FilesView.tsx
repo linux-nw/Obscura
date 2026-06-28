@@ -7,6 +7,7 @@ import {
 import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
 import { FileManager, FileMetadata } from '../services/FileManager';
+import { DecoyVaultService } from '../services/DecoyVaultService';
 import { SecureCryptoService } from '../services/CryptoService';
 import { AutoLockService } from '../services/AutoLockService';
 import FileIcon from '../components/FileIcon';
@@ -43,12 +44,29 @@ export default function FilesView({ isDecoy = false }: { isDecoy?: boolean }) {
     }
   };
 
+  // L6: in the guest vault, list/read/write go through DecoyVaultService (sealed with the
+  // guest key) — never FileManager's master-key path or the real vault/ dir.
+  const listFiles = async (): Promise<FileMetadata[]> => {
+    if (!isDecoy) return FileManager.getFiles();
+    const guest = await DecoyVaultService.getFakeFiles();
+    return guest.map(f => ({
+      id: f.id,
+      name: f.name,
+      originalName: f.originalName,
+      type: f.type,
+      size: f.size,
+      createdAt: f.createdAt,
+      iv: '',
+      mac: '',
+      version: 1,
+    }));
+  };
+
   // Kein initialized-Guard: FileManager.getFiles() initialisiert sich selbst.
   const loadFiles = async () => {
-    if (isDecoy) { setFiles([]); setLoading(false); return; }
     setLoading(true);
     try {
-      const loaded = await FileManager.getFiles();
+      const loaded = await listFiles();
       setFiles(loaded);
       loadThumbs(loaded);
     } catch {
@@ -64,7 +82,9 @@ export default function FilesView({ isDecoy = false }: { isDecoy?: boolean }) {
     for (const f of list) {
       if (f.type !== 'image') continue;
       try {
-        const b64 = await FileManager.getFileContent(f.id);
+        const b64 = isDecoy
+          ? await DecoyVaultService.getFakeFileContent(f.id)
+          : await FileManager.getFileContent(f.id);
         setThumbs(prev => prev[f.id] ? prev : { ...prev, [f.id]: `data:image/jpeg;base64,${b64}` });
       } catch {
         // Thumbnail-Fehler ignorieren — Karte fällt auf das Icon zurück.
@@ -113,7 +133,7 @@ export default function FilesView({ isDecoy = false }: { isDecoy?: boolean }) {
         setLoading(true);
         let saved = 0;
         for (const asset of result.assets) {
-          const currentFiles = await FileManager.getFiles();
+          const currentFiles = await listFiles();
           if (currentFiles.length >= FREE_LIMIT) {
             Alert.alert('Limit erreicht', `Kostenlose Version: max. ${FREE_LIMIT} Dateien. ${saved} von ${result.assets.length} importiert.`);
             break;
@@ -148,7 +168,7 @@ export default function FilesView({ isDecoy = false }: { isDecoy?: boolean }) {
         setLoading(true);
         let saved = 0;
         for (const asset of result.assets) {
-          const currentFiles = await FileManager.getFiles();
+          const currentFiles = await listFiles();
           if (currentFiles.length >= FREE_LIMIT) {
             Alert.alert('Limit erreicht', `Kostenlose Version: max. ${FREE_LIMIT} Dateien. ${saved} von ${result.assets.length} importiert.`);
             break;
@@ -167,9 +187,17 @@ export default function FilesView({ isDecoy = false }: { isDecoy?: boolean }) {
     }
   };
 
+  const persistFile = async (uri: string, type: 'image' | 'video' | 'document', name: string) => {
+    if (isDecoy) {
+      await DecoyVaultService.saveFile(uri, type, name);
+    } else {
+      await FileManager.saveFile(uri, type, name);
+    }
+  };
+
   const saveFileNoReload = async (uri: string, type: 'image' | 'video' | 'document', name: string) => {
     try {
-      await FileManager.saveFile(uri, type, name);
+      await persistFile(uri, type, name);
     } catch (e) {
       Alert.alert('Fehler', `Datei konnte nicht gespeichert werden: ${String(e)}`);
     }
@@ -178,7 +206,7 @@ export default function FilesView({ isDecoy = false }: { isDecoy?: boolean }) {
   const saveFile = async (uri: string, type: 'image' | 'video' | 'document', name: string) => {
     setLoading(true);
     try {
-      await FileManager.saveFile(uri, type, name);
+      await persistFile(uri, type, name);
       await loadFiles();
     } catch (e) {
       Alert.alert('Fehler', `Datei konnte nicht gespeichert werden: ${String(e)}`);
@@ -201,7 +229,11 @@ export default function FilesView({ isDecoy = false }: { isDecoy?: boolean }) {
           onPress: async () => {
             setLoading(true);
             for (const id of ids) {
-              await FileManager.deleteFile(id).catch(() => {});
+              if (isDecoy) {
+                await DecoyVaultService.deleteFile(id).catch(() => {});
+              } else {
+                await FileManager.deleteFile(id).catch(() => {});
+              }
             }
             clearSelect();
             await loadFiles();
@@ -394,7 +426,7 @@ export default function FilesView({ isDecoy = false }: { isDecoy?: boolean }) {
       </Modal>
 
       {/* ── In-App File Viewer (alle Typen) ── */}
-      <FileViewer file={viewerFile} onClose={() => setViewerFile(null)} />
+      <FileViewer file={viewerFile} isDecoy={isDecoy} onClose={() => setViewerFile(null)} />
     </View>
   );
 }
