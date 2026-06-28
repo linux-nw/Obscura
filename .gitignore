@@ -39,3 +39,7 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+# editor / local tool config (may contain local paths or usernames)
+.idea/
+.claude/
