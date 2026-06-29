@@ -274,7 +274,7 @@ class SecureNotesService {
    * (Key-Rotation). Pro Feld idempotent via CryptoService.recryptBlob; eine Notiz
    * wird mit einem einzigen Write komplett geschrieben (kein Feld-Mischzustand).
    */
-  static async reencryptAll(oldKey: string, newKey: string): Promise<void> {
+  static async reencryptAll(oldHandle: string, newHandle: string): Promise<void> {
     await this.initialize();
     const files = await FileSystem.readDirectoryAsync(this.NOTES_DIR);
     const noteFiles = files.filter(file => file.startsWith('note_'));
@@ -284,10 +284,10 @@ class SecureNotesService {
       const note = JSON.parse(await FileSystem.readAsStringAsync(path));
       const nid = note.id;
       const v = note.version ?? 1; // A3: preserve the same version in old+new AAD
-      note.title = await CryptoService.recryptBlob(note.title, oldKey, newKey, `${nid}:title:v${v}`);
-      note.content = await CryptoService.recryptBlob(note.content, oldKey, newKey, `${nid}:content:v${v}`);
-      note.category = await CryptoService.recryptBlob(note.category, oldKey, newKey, `${nid}:category:v${v}`);
-      note.tags = await CryptoService.recryptBlob(note.tags, oldKey, newKey, `${nid}:tags:v${v}`);
+      note.title = await CryptoService.recryptBlob(note.title, oldHandle, newHandle, `${nid}:title:v${v}`);
+      note.content = await CryptoService.recryptBlob(note.content, oldHandle, newHandle, `${nid}:content:v${v}`);
+      note.category = await CryptoService.recryptBlob(note.category, oldHandle, newHandle, `${nid}:category:v${v}`);
+      note.tags = await CryptoService.recryptBlob(note.tags, oldHandle, newHandle, `${nid}:tags:v${v}`);
       await writeFileAtomic(path, JSON.stringify(note)); // H3: atomic
     }
   }

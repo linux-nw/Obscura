@@ -6,6 +6,7 @@ import { Argon2idService, Argon2Params } from './Argon2idService';
 import { HardwareBackedStorage } from './HardwareKeystoreService';
 import { fastPbkdf2, hkdfSha256, isNobleAvailable } from './FastPBKDF2';
 import { aesCbcEncryptRaw, aesCbcDecryptRaw } from './AesCbcHmac';
+import { keyCustody } from './KeyCustody';
 // XChaCha20-Poly1305 native Module (erstellt bei ADB-Test)
 // Import aus ../native da dieser Service in src/services liegt
 import { encrypt as xchachaEncrypt, decrypt as xchachaDecrypt, verifyConstantTime as nativeVerifyConstantTime } from '../native/RNFileVault';
@@ -693,11 +694,47 @@ export class SecureCryptoService {
   }
 
   /**
-   * Holt den aktuellen Master-Schlüssel — in-memory cached nach erstem Lesen
-   * Wird von FileEncryptionKey für Key Wrapping/Unwrapping verwendet
+   * L3 Phase 2: REMOVED. The raw master key is never handed back to JS as a value — all
+   * crypto runs through an opaque custody handle (see KeyCustody). Kept as a hard throw so
+   * any stale caller fails loudly instead of silently receiving a raw key.
+   *
+   * Production callers were rewired to the handle path:
+   *   - content:   encryptData / decryptData (use the live master handle internally)
+   *   - file keys: encryptFileKey / decryptFileKey, encryptFileKeyWith(handle) / decryptFileKeyWith(handle)
+   *   - rotation:  KeyRotationService threads old/new handles
    */
   static async getMasterKey(): Promise<string | null> {
-    return this._masterKeyCache;
+    throw new Error('getMasterKey() wurde in L3 Phase 2 entfernt — Krypto läuft über Custody-Handles (encryptData/decryptData/encryptFileKey).');
+  }
+
+  /** The live master-key custody handle, or throw if the vault is locked. */
+  static currentMasterHandle(): string {
+    if (!this.__masterHandle || !keyCustody.has(this.__masterHandle)) {
+      throw new Error('Tresor gesperrt — kein Master-Key-Handle vorhanden');
+    }
+    return this.__masterHandle;
+  }
+
+  /** Register a raw key into custody, returning its handle (key rotation, decoy, tests). */
+  static registerKeyHandle(keyHex: string): string {
+    return keyCustody.register(keyHex);
+  }
+
+  /** Close a custody handle (zero + drop). Idempotent. */
+  static closeKeyHandle(handle: string): boolean {
+    return keyCustody.close(handle);
+  }
+
+  /**
+   * TEST-ONLY: resolve the current master key hex from custody, or null if locked. Exists so
+   * host tests can assert key identity / rotation without a production getMasterKey(). NEVER
+   * call from production code — it defeats the custody seam, and in 2b (native key custody)
+   * the key is not resolvable in JS at all.
+   */
+  static __masterKeyHexForTest(): string | null {
+    return this.__masterHandle && keyCustody.has(this.__masterHandle)
+      ? keyCustody.resolve(this.__masterHandle)
+      : null;
   }
 
   static async loadMasterKeyForBiometric(): Promise<boolean> {
@@ -855,9 +892,8 @@ export class SecureCryptoService {
       const unlocked = await this.unlock(oldPassphrase);
       if (!unlocked) return false;
 
-      const masterKeyHex = this._masterKeyCache;
-      if (!masterKeyHex) return false;
-
+      // Same master key, new KEK wrap — resolve the live handle to re-wrap it (2a JS-backed).
+      const masterKeyHex = keyCustody.resolve(this.currentMasterHandle());
       await this.wrapAndStoreMasterKey(newPassphrase, masterKeyHex);
       return true;
     } catch {
@@ -957,27 +993,26 @@ export class SecureCryptoService {
     iv: string;
     mac: string; // AEAD-/HMAC-Tag wird als mac bezeichnet für API-Kompatibilität
   }> {
-    const keyHex = await this.getMasterKey();
-    if (!keyHex) {
-      throw new Error('Verschlüsselung fehlgeschlagen');
-    }
-    return this.encryptDataWith(data, keyHex, aadContext);
+    return this.encryptDataWithHandle(data, this.currentMasterHandle(), aadContext);
   }
 
   /**
-   * Wie encryptData, aber mit EXPLIZIT übergebenem Schlüssel (statt Master-Key-Cache).
-   * Wird bei der Key-Rotation gebraucht, um Inhalte mit dem NEUEN Master-Key zu
-   * re-verschlüsseln, ohne den Cache umzustellen.
+   * Wie encryptData, aber adressiert den Schlüssel über ein Custody-HANDLE statt über den
+   * Master-Cache. Genutzt von Key-Rotation (alter/neuer Handle) und vom Decoy-Pfad (eigener
+   * Content-Handle). L3 Phase 2a: das Handle wird JS-seitig über KeyCustody.resolve() in den
+   * rohen Key aufgelöst, der dann durch dieselben Krypto-Primitive läuft wie bisher — kein
+   * Ciphertext-Byte ändert sich. 2b ersetzt resolve() durch den nativen Handle-Pfad.
    *
    * H2: aadContext (z.B. "fileId:content") wird in den Auth-Tag gebunden. Beim
    * Entschlüsseln muss derselbe Kontext angegeben werden, sonst schlägt die
    * Verifikation fehl — verhindert Blob-Swap zwischen Objekten/Rollen.
    */
-  static async encryptDataWith(data: string, keyHex: string, aadContext: string = ''): Promise<{
+  static async encryptDataWithHandle(data: string, handle: string, aadContext: string = ''): Promise<{
     encryptedData: string;
     iv: string;
     mac: string;
   }> {
+    const keyHex = keyCustody.resolve(handle);
     // Backend wählen: XChaCha20 (native) > AES-CBC+HMAC (pure-JS fallback).
     // S3: a non-XChaCha backend means the native module is absent → silent JS-crypto
     // downgrade. Refuse to write unless explicitly permitted (test env / dev opt-in).
@@ -1047,21 +1082,19 @@ export class SecureCryptoService {
    * @returns Entschlüsselter String
    */
   static async decryptData(encryptedData: string, iv: string, mac: string, aadContext: string = ''): Promise<string> {
-    const keyHex = await this.getMasterKey();
-    if (!keyHex) {
-      throw new Error('Entschlüsselung fehlgeschlagen');
-    }
-    return this.decryptDataWith(encryptedData, iv, mac, keyHex, aadContext);
+    return this.decryptDataWithHandle(encryptedData, iv, mac, this.currentMasterHandle(), aadContext);
   }
 
   /**
-   * Wie decryptData, aber mit EXPLIZIT übergebenem Schlüssel (statt Master-Key-Cache).
-   * Wird bei der Key-Rotation gebraucht, um Inhalte mit dem ALTEN Master-Key zu
-   * entschlüsseln, bevor sie mit dem neuen re-verschlüsselt werden.
+   * Wie decryptData, aber adressiert den Schlüssel über ein Custody-HANDLE. Genutzt von
+   * Key-Rotation (alter Handle zum Entschlüsseln vor dem Re-Wrap) und vom Decoy-Pfad.
+   * L3 Phase 2a: Handle -> roher Key via KeyCustody.resolve(); identische Krypto, identisches
+   * Wire-Format. 2b ersetzt den Resolve durch den nativen decryptWithHandle.
    *
    * H2: aadContext muss exakt dem beim Verschlüsseln verwendeten Kontext entsprechen.
    */
-  static async decryptDataWith(encryptedData: string, iv: string, mac: string, keyHex: string, aadContext: string = ''): Promise<string> {
+  static async decryptDataWithHandle(encryptedData: string, iv: string, mac: string, handle: string, aadContext: string = ''): Promise<string> {
+    const keyHex = keyCustody.resolve(handle);
     try {
       // Lese Backend-ID aus Header (erste 2 hex Zeichen)
       // Format: [backend_id][encrypted_data]
@@ -1120,19 +1153,19 @@ export class SecureCryptoService {
    */
   static async recryptBlob(
     blob: { data: string; iv: string; mac: string },
-    oldKey: string,
-    newKey: string,
+    oldHandle: string,
+    newHandle: string,
     aadContext: string = ''
   ): Promise<{ data: string; iv: string; mac: string }> {
     try {
       // Schon mit dem neuen Schlüssel verschlüsselt? Dann nichts tun.
-      await this.decryptDataWith(blob.data, blob.iv, blob.mac, newKey, aadContext);
+      await this.decryptDataWithHandle(blob.data, blob.iv, blob.mac, newHandle, aadContext);
       return blob;
     } catch {
       // Noch unter dem alten Schlüssel — migrieren.
     }
-    const plain = await this.decryptDataWith(blob.data, blob.iv, blob.mac, oldKey, aadContext);
-    const re = await this.encryptDataWith(plain, newKey, aadContext);
+    const plain = await this.decryptDataWithHandle(blob.data, blob.iv, blob.mac, oldHandle, aadContext);
+    const re = await this.encryptDataWithHandle(plain, newHandle, aadContext);
     return { data: re.encryptedData, iv: re.iv, mac: re.mac };
   }
 
@@ -1240,22 +1273,23 @@ export class SecureCryptoService {
     return this.bufferToHex(buffer);
   }
 
-  // M2: the long-lived master-key copy is held as a Uint8Array, not an immutable
-  // string, so it can be zeroed on logout. `_masterKeyCache` stays a string-typed
-  // get/set property for all existing call sites; the setter zeroes the previous
-  // bytes on every reassignment and on clear.
+  // L3 Phase 2: the master key is addressed by an opaque custody HANDLE, never held as raw
+  // bytes on the service. `__masterHandle` indexes KeyCustody (JS-backed in 2a — the raw key
+  // still lives in the JS heap inside KeyCustody; 2b moves it to native secure memory).
   //
-  // Residual (inherent to JS): getMasterKey() returns a fresh hex string per call;
-  // those transient copies linger in the GC heap until collected. The persistent
-  // long-lived copy — the one most exposed to a memory dump — is the zeroable array.
-  private static __mkBytes: Uint8Array | null = null;
+  // `_masterKeyCache` is kept as the WRITE-ONLY install/clear channel used by every unlock
+  // path (setupMasterKey, unlockKEK, migrateLegacy, loadMasterKeyForBiometric, installMasterKey):
+  // the setter registers the key into custody (or closes the current handle on null) and
+  // stores the resulting handle. There is no getter — code that needs the key resolves the
+  // handle through KeyCustody, and getMasterKey() throws.
+  private static __masterHandle: string | null = null;
 
-  private static get _masterKeyCache(): string | null {
-    return this.__mkBytes ? this.bytesToHex_fast(this.__mkBytes) : null;
-  }
   private static set _masterKeyCache(hex: string | null) {
-    if (this.__mkBytes) this.__mkBytes.fill(0); // zero the previous key material
-    this.__mkBytes = hex ? new Uint8Array(this.hexToBuffer(hex)) : null;
+    if (this.__masterHandle) {
+      keyCustody.close(this.__masterHandle); // zero + drop the previous key material
+      this.__masterHandle = null;
+    }
+    if (hex) this.__masterHandle = keyCustody.register(hex);
   }
 
   // MAC-Key Cache: deterministisch ableitbar pro Master-Key, daher safely cacheable
@@ -1833,8 +1867,9 @@ export class SecureCryptoService {
    */
   static async encryptFileKeyWith(
     fileKey: string,
-    masterKeyHex: string
+    masterHandle: string
   ): Promise<{ encryptedKey: string; iv: string; mac: string; createdAt: string }> {
+    const masterKeyHex = keyCustody.resolve(masterHandle);
     const iv = await this.generateSecureBytes(this.CBC_IV_LENGTH);
     const ivHex = this.bufferToHex(iv);
     const result = await this.aesCBCEncrypt(fileKey, masterKeyHex, ivHex);
@@ -1852,13 +1887,13 @@ export class SecureCryptoService {
    */
   static async decryptFileKeyWith(
     encryptedKey: { encryptedKey: string; iv: string; mac: string; createdAt?: string },
-    masterKeyHex: string
+    masterHandle: string
   ): Promise<string> {
     return this.aesCBCDecrypt(
       encryptedKey.encryptedKey,
       encryptedKey.iv,
       encryptedKey.mac,
-      masterKeyHex
+      keyCustody.resolve(masterHandle)
     );
   }
 
@@ -1888,10 +1923,7 @@ export class SecureCryptoService {
     createdAt: string;
   }> {
     try {
-      const masterKeyHex = await this.getMasterKey();
-      if (!masterKeyHex) {
-        throw new Error('Kein Master-Schlüssel vorhanden');
-      }
+      const masterKeyHex = keyCustody.resolve(this.currentMasterHandle());
 
       // Key wrapping uses aesCBCEncrypt which uses CBC mode - requires 16-byte IV
       const iv = await this.generateSecureBytes(this.CBC_IV_LENGTH);
@@ -1924,10 +1956,7 @@ export class SecureCryptoService {
     createdAt?: string;
   }): Promise<string> {
     try {
-      const masterKeyHex = await this.getMasterKey();
-      if (!masterKeyHex) {
-        throw new Error('Kein Master-Schlüssel vorhanden');
-      }
+      const masterKeyHex = keyCustody.resolve(this.currentMasterHandle());
 
       // Entschlüsseln mit backend-selection (XChaCha20 > AES-CBC+HMAC > CryptoJS)
       return await this.aesCBCDecrypt(encryptedKey.encryptedKey, encryptedKey.iv, encryptedKey.mac, masterKeyHex);

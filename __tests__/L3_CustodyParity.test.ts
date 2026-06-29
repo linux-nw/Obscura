@@ -21,13 +21,17 @@
 const secureStore = require('../__mocks__/expo-secure-store');
 
 import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { SecureCryptoService } from '../src/services/CryptoService';
 import { aesCbcEncryptRaw, aesCbcDecryptRaw } from '../src/services/AesCbcHmac';
 import { hkdfSha256 } from '../src/services/FastPBKDF2';
 
+// Device-harness vector dump (Phase 4). L3_VECTORS_OUT overrides for the ceremony;
+// the default is just a writable temp path — NOT a session-specific scratchpad.
 const OUT =
   process.env.L3_VECTORS_OUT ||
-  '/tmp/claude-1000/-mnt-c-Users-linux-Desktop-Coding-Projekte-Obscuraa-FileVault/53f1acbf-4355-4182-bf8d-536d14462dc5/scratchpad/l3_vectors.json';
+  path.join(os.tmpdir(), 'l3_vectors.json');
 
 // Fixed, deterministic test material so the vectors are reproducible and can also be
 // hard-coded into the on-device androidTest later.
@@ -77,19 +81,23 @@ describe('L3 Phase 1a: JS parity reference', () => {
   test('real pre-rebuild blobs: file-key wrap + master-blob (EtM)', async () => {
     // File-key wrap: exactly what FileManager stores per file (encryptFileKeyWith).
     const fileKey = 'deadbeefcafef00d' + '1122334455667788'.repeat(3); // 64 hex chars
-    const wrap = await SecureCryptoService.encryptFileKeyWith(fileKey, KEY);
-    expect(await SecureCryptoService.decryptFileKeyWith(wrap, KEY)).toBe(fileKey);
+    // L3 Phase 2: the master key is addressed by a custody handle, not a raw hex arg.
+    const keyHandle = SecureCryptoService.registerKeyHandle(KEY);
+    const wrap = await SecureCryptoService.encryptFileKeyWith(fileKey, keyHandle);
+    expect(await SecureCryptoService.decryptFileKeyWith(wrap, keyHandle)).toBe(fileKey);
     blobs.push({ name: 'filekey-wrap', keyHex: KEY, ivHex: wrap.iv, plainB64: utf8B64(fileKey), ctHex: wrap.encryptedKey, macHex: wrap.mac });
 
     // Master-blob: same construction wrapAndStoreMasterKey uses (master wrapped under KEK).
     const kek = '9988776655443322110ffeeddccbbaa00112233445566778899aabbccddeeff0';
     const masterPlain = 'cafebabe00ff'.padEnd(64, '0');
-    const mwrap = await SecureCryptoService.encryptFileKeyWith(masterPlain, kek);
-    expect(await SecureCryptoService.decryptFileKeyWith(mwrap, kek)).toBe(masterPlain);
+    const kekHandle = SecureCryptoService.registerKeyHandle(kek);
+    const mwrap = await SecureCryptoService.encryptFileKeyWith(masterPlain, kekHandle);
+    expect(await SecureCryptoService.decryptFileKeyWith(mwrap, kekHandle)).toBe(masterPlain);
     blobs.push({ name: 'master-blob', keyHex: kek, ivHex: mwrap.iv, plainB64: utf8B64(masterPlain), ctHex: mwrap.encryptedKey, macHex: mwrap.mac });
   }, 30000);
 
   afterAll(() => {
+    fs.mkdirSync(path.dirname(OUT), { recursive: true });
     fs.writeFileSync(OUT, JSON.stringify({ aes, hkdf, hmac, blobs }, null, 2));
     // Flat, pipe-delimited mirror so the plain-JDK harness needs no JSON lib.
     // All fields are hex/base64/label -> no '|' collisions.

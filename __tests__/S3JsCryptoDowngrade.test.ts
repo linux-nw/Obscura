@@ -22,7 +22,8 @@ let sharedMasterKey: string;
 
 beforeAll(async () => {
   await SecureCryptoService.setupMasterKey(PASSPHRASE);
-  sharedMasterKey = (await SecureCryptoService.getMasterKey())!;
+  // L3 Phase 2: getMasterKey() is gone (throws). Resolve the master via the test-only seam.
+  sharedMasterKey = SecureCryptoService.__masterKeyHexForTest()!;
 }, 30000);
 
 beforeEach(() => {
