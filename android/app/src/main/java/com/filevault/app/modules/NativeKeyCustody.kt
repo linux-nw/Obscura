@@ -69,15 +69,16 @@ object NativeKeyCustody {
     }
 
     // ── store a raw key into a guarded secure-memory region ─────────────────────────
-    private fun store(rawKey: ByteArray): String {
+    private fun storeUnder(handle: String, rawKey: ByteArray): String {
         val mlocked = ensureInit()
         val ptr = ls.sodium.sodium_malloc(rawKey.size)
             ?: throw IllegalStateException("sodium_malloc returned null")
         ptr.write(0, rawKey, 0, rawKey.size)
-        val handle = newHandle()
         sessions[handle] = Session(ptr, rawKey.size, mlocked)
         return handle
     }
+
+    private fun store(rawKey: ByteArray): String = storeUnder(newHandle(), rawKey)
 
     /**
      * Register an already-derived raw key. Used by tests and (Phase 2) by callers that have
@@ -85,6 +86,17 @@ object NativeKeyCustody {
      * NOT a bridge method — no raw key path is exposed to JS.
      */
     fun registerRawKey(rawKey: ByteArray): String = store(rawKey)
+
+    /**
+     * Adopt a raw key under a CALLER-PROVIDED opaque handle (L3 Phase 2b).
+     *
+     * The custody seam (KeyCustody.ts, native backing) mints the 128-bit handle JS-side so it
+     * can track liveness synchronously, then hands the raw key here. This is the documented
+     * ONE-TIME raw-key touch at vault creation / rotation (audit B1/B5) — the only path that
+     * crosses the bridge with a raw key. In steady state (content/file-key ops) the key never
+     * leaves this guarded region. Same store as registerRawKey, only the id is external.
+     */
+    fun adoptRawKey(handle: String, rawKey: ByteArray): String = storeUnder(handle, rawKey)
 
     /**
      * openVault — native KEK-unwrap of the master blob straight into secure memory.
@@ -125,6 +137,74 @@ object NativeKeyCustody {
         val handle = store(masterRaw)
         ls.sodium.sodium_memzero(masterRaw, masterRaw.size)
         return handle
+    }
+
+    /**
+     * unwrapVaultWithKek — native EtM-unwrap of the master blob under an ALREADY-DERIVED KEK.
+     *
+     * The biometric path (loadMasterKeyForBiometric, audit B3) retrieves a raw 32-byte KEK from
+     * hardware-backed storage — there is no passphrase to run Argon2id over. This is openVault's
+     * tail without the KDF: verify the EtM tag, AES-CBC-decrypt the master, store it guarded,
+     * return only the handle. Byte-identical MAC framing to wrapAndStoreMasterKey (utf8(ivHex+ctHex)).
+     */
+    fun unwrapVaultWithKek(kekHex: String, ivHex: String, encMasterCtHex: String, macHex: String): String {
+        ensureInit()
+        val kek = NativeKeyCustodyCrypto.fromHex(kekHex)
+        try {
+            val masterAscii = NativeKeyCustodyCrypto.unwrapEtm(kek, ivHex, encMasterCtHex, macHex)
+            val masterRaw = NativeKeyCustodyCrypto.fromHex(String(masterAscii, StandardCharsets.UTF_8))
+            ls.sodium.sodium_memzero(masterAscii, masterAscii.size)
+            val handle = store(masterRaw)
+            ls.sodium.sodium_memzero(masterRaw, masterRaw.size)
+            return handle
+        } finally {
+            ls.sodium.sodium_memzero(kek, kek.size)
+        }
+    }
+
+    /**
+     * rewrapVault — re-wrap the LIVE master key under a new passphrase, natively (audit R3, changePassphrase).
+     *
+     * The master never returns to JS: a new KEK is derived (Argon2id, NFC-normalised password
+     * supplied by the bridge), and the master — re-materialised as its 64-ASCII-hex string, exactly
+     * the plaintext wrapAndStoreMasterKey wraps — is EtM-wrapped under the new KEK. Only the new
+     * {ct, mac} blob is returned for storage; the new IV is the caller's. Same master key, new wrap.
+     */
+    fun rewrapVault(
+        handle: String,
+        newPassword: ByteArray,
+        newSalt: ByteArray,
+        opslimit: Long,
+        memlimitKB: Long,
+        newIv: ByteArray
+    ): NativeKeyCustodyCrypto.Wrapped {
+        ensureInit()
+        val newKek = ByteArray(32)
+        val rc = ls.sodium.crypto_pwhash(
+            newKek, newKek.size.toLong(),
+            newPassword, newPassword.size.toLong(),
+            newSalt,
+            opslimit,
+            NativeLong(memlimitKB * 1024L),
+            2 // crypto_pwhash_ALG_ARGON2ID13
+        )
+        if (rc != 0) {
+            ls.sodium.sodium_memzero(newKek, newKek.size)
+            throw SecurityException("KEK derivation failed (rc=$rc)")
+        }
+        try {
+            return withKey(handle) { masterRaw ->
+                // Wrap plaintext == the 64-ASCII-hex master string (matches wrapAndStoreMasterKey).
+                val masterAscii = NativeKeyCustodyCrypto.toHex(masterRaw).toByteArray(StandardCharsets.UTF_8)
+                try {
+                    NativeKeyCustodyCrypto.wrapEtm(newKek, newIv, masterAscii)
+                } finally {
+                    ls.sodium.sodium_memzero(masterAscii, masterAscii.size)
+                }
+            }
+        } finally {
+            ls.sodium.sodium_memzero(newKek, newKek.size)
+        }
     }
 
     private fun session(handle: String): Session =

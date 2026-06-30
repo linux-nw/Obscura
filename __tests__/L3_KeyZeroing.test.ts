@@ -20,7 +20,11 @@
 require('../__mocks__/expo-secure-store');
 
 import { SecureCryptoService } from '../src/services/CryptoService';
-import { keyCustody } from '../src/services/KeyCustody';
+import { keyCustody, JsBackedKeyCustody } from '../src/services/KeyCustody';
+
+// Under Jest there is no native module, so custody is JS-backed and the resolve() seam exists.
+// (On device the backing is native, isNative === true, and resolve() is gone — see KeyCustody.ts.)
+const jsCustody = keyCustody as JsBackedKeyCustody;
 
 describe('Layer 3: master key lives behind a custody handle and is zeroed on lock', () => {
   test('installing a key stores only a handle; the key is resolvable via the handle', () => {
@@ -48,7 +52,7 @@ describe('Layer 3: master key lives behind a custody handle and is zeroed on loc
 
     // The handle is closed (key bytes zeroed in place + dropped) and the vault is locked.
     expect(keyCustody.has(handle)).toBe(false);
-    expect(() => keyCustody.resolve(handle)).toThrow();
+    expect(() => jsCustody.resolve(handle)).toThrow();
     expect((SecureCryptoService as any).__masterHandle).toBeNull();
     expect(SecureCryptoService.__masterKeyHexForTest()).toBeNull();
   });
@@ -62,7 +66,7 @@ describe('Layer 3: master key lives behind a custody handle and is zeroed on loc
 
     // The old handle is closed; the new one holds the new key.
     expect(keyCustody.has(first)).toBe(false);
-    expect(() => keyCustody.resolve(first)).toThrow();
+    expect(() => jsCustody.resolve(first)).toThrow();
     const second = (SecureCryptoService as any).__masterHandle as string;
     expect(second).not.toBe(first);
     expect(SecureCryptoService.__masterKeyHexForTest()).toBe('ef'.repeat(32));

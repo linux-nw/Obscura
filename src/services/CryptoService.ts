@@ -717,7 +717,7 @@ export class SecureCryptoService {
 
   /** Register a raw key into custody, returning its handle (key rotation, decoy, tests). */
   static registerKeyHandle(keyHex: string): string {
-    return keyCustody.register(keyHex);
+    return keyCustody.registerRawKey(keyHex);
   }
 
   /** Close a custody handle (zero + drop). Idempotent. */
@@ -732,13 +732,15 @@ export class SecureCryptoService {
    * the key is not resolvable in JS at all.
    */
   static __masterKeyHexForTest(): string | null {
+    // Under native key custody the master is not resolvable in JS at all — return null.
+    if (keyCustody.isNative) return null;
     return this.__masterHandle && keyCustody.has(this.__masterHandle)
       ? keyCustody.resolve(this.__masterHandle)
       : null;
   }
 
   static async loadMasterKeyForBiometric(): Promise<boolean> {
-    if (this._masterKeyCache) return true;
+    if (this.__masterHandle && keyCustody.has(this.__masterHandle)) return true;
     try {
       const kek = await SecureStore.getItemAsync(this.STORAGE_BIO_KEK, {
         requireAuthentication: true,
@@ -749,6 +751,18 @@ export class SecureCryptoService {
       const ivHex = await this.getItemSecure(this.STORAGE_MASTER_IV);
       const storedMac = await this.getItemSecure(this.STORAGE_MASTER_MAC);
       if (!encMasterKey || !ivHex || !storedMac) return false;
+
+      // R3 (audit B3): under native custody the master is EtM-unwrapped in secure memory and never
+      // returns to JS — pass the hardware-stored KEK to the native module and adopt the handle.
+      if (keyCustody.isNative) {
+        const handle = await keyCustody.unwrapVaultWithKekInstall({
+          kekHex: kek, ivHex, ctHex: encMasterKey, macHex: storedMac,
+        });
+        this.setMasterHandle(handle);
+        return true;
+      }
+
+      // JS-backed (Jest / dev): verify the EtM tag, then CryptoJS-decrypt the master in JS.
       const macKey = await this.deriveMacKey(kek);
       const expectedMac = await this.computeMac(macKey, ivHex + encMasterKey);
       if (!await this.constantsTimeEquals(expectedMac, storedMac)) return false;
@@ -833,6 +847,30 @@ export class SecureCryptoService {
         return false;
       }
 
+      // R3 (audit B2): under native custody the KEK is derived (Argon2id, NFC native) and the master
+      // is EtM-unwrapped, both in secure memory — the master never materialises as a JS value. A
+      // wrong passphrase surfaces as an EtM tag mismatch (native throw) → counted as a failed attempt.
+      if (keyCustody.isNative) {
+        let handle: string;
+        try {
+          handle = await keyCustody.openVaultInstall({
+            password: passphrase,
+            kekSaltHex,
+            opslimit: this.ARGON2_ITERATIONS,
+            memlimitKB: this.ARGON2_MEMORY_KB,
+            ivHex,
+            ctHex: encMasterKey,
+            macHex: storedMac,
+          });
+        } catch {
+          await this.incrementFailedAttempts();
+          return false;
+        }
+        this.setMasterHandle(handle);
+        await this.resetFailedAttempts();
+        return true;
+      }
+
       const kek = await this.deriveKEK(passphrase, kekSaltHex);
       const macKey = await this.deriveMacKey(kek);
       const expectedMac = await this.computeMac(macKey, ivHex + encMasterKey);
@@ -892,7 +930,23 @@ export class SecureCryptoService {
       const unlocked = await this.unlock(oldPassphrase);
       if (!unlocked) return false;
 
-      // Same master key, new KEK wrap — resolve the live handle to re-wrap it (2a JS-backed).
+      // R3: same master key, new KEK wrap. Under native custody the master is re-wrapped in secure
+      // memory (rewrapVault) and never returns to JS; the JS-backed path resolves it to re-wrap.
+      if (keyCustody.isNative) {
+        const handle = this.currentMasterHandle();
+        const newSaltHex = this.bufferToHex(await this.generateSecureBytes(16)); // 16-byte Argon2id salt
+        const newIvHex = this.bufferToHex(await this.generateSecureBytes(this.CBC_IV_LENGTH));
+        const blob = await keyCustody.rewrapVault(handle, {
+          newPassword: newPassphrase,
+          newSaltHex,
+          opslimit: this.ARGON2_ITERATIONS,
+          memlimitKB: this.ARGON2_MEMORY_KB,
+          newIvHex,
+        });
+        await this.storeWrappedMaster(newSaltHex, blob.ivHex, blob.ctHex, blob.macHex);
+        return true;
+      }
+
       const masterKeyHex = keyCustody.resolve(this.currentMasterHandle());
       await this.wrapAndStoreMasterKey(newPassphrase, masterKeyHex);
       return true;
@@ -910,11 +964,19 @@ export class SecureCryptoService {
 
     const result = await this.aesCBCEncrypt(masterKeyHex, kek, ivHex);
 
+    await this.storeWrappedMaster(kekSaltHex, ivHex, result.encryptedData, result.tag);
+  }
+
+  /** Persists the wrapped-master blob (audit B2 storage shape). Shared by the JS wrap path and the
+   *  native rewrapVault path so both write the identical KEK-salt / KDF-meta / enc / iv / mac set. */
+  private static async storeWrappedMaster(
+    kekSaltHex: string, ivHex: string, ctHex: string, macHex: string
+  ): Promise<void> {
     await this.setItemSecure(this.STORAGE_KEK_SALT, kekSaltHex);
     await this.setItemSecure(this.STORAGE_KDF_META, this.KDF_META_CURRENT); // C1
-    await this.setItemSecure(this.STORAGE_MASTER_ENC, result.encryptedData);
+    await this.setItemSecure(this.STORAGE_MASTER_ENC, ctHex);
     await this.setItemSecure(this.STORAGE_MASTER_IV, ivHex);
-    await this.setItemSecure(this.STORAGE_MASTER_MAC, result.tag);
+    await this.setItemSecure(this.STORAGE_MASTER_MAC, macHex);
   }
 
   /**
@@ -1012,6 +1074,28 @@ export class SecureCryptoService {
     iv: string;
     mac: string;
   }> {
+    // R1 (native custody): content is encrypted by handle in secure memory — XChaCha20-Poly1305 ONLY,
+    // backend prefix 0x01. The pure-JS AES-CBC / 0x02 downgrade does NOT exist on this path: if the
+    // native op throws it is a HARD error, never a silent fallback to weaker JS crypto (non-negotiable).
+    if (keyCustody.isNative) {
+      const ivHex = this.bufferToHex(await this.generateSecureBytes(this.XCHACHA_NONCE_LENGTH));
+      const backendPrefix = BACKEND_XCHACHA.toString(16).padStart(2, '0');
+      // W-03 + H2: AAD = backendPrefix || hex(utf8(aadContext)), bound into the Poly1305 tag.
+      const aadHex = backendPrefix + this.utf8ToHex(aadContext);
+      const dataB64 = this.utf8ToBase64(data);
+      let result: { cipherHex: string; tagHex: string };
+      try {
+        result = await keyCustody.encryptContent(handle, dataB64, ivHex, aadHex);
+      } catch (e) {
+        throw new Error(`Native-Inhalts-Verschlüsselung fehlgeschlagen (kein JS-Fallback unter nativer Key-Custody): ${(e as Error)?.message ?? e}`);
+      }
+      return {
+        encryptedData: backendPrefix + result.cipherHex,
+        iv: ivHex,
+        mac: result.tagHex,
+      };
+    }
+
     const keyHex = keyCustody.resolve(handle);
     // Backend wählen: XChaCha20 (native) > AES-CBC+HMAC (pure-JS fallback).
     // S3: a non-XChaCha backend means the native module is absent → silent JS-crypto
@@ -1094,6 +1178,29 @@ export class SecureCryptoService {
    * H2: aadContext muss exakt dem beim Verschlüsseln verwendeten Kontext entsprechen.
    */
   static async decryptDataWithHandle(encryptedData: string, iv: string, mac: string, handle: string, aadContext: string = ''): Promise<string> {
+    // R1 (native custody): decrypt by handle in secure memory. Only XChaCha20 (0x01) is readable —
+    // on a real device every content blob is 0x01 (the JS AES-CBC/0x02 and legacy 0x03 paths can only
+    // be WRITTEN under the JS backing, which never runs on device). A non-0x01 prefix is rejected
+    // rather than silently routed back into JS crypto with a raw key. A failed AEAD throws (recryptBlob
+    // relies on that to detect "not under this key").
+    if (keyCustody.isNative) {
+      if (encryptedData.length < 2) {
+        throw new Error('Entschlüsselung fehlgeschlagen');
+      }
+      const prefix = encryptedData.substring(0, 2);
+      if (parseInt(prefix, 16) !== BACKEND_XCHACHA) {
+        throw new Error('Native Key-Custody liest nur XChaCha20-Inhalte (0x01); Legacy-0x02/0x03-Inhalte sind auf dem Gerät nicht lesbar.');
+      }
+      const rawCiphertext = encryptedData.substring(2);
+      const aadHex = prefix + this.utf8ToHex(aadContext);
+      try {
+        const b64 = await keyCustody.decryptContent(handle, rawCiphertext, iv, mac, aadHex);
+        return this.base64ToUtf8(b64);
+      } catch {
+        throw new Error('Entschlüsselung fehlgeschlagen');
+      }
+    }
+
     const keyHex = keyCustody.resolve(handle);
     try {
       // Lese Backend-ID aus Header (erste 2 hex Zeichen)
@@ -1289,7 +1396,22 @@ export class SecureCryptoService {
       keyCustody.close(this.__masterHandle); // zero + drop the previous key material
       this.__masterHandle = null;
     }
-    if (hex) this.__masterHandle = keyCustody.register(hex);
+    // Documented one-time raw-key touch (audit B1/B5): vault creation / migration / rotation hand a
+    // freshly generated or just-decrypted master to custody. On the native backing this is the only
+    // place a raw key crosses the bridge; in steady state the key never re-enters JS.
+    if (hex) this.__masterHandle = keyCustody.registerRawKey(hex);
+  }
+
+  /**
+   * Adopt a master handle that custody already minted natively (openVault / unwrapVaultWithKek) —
+   * the master was unwrapped in secure memory and never materialised as a JS value (audit R3).
+   * Closes the previous handle. Used only on the native backing.
+   */
+  private static setMasterHandle(handle: string | null): void {
+    if (this.__masterHandle && this.__masterHandle !== handle) {
+      keyCustody.close(this.__masterHandle);
+    }
+    this.__masterHandle = handle;
   }
 
   // MAC-Key Cache: deterministisch ableitbar pro Master-Key, daher safely cacheable
@@ -1869,9 +1991,16 @@ export class SecureCryptoService {
     fileKey: string,
     masterHandle: string
   ): Promise<{ encryptedKey: string; iv: string; mac: string; createdAt: string }> {
-    const masterKeyHex = keyCustody.resolve(masterHandle);
     const iv = await this.generateSecureBytes(this.CBC_IV_LENGTH);
     const ivHex = this.bufferToHex(iv);
+    // R2 (native custody): EtM-wrap the file key under the master handle in secure memory. The CBC
+    // plaintext bytes are the ASCII of the file-key hex string (matches aesCbcEncryptRaw's CryptoJS
+    // UTF-8 treatment) — passed as hex(utf8(fileKey)). Byte-identical wire format.
+    if (keyCustody.isNative) {
+      const w = await keyCustody.wrapKey(masterHandle, ivHex, this.utf8ToHex(fileKey));
+      return { encryptedKey: w.ctHex, iv: ivHex, mac: w.macHex, createdAt: new Date().toISOString() };
+    }
+    const masterKeyHex = keyCustody.resolve(masterHandle);
     const result = await this.aesCBCEncrypt(fileKey, masterKeyHex, ivHex);
     return {
       encryptedKey: result.encryptedData,
@@ -1889,6 +2018,10 @@ export class SecureCryptoService {
     encryptedKey: { encryptedKey: string; iv: string; mac: string; createdAt?: string },
     masterHandle: string
   ): Promise<string> {
+    // R2 (native custody): EtM-unwrap the file key under the master handle; returns the file-key string.
+    if (keyCustody.isNative) {
+      return keyCustody.unwrapKey(masterHandle, encryptedKey.iv, encryptedKey.encryptedKey, encryptedKey.mac);
+    }
     return this.aesCBCDecrypt(
       encryptedKey.encryptedKey,
       encryptedKey.iv,
@@ -1923,13 +2056,17 @@ export class SecureCryptoService {
     createdAt: string;
   }> {
     try {
-      const masterKeyHex = keyCustody.resolve(this.currentMasterHandle());
-
-      // Key wrapping uses aesCBCEncrypt which uses CBC mode - requires 16-byte IV
+      // Key wrapping uses CBC mode - requires 16-byte IV
       const iv = await this.generateSecureBytes(this.CBC_IV_LENGTH);
       const ivHex = this.bufferToHex(iv);
 
-      // AES-256-CBC Verschlüsselung mit Backend Selection
+      // R2 (native custody): EtM-wrap by handle in secure memory; else JS AES-CBC. Same wire format.
+      if (keyCustody.isNative) {
+        const w = await keyCustody.wrapKey(this.currentMasterHandle(), ivHex, this.utf8ToHex(fileKey));
+        return { encryptedKey: w.ctHex, iv: ivHex, mac: w.macHex, createdAt: new Date().toISOString() };
+      }
+
+      const masterKeyHex = keyCustody.resolve(this.currentMasterHandle());
       const result = await this.aesCBCEncrypt(fileKey, masterKeyHex, ivHex);
 
       return {
@@ -1956,9 +2093,14 @@ export class SecureCryptoService {
     createdAt?: string;
   }): Promise<string> {
     try {
-      const masterKeyHex = keyCustody.resolve(this.currentMasterHandle());
+      // R2 (native custody): EtM-unwrap by handle; else JS AES-CBC. Returns the file-key string.
+      if (keyCustody.isNative) {
+        return await keyCustody.unwrapKey(
+          this.currentMasterHandle(), encryptedKey.iv, encryptedKey.encryptedKey, encryptedKey.mac
+        );
+      }
 
-      // Entschlüsseln mit backend-selection (XChaCha20 > AES-CBC+HMAC > CryptoJS)
+      const masterKeyHex = keyCustody.resolve(this.currentMasterHandle());
       return await this.aesCBCDecrypt(encryptedKey.encryptedKey, encryptedKey.iv, encryptedKey.mac, masterKeyHex);
     } catch {
       throw new Error('Konnte File-Key nicht entschlüsseln');
