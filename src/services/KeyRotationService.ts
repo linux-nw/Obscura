@@ -91,23 +91,27 @@ export class KeyRotationService {
     const unlocked = await SecureCryptoService.unlock(currentPassphrase);
     if (!unlocked) throw new Error('Falsches Passwort — Rotation abgebrochen');
 
-    const oldMasterKey = await SecureCryptoService.getMasterKey();
-    if (!oldMasterKey) throw new Error('Kein Master-Key im Speicher');
+    // L3 Phase 2: the master key is addressed by a custody handle, never a raw value.
+    const oldHandle = SecureCryptoService.currentMasterHandle();
 
     const newMasterKeyBuf = await SecureCryptoService.generateSecureBytes(32);
     const newMasterKeyHex = SecureCryptoService.bufferToHex(newMasterKeyBuf);
+    const newHandle = SecureCryptoService.registerKeyHandle(newMasterKeyHex);
 
     // Wrap the new master key with the OLD master key so a resume can retrieve it
     // while the OLD master is still the installed one.
-    const newMasterWrapped = await SecureCryptoService.encryptFileKeyWith(newMasterKeyHex, oldMasterKey);
+    const newMasterWrapped = await SecureCryptoService.encryptFileKeyWith(newMasterKeyHex, oldHandle);
 
     const wal: RotationWAL = { newMasterWrapped, startedAt: Date.now() };
     await SecureStore.setItemAsync(WAL_KEY, JSON.stringify(wal));
 
-    await this.migrateContent(oldMasterKey, newMasterKeyHex);
+    await this.migrateContent(oldHandle, newHandle);
 
-    // Commit: install the new master key (wrap with passphrase, update cache), then drop the WAL.
+    // Commit: install the new master key (wrap with passphrase, register the live master
+    // handle — this also closes the old handle). Then drop our migration handle + the WAL.
     await SecureCryptoService.installMasterKey(newMasterKeyHex, currentPassphrase);
+    SecureCryptoService.closeKeyHandle(newHandle);
+    SecureCryptoService.closeKeyHandle(oldHandle);
     await SecureStore.deleteItemAsync(WAL_KEY);
 
     await this.incrementRotationCount();
@@ -124,8 +128,12 @@ export class KeyRotationService {
 
     try {
       const wal = JSON.parse(walStr) as RotationWAL;
-      const currentKey = await SecureCryptoService.getMasterKey();
-      if (!currentKey) return; // not unlocked yet — caller must unlock first
+      let currentHandle: string;
+      try {
+        currentHandle = SecureCryptoService.currentMasterHandle();
+      } catch {
+        return; // not unlocked yet — caller must unlock first
+      }
 
       // W-05: surface a stale WAL. We still resume (per-blob idempotency makes it safe,
       // and finishing is the correct response to an attacker pausing rotation), but the
@@ -137,18 +145,21 @@ export class KeyRotationService {
 
       let newMasterKeyHex: string;
       try {
-        // Succeeds iff currentKey is the OLD master (the WAL was wrapped with it).
-        newMasterKeyHex = await SecureCryptoService.decryptFileKeyWith(wal.newMasterWrapped, currentKey);
+        // Succeeds iff currentHandle is the OLD master (the WAL was wrapped with it).
+        newMasterKeyHex = await SecureCryptoService.decryptFileKeyWith(wal.newMasterWrapped, currentHandle);
       } catch {
-        // currentKey is NOT the old master → commit already happened (content fully
+        // currentHandle is NOT the old master → commit already happened (content fully
         // migrated, master already installed). Just clear the stale WAL.
         await SecureStore.deleteItemAsync(WAL_KEY);
         return;
       }
 
-      // currentKey == old master: finish the migration idempotently, then commit.
-      await this.migrateContent(currentKey, newMasterKeyHex);
+      // currentHandle == old master: finish the migration idempotently, then commit.
+      const newHandle = SecureCryptoService.registerKeyHandle(newMasterKeyHex);
+      await this.migrateContent(currentHandle, newHandle);
       await SecureCryptoService.installMasterKey(newMasterKeyHex, currentPassphrase);
+      SecureCryptoService.closeKeyHandle(newHandle);
+      SecureCryptoService.closeKeyHandle(currentHandle);
       await SecureStore.deleteItemAsync(WAL_KEY);
 
       await this.incrementRotationCount();
@@ -159,10 +170,10 @@ export class KeyRotationService {
     }
   }
 
-  /** Re-encrypts all file + note content from oldKey to newKey (idempotent). */
-  private static async migrateContent(oldKey: string, newKey: string): Promise<void> {
-    await FileManager.reencryptAll(oldKey, newKey);
-    await NotesService.reencryptAll(oldKey, newKey);
+  /** Re-encrypts all file + note content from the old to the new master handle (idempotent). */
+  private static async migrateContent(oldHandle: string, newHandle: string): Promise<void> {
+    await FileManager.reencryptAll(oldHandle, newHandle);
+    await NotesService.reencryptAll(oldHandle, newHandle);
   }
 
   // ─────────────────────────────── Legacy rotation (stub) ───────────────────────────────

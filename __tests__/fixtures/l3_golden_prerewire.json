@@ -1,0 +1,26 @@
+{
+  "note": "L3 pre-rewire golden — DO NOT regenerate after Phase 2. Frozen main-stand blobs.",
+  "masterKeyHex": "a3f1c0de11223344556677889900aabbccddeeff00112233445566778899abcd",
+  "kekHex": "ffeeddccbbaa99887766554433221100112233445566778899aabbccddeeff00",
+  "fileKeyWrap": {
+    "iv": "11223344556677889900aabbccddeeff",
+    "encryptedKey": "56cad5fb6874a548b1b666d3b3703e521fae36c7c7bdc57776a7e876566f4aae33523e3e0cf569f37e38dc91ed071580eddd190bdf75c94ddbbb23e9489543cbf8d0516840643b7c6201745a1f26c7ca",
+    "mac": "514e50f3953e04875a5399dd84e38d51522d5ae63775579eb5b6d5bc68f81fa0",
+    "plaintextHex": "0f1e2d3c4b5a69788796a5b4c3d2e1f0aabbccddeeff00112233445566778899"
+  },
+  "masterBlob": {
+    "iv": "00ffeeddccbbaa998877665544332211",
+    "encryptedKey": "9a66ab34133c87c935d56c9139983451daf1e07b3b375b62127c0ea95c932e92700cf8b84c960edc1d8cf4f6f4a9c276b597fb71469d9aa3717b066badbe815a9cc698f69f0b56b0ad472229c5516c22",
+    "mac": "80f44366e83c03f976f410e081601bd5a516e6884627dd4ba5585260af39f9a0",
+    "plaintextHex": "a3f1c0de11223344556677889900aabbccddeeff00112233445566778899abcd"
+  },
+  "contentXchachaKat": {
+    "source": "draft-irtf-cfrg-xchacha-03 §A.3.1 (== XChaCha20BridgeTest)",
+    "keyHex": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+    "nonceHex": "404142434445464748494a4b4c4d4e4f5051525354555657",
+    "aadHex": "50515253c0c1c2c3c4c5c6c7",
+    "plaintextUtf8": "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.",
+    "ctHex": "bd6d179d3e83d43b9576579493c0e939572a1700252bfaccbed2902c21396cbb731c7f1b0b4aa6440bf3a82f4eda7e39ae64c6708c54c216cb96b72e1213b4522f8c9ba40db5d945b11b69b982c1bb9e3f3fac2bc369488f76b2383565d3fff921f9664c97637da9768812f615c68b13b52e",
+    "tagHex": "c0875924c1c7987947deafd8780acf49"
+  }
+}

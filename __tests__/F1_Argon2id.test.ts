@@ -52,11 +52,12 @@ describe('F1: KEK derivation uses Argon2id, never PBKDF2', () => {
 
   test('setup → clearCaches → unlock roundtrip works with Argon2id KEK', async () => {
     await SecureCryptoService.setupMasterKey('FortressX99');
-    const masterKey = (SecureCryptoService as any)._masterKeyCache;
+    // L3 Phase 2: the master key lives behind a custody handle; resolve it via the test seam.
+    const masterKey = SecureCryptoService.__masterKeyHexForTest();
     SecureCryptoService.clearAllCaches();
 
     const ok = await SecureCryptoService.unlock('FortressX99');
     expect(ok).toBe(true);
-    expect((SecureCryptoService as any)._masterKeyCache).toBe(masterKey);
+    expect(SecureCryptoService.__masterKeyHexForTest()).toBe(masterKey);
   }, 60000);
 });

@@ -87,7 +87,7 @@ async function readBackContent(): Promise<{ fileContent: string; noteBody: strin
 
 test('full rotation: content survives, blobs re-encrypted, re-login reads them', async () => {
   await seedVault();
-  const oldMaster = (await SecureCryptoService.getMasterKey())!;
+  const oldMaster = SecureCryptoService.__masterKeyHexForTest()!;
 
   // Snapshot a stored file-content blob to prove it gets re-encrypted.
   const files = await FileManager.getFiles();
@@ -95,7 +95,7 @@ test('full rotation: content survives, blobs re-encrypted, re-login reads them',
 
   await KeyRotationService.performSecureRotation(PASSPHRASE);
 
-  const newMaster = (await SecureCryptoService.getMasterKey())!;
+  const newMaster = SecureCryptoService.__masterKeyHexForTest()!;
   expect(newMaster).not.toBe(oldMaster);
   expect(await KeyRotationService.hasPendingRotation()).toBe(false);
 
@@ -104,7 +104,7 @@ test('full rotation: content survives, blobs re-encrypted, re-login reads them',
   expect(ctAfter).not.toBe(ctBefore);
   const metaAfter = JSON.parse(mockFsStore.get(`/mock/documents/vault/${files[0].name}.meta.enc`)!);
   await expect(
-    SecureCryptoService.decryptDataWith(ctAfter, metaAfter.iv, metaAfter.mac, oldMaster)
+    SecureCryptoService.decryptDataWithHandle(ctAfter, metaAfter.iv, metaAfter.mac, SecureCryptoService.registerKeyHandle(oldMaster))
   ).rejects.toThrow();
 
   // Content still decrypts with the (new) current master.
@@ -116,7 +116,7 @@ test('full rotation: content survives, blobs re-encrypted, re-login reads them',
   SecureCryptoService.clearAllCaches();
   const unlocked = await SecureCryptoService.unlock(PASSPHRASE);
   expect(unlocked).toBe(true);
-  expect(await SecureCryptoService.getMasterKey()).toBe(newMaster);
+  expect(SecureCryptoService.__masterKeyHexForTest()).toBe(newMaster);
 
   rb = await readBackContent();
   expect(rb.fileContent).toBe(FILE_CONTENT_B64);
@@ -125,23 +125,26 @@ test('full rotation: content survives, blobs re-encrypted, re-login reads them',
 
 test('crash mid-rotation (files migrated, notes not, no commit) → resume completes', async () => {
   await seedVault();
-  const oldMaster = (await SecureCryptoService.getMasterKey())!;
+  const oldMaster = SecureCryptoService.__masterKeyHexForTest()!;
 
   // Begin a rotation by hand and crash before committing: WAL written, file blobs
   // migrated, note blobs NOT migrated, master NOT installed (still old).
   const newMasterBuf = await SecureCryptoService.generateSecureBytes(32);
   const newMaster = SecureCryptoService.bufferToHex(newMasterBuf);
-  const newMasterWrapped = await SecureCryptoService.encryptFileKeyWith(newMaster, oldMaster);
+  // L3 Phase 2: content migration is addressed by custody handles, not raw hex keys.
+  const oldHandle = SecureCryptoService.registerKeyHandle(oldMaster);
+  const newHandle = SecureCryptoService.registerKeyHandle(newMaster);
+  const newMasterWrapped = await SecureCryptoService.encryptFileKeyWith(newMaster, oldHandle);
   await secureStore.setItemAsync(WAL_KEY, JSON.stringify({ newMasterWrapped, startedAt: Date.now() }));
-  await FileManager.reencryptAll(oldMaster, newMaster); // files now under new master
+  await FileManager.reencryptAll(oldHandle, newHandle); // files now under new master
   // notes intentionally left under old master; no installMasterKey → cache still old
 
-  expect(await SecureCryptoService.getMasterKey()).toBe(oldMaster);
+  expect(SecureCryptoService.__masterKeyHexForTest()).toBe(oldMaster);
 
   // Resume after unlock finishes notes, installs the new master, clears the WAL.
   await KeyRotationService.resumeRotationIfNeeded(PASSPHRASE);
 
-  expect(await SecureCryptoService.getMasterKey()).toBe(newMaster);
+  expect(SecureCryptoService.__masterKeyHexForTest()).toBe(newMaster);
   expect(await KeyRotationService.hasPendingRotation()).toBe(false);
 
   const rb = await readBackContent();
@@ -150,7 +153,7 @@ test('crash mid-rotation (files migrated, notes not, no commit) → resume compl
 
   // Re-running resume is a harmless no-op (WAL already gone).
   await KeyRotationService.resumeRotationIfNeeded(PASSPHRASE);
-  expect(await SecureCryptoService.getMasterKey()).toBe(newMaster);
+  expect(SecureCryptoService.__masterKeyHexForTest()).toBe(newMaster);
 }, 120000);
 
 test('stale WAL after commit → resume clears it, content intact', async () => {
@@ -158,20 +161,20 @@ test('stale WAL after commit → resume clears it, content intact', async () => 
 
   // Complete a real rotation first.
   await KeyRotationService.performSecureRotation(PASSPHRASE);
-  const committedMaster = (await SecureCryptoService.getMasterKey())!;
+  const committedMaster = SecureCryptoService.__masterKeyHexForTest()!;
 
   // Simulate a crash AFTER install but BEFORE the WAL was deleted: a WAL whose
   // newMasterWrapped was wrapped with some OLD key the current master cannot unwrap.
   const bogusOld = 'b'.repeat(64);
   const phantomNew = 'c'.repeat(64);
-  const newMasterWrapped = await SecureCryptoService.encryptFileKeyWith(phantomNew, bogusOld);
+  const newMasterWrapped = await SecureCryptoService.encryptFileKeyWith(phantomNew, SecureCryptoService.registerKeyHandle(bogusOld));
   await secureStore.setItemAsync(WAL_KEY, JSON.stringify({ newMasterWrapped, startedAt: Date.now() }));
 
   await KeyRotationService.resumeRotationIfNeeded(PASSPHRASE);
 
   // WAL cleared, master unchanged, content still readable.
   expect(await KeyRotationService.hasPendingRotation()).toBe(false);
-  expect(await SecureCryptoService.getMasterKey()).toBe(committedMaster);
+  expect(SecureCryptoService.__masterKeyHexForTest()).toBe(committedMaster);
   const rb = await readBackContent();
   expect(rb.fileContent).toBe(FILE_CONTENT_B64);
   expect(rb.noteBody).toBe(NOTE_BODY);
@@ -179,11 +182,11 @@ test('stale WAL after commit → resume clears it, content intact', async () => 
 
 test('stale WAL (>24h) is warned about, then resumed (W-05)', async () => {
   await seedVault();
-  const oldMaster = (await SecureCryptoService.getMasterKey())!;
+  const oldMaster = SecureCryptoService.__masterKeyHexForTest()!;
 
   const newMasterBuf = await SecureCryptoService.generateSecureBytes(32);
   const newMaster = SecureCryptoService.bufferToHex(newMasterBuf);
-  const newMasterWrapped = await SecureCryptoService.encryptFileKeyWith(newMaster, oldMaster);
+  const newMasterWrapped = await SecureCryptoService.encryptFileKeyWith(newMaster, SecureCryptoService.registerKeyHandle(oldMaster));
   // WAL started 25h ago.
   await secureStore.setItemAsync(WAL_KEY, JSON.stringify({
     newMasterWrapped, startedAt: Date.now() - 25 * 60 * 60 * 1000,
@@ -196,7 +199,7 @@ test('stale WAL (>24h) is warned about, then resumed (W-05)', async () => {
   warnSpy.mockRestore();
 
   // Resume still completed the rotation (per-blob idempotency makes it safe).
-  expect(await SecureCryptoService.getMasterKey()).toBe(newMaster);
+  expect(SecureCryptoService.__masterKeyHexForTest()).toBe(newMaster);
   expect(await KeyRotationService.hasPendingRotation()).toBe(false);
   const rb = await readBackContent();
   expect(rb.fileContent).toBe(FILE_CONTENT_B64);
@@ -205,13 +208,13 @@ test('stale WAL (>24h) is warned about, then resumed (W-05)', async () => {
 
 test('wrong passphrase aborts rotation, nothing changed', async () => {
   await seedVault();
-  const oldMaster = (await SecureCryptoService.getMasterKey())!;
+  const oldMaster = SecureCryptoService.__masterKeyHexForTest()!;
 
   await expect(
     KeyRotationService.performSecureRotation('definitely-wrong')
   ).rejects.toThrow();
 
-  expect(await SecureCryptoService.getMasterKey()).toBe(oldMaster);
+  expect(SecureCryptoService.__masterKeyHexForTest()).toBe(oldMaster);
   expect(await KeyRotationService.hasPendingRotation()).toBe(false);
   const rb = await readBackContent();
   expect(rb.fileContent).toBe(FILE_CONTENT_B64);

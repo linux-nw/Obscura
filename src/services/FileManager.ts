@@ -431,7 +431,7 @@ class SecureFileManager {
    * Master-Key (Key-Rotation). Pro Blob idempotent via CryptoService.recryptBlob,
    * daher crash-sicher wiederholbar.
    */
-  static async reencryptAll(oldKey: string, newKey: string): Promise<void> {
+  static async reencryptAll(oldHandle: string, newHandle: string): Promise<void> {
     await this.initialize();
     const files = await FileSystem.readDirectoryAsync(this.VAULT_DIR);
     const metaFiles = files.filter(f => f.endsWith('.meta.enc'));
@@ -449,12 +449,12 @@ class SecureFileManager {
       const v = meta.version ?? 1;
       const newContent = await CryptoService.recryptBlob(
         { data: contentData, iv: meta.iv, mac: meta.mac },
-        oldKey,
-        newKey,
+        oldHandle,
+        newHandle,
         `${fid}:content:v${v}`
       );
-      const newOriginalName = await CryptoService.recryptBlob(meta.originalName, oldKey, newKey, `${fid}:name:v${v}`);
-      const newType = await CryptoService.recryptBlob(meta.type, oldKey, newKey, `${fid}:type:v${v}`);
+      const newOriginalName = await CryptoService.recryptBlob(meta.originalName, oldHandle, newHandle, `${fid}:name:v${v}`);
+      const newType = await CryptoService.recryptBlob(meta.type, oldHandle, newHandle, `${fid}:type:v${v}`);
 
       // Inhalt zuerst, dann Metadatei schreiben (per-Blob-Idempotenz macht die
       // Reihenfolge unkritisch — ein Abbruch dazwischen wird sauber resümiert).

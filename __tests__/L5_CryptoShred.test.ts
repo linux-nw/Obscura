@@ -36,7 +36,8 @@ describe('Layer 5: vault-level crypto-shredding', () => {
     await SecureCryptoService.deleteEncryptionKey();
 
     // No key anywhere → the blob is dead, regardless of any flash residue.
-    expect(await SecureCryptoService.getMasterKey()).toBeNull();
+    // L3 Phase 2: getMasterKey() is gone (throws); the locked state is "no master handle".
+    expect(SecureCryptoService.__masterKeyHexForTest()).toBeNull();
     await expect(
       SecureCryptoService.decryptData(encryptedData, iv, mac, 'f1:content'),
     ).rejects.toThrow();

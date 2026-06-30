@@ -726,7 +726,7 @@ named residuals.
 |-------|--------|----------------|-------------------------|
 | 1 UI leakage & `FLAG_SECURE` | Done (enforcing line confirmed) | `MainActivity.kt:28` native unconditional; no runtime disabler; `dumpsys` host-unverifiable | Framebuffer read with root |
 | 2 IME / keyboard | Done (all credential fields + note content) | enforcing field props (`AuthScreen:380`, `SettingsScreen:998/1027/1086`, `NoteEditor`); `tsc` | Malicious **system** IME / root keylogger |
-| 3 Master key out of JS heap | **Partial** | `__tests__/L3_KeyZeroing`; native `androidTest`; §15.5 | raw key transits JS heap as immutable hex string per op; native zero is `fill(0)` not `mlock`/`memzero` |
+| 3 Master key out of JS heap | **Done** (**device-verified** 6/6, S22+, arm64-v8a; documented limits in §15.5) | `__tests__/L3_KeyZeroing`; `L3Phase4CeremonyTest` (4a–4f on-device); `NativeKeyCustodyModule.kt`; `KeyCustody.ts` native backing; §15.5 | Plaintext still crosses bridge per op (L3 protects the key, not each plaintext byte); per-op lazysodium `byte[]` transient; one-time master touch at creation/rotation/legacy-import (B1/B5/migrateLegacy) |
 | 4 Device integrity / attestation | Done (verdict from real KeyInfo; hardcoded-`true` wart fixed) | `HardwareKeystoreService.ts:98`→`securityLevelOf`; `HardwareKeystoreAttestTest.kt` (on-device) | No hardware backing → SOFTWARE (warned) |
 | 5 Crypto-shredding | Done (test-pinned) | `__tests__/L5_CryptoShred` (post-shred decrypt `rejects.toThrow`); `F2_CacheCleanup`; FileViewer per-close temp delete | NAND wear-levelling physical residue |
 | 6 Duress / coercion | Done (**device-verified**: decoy read+write, persistence, isolation) | `__tests__/L6_DecoyEncryption` + `L6_DecoyWrite` (write/cross-vault/no-shared-counter); on-device §15.6; §15.2 | Hidden-vault *existence* stays provable; decoy login bumps lock-counter A (§15.6 follow-up) |
@@ -794,7 +794,7 @@ accumulated blobs across many cross-build reinstalls; the most likely cause is o
 under a superseded master key. Not a save-error, not from the decoy path, did not block verification —
 flagged for a separate look on a clean install rather than buried.
 
-**L3** stays honestly **Partial** (§15.5) — not upgraded. **L4 SOFTWARE-fallback** branch remains
+**L3** upgraded to **Done** in L3 Phase 2b (§15.5) — limits documented. **L4 SOFTWARE-fallback** branch remains
 device-unverifiable on this hardware (the S22 has StrongBox + TEE; it cannot produce a software-only
 key to exercise that path). **AAR checksum pin** deferred (below).
 
@@ -807,30 +807,67 @@ was produced; fabricating one was rejected. Realistic alternative (deferred, inf
 vendor `lazysodium-android` + `jna` into `android/local-maven` with committed checksums, matching the
 existing react/hermes pinning pattern.
 
-### 15.5 Layer 3 — why it is Partial, not Done
+### 15.5 Layer 3 — Done (Phase 2b), with documented limits
 
-L3's claim is "master key out of the JS heap". Precisely measured, the **long-lived** copy is handled
-well but the **transient** copies are not, and the native zeroing is weaker than `libsodium`'s.
+L3's claim is "master key out of the JS heap". Phase 2b closes the residuals that kept it Partial:
+the master key now lives exclusively in a `sodium_malloc`-guarded native region (`NativeKeyCustody.kt`)
+addressed by an opaque 128-bit handle; all content AEAD, file-key EtM-wrap, passphrase unlock,
+passphrase change, and biometric unlock route through that handle without the raw key returning to JS.
 
-- **Does raw key material exist in the JS heap?** Yes. (a) The canonical cache `__mkBytes` is a
-  `Uint8Array` that lives the whole unlocked session by design and is `fill(0)`-zeroed on lock
-  (`CryptoService.ts:1251`) — this is the *good* part, genuinely zeroable, not theater. (b) But the
-  string-typed accessor `get _masterKeyCache` (`:1248`) rebuilds a fresh 64-char **hex string** on
-  every read, and `getMasterKey()` (`:694`) returns it on every encrypt/decrypt. Strings are
-  immutable in Hermes — those copies cannot be wiped, only dropped for a GC that is not deterministic.
-- **Do `sodium_mlock` / `sodium_memzero` fire?** No. The native side uses Kotlin `ByteArray.fill(0)`
-  (`RNFileVaultModule.kt:58,106,116,167`), which is best-effort: no `mlock` (key pages may be swapped
-  to disk) and the JVM GC may have already copied the array (compaction) leaving residue. The comment
-  does not over-claim sodium here — but the protection is below what the layer name implies.
-- **Does auto-lock zero the native buffer?** There is no long-lived native key buffer to zero — the
-  native module is stateless per-op (key passed in, `fill(0)`'d after). Lock zeroes the JS `Uint8Array`.
-- **Quantified raw-key JS-heap lifetime:** ≈ the entire unlocked session for the `Uint8Array` (intended),
-  **plus** one immutable hex-string copy per crypto op lingering until the next GC. Not ~0.
-- **What 0-JS-lifetime would require:** keep the key only inside native (mlock'd libsodium buffer),
-  expose an opaque handle across the bridge, and perform all AEAD natively without ever returning the
-  hex key to JS. The current architecture returns the hex key to JS and orchestrates crypto there, so
-  the key structurally must enter the JS heap. Closing this is a crypto-core rearchitecture — out of
-  scope for endpoint hardening, and deliberately **not** attempted here.
+**What Phase 2b does:**
+
+- `NativeKeyCustody` (`android/app/src/main/java/com/filevault/app/modules/NativeKeyCustody.kt`):
+  the key lives in a `sodium_malloc`'d guarded region (guard pages + canary + `sodium_memzero` on
+  `sodium_free`). `withKey` materialises the key as a short-lived `byte[]` transient for each
+  lazysodium call and `sodium_memzero`s it immediately after (not GC-dependent).
+- `NativeKeyCustodyModule` (`…/NativeKeyCustodyModule.kt`): `@ReactMethod` bridge. The only method
+  that accepts a raw key is `registerRawKey` (one-time touch at creation/rotation — see B1/B5 below).
+  Every other method accepts/returns an opaque handle string.
+- `KeyCustody.ts` native backing (`NativeBackedKeyCustodyImpl`): `has()` stays synchronous via a
+  JS-side `live: Set<string>` shadow. Every async bridge op awaits a per-handle readiness promise
+  before touching the bridge, so a failed native store surfaces as a hard error, not silent wrong-key.
+- `CryptoService.ts`: all R1/R2/R3 resolve() seams eliminated. The JS AES-CBC/0x02 downgrade and
+  the legacy 0x03 read path exist only under `JsBackedKeyCustody` (never loaded on device). On device,
+  a non-XChaCha prefix in `decryptDataWithHandle` is a hard error, never routed back into JS crypto.
+
+**Three documented limits (not defects — inherent architecture boundaries):**
+
+1. **Plaintext crosses the bridge per op.** L3 protects the *key*, not each plaintext byte. Every
+   `encryptContent` / `decryptContent` call passes the plaintext (as Base64) or ciphertext across the
+   bridge. This is inherent: the application logic (note editing, file I/O) runs in JS. Eliminating
+   this would require moving the entire application into native — out of scope.
+
+2. **Per-op `byte[]` transient at the lazysodium boundary.** `withKey` reads the key out of the
+   `sodium_malloc` region into a short-lived JVM `byte[]`, passes it to the lazysodium JNI layer, and
+   `sodium_memzero`s it immediately after. The transient never crosses the bridge and is far shorter-lived
+   than the old session-long JS `Uint8Array`, but it is not zero-duration: a native memory scrape
+   within a single JNI call could theoretically capture it. This is the same residual the
+   `RNFileVaultModule` already has — `sodium_malloc` confines the long-lived copy; the transient cannot
+   be avoided without patching lazysodium to accept a pointer instead of a `byte[]`.
+
+3. **One-time raw-key touch at vault creation / rotation / legacy-import (B1/B5/migrateLegacy).**
+   `registerRawKey` (`NativeKeyCustodyModule`) is the only bridge method that accepts a raw key hex
+   string. It is called exactly once per vault lifecycle event: `setupMasterKey` (B1 — new vault),
+   `installMasterKey` / key-rotation (B5), and `migrateLegacy` (one-time legacy-import). In
+   steady-state operation (every content encrypt/decrypt and file-key wrap/unwrap after first unlock)
+   no raw key crosses the bridge. The claim is "not 'never' — 'not in steady state'", which is
+   documented in the audit table (R1/R2/R3 eliminated; B1/B5/legacy remaining) and enforced by the
+   type system: `NativeBackedKeyCustody` has no `resolve()`.
+
+**Verification — Phase 4 device ceremony (2026-06-30, SM-S906B Galaxy S22+, arm64-v8a):**
+
+`L3Phase4CeremonyTest.kt` — 6 tests, 0 failures, time 0.38 s:
+
+| Test | Scenario | Assertion |
+|------|----------|-----------|
+| 4a `test4a_openVault_passphraseUnlock` | Argon2id KEK + EtM-unwrap native → handle | AEAD via handle == direct AEAD with raw master (byte-identical); wrong passphrase → `SecurityException` |
+| 4b `test4b_contentAeadRoundtrip` | `encryptWithHandle` / `decryptWithHandle` | Plaintext round-trips; tag flip → `SecurityException` |
+| 4c `test4c_fileKeyWrapRoundtrip` | `wrapWithHandle` / `unwrapWithHandle` | File-key string recovered; MAC tamper → `SecurityException` |
+| 4d `test4d_changePassphraseRoundtrip` | `rewrapVault` + re-open with new passphrase | Cross-handle decrypt succeeds (same master); old passphrase against new blob → `SecurityException` |
+| 4e `test4e_biometricUnwrapVaultWithKek` | `unwrapVaultWithKek` (no Argon2id) | AEAD via handle byte-identical; wrong KEK → `SecurityException` |
+| 4f `test4f_lockAndRelockAndCloseAll` | `closeVault` + `closeAll` + `adoptRawKey` | `hasHandle` false after close; op on closed handle → `IllegalArgumentException`; idempotent; `closeAll` clears multiple handles |
+
+The three 2b-new methods (`adoptRawKey`, `unwrapVaultWithKek`, `rewrapVault`) ran natively for the first time in this ceremony. Prior native runs covered Phase 1a (parity KATs) and Phase 1b (handle/openVault/close); 4d and 4e had no prior native execution.
 
 ---
 
@@ -883,3 +920,15 @@ well but the **transient** copies are not, and the native zeroing is weaker than
 | Bridge | High | New `androidTest/RNFileVaultBridgeRoundtripTest.kt` drives `RNFileVaultModule.encrypt`→`decrypt` through the real bridge (`ReadableMap`/`Promise`), covering the marshalling the primitive KATs skip (Base64/hex/detached-tag-split/AAD), with empty/1-byte/>1 MiB roundtrips, a Poly1305 tamper case and an AAD-mismatch case. Verified **`tests=15, failures=0`** on x86_64 (2026-06-26) — the §13.2 "end-to-end JNI glue" gap is closed on x86_64. |
 | arm64 | High | arm64-v8a **on-device VERIFIED** on physical device Samsung SM-S906B (Galaxy S22+, arm64-v8a), Android 16, lazysodium 5.1.0, 2026-06-26: `./gradlew :app:connectedDebugAndroidTest -PreactNativeArchitectures=arm64-v8a` → `tests=15, failures=0, errors=0` (9 native KATs + 6 bridge cases), byte-identical to the published vectors and the JS constants on native arm64. Cross-impl byte-equality now established on **both** ABIs. §13.1/§13.2 set to VERIFIED. (Earlier x86_64-emulator arm64-translation attempt failed at startup — RN SoLoader resolves libs by the emulator's primary ABI x86_64; resolved by running on real arm64 hardware where the primary ABI is arm64-v8a.) |
 | CI | — | `android-kat.yml` runs the suite on an x86_64 emulator. An arm64 emulator matrix is deliberately **not** added — infeasible on GitHub-hosted runners (`ubuntu-24.04-arm` has no `/dev/kvm`; x86_64 runners hit the SoLoader/primary-ABI wall). arm64 is verified by the documented manual on-device run above. |
+
+### Change Log — L3 Phase 2b (Native Key Custody — Done)
+
+| ID | Severity | Fix |
+|----|----------|-----|
+| L3-2b | Critical | **Master key moves to libsodium native secure memory.** `NativeKeyCustody.kt` stores the key in `sodium_malloc`-guarded memory (guard pages + canary + `sodium_memzero` on free) behind an opaque 128-bit handle. Three new methods close the 2a residuals: `adoptRawKey` (B1/B5 one-time bridge touch at creation/rotation), `unwrapVaultWithKek` (biometric B3 path — EtM-unwrap under hardware-stored KEK, no Argon2id), `rewrapVault` (R3 changePassphrase — new KEK derived + master re-wrapped natively, master never returns to JS). |
+| L3-2b | Critical | **`NativeKeyCustodyModule.kt`** — full `@ReactMethod` bridge (12 methods). `registerRawKey` is the only method accepting a raw key; every other method works by handle. Registered in `FileVaultPackage.kt`. |
+| L3-2b | High | **`src/native/NativeKeyCustody.ts`** — typed TypeScript bridge. `isAvailable()` drives module-load backing selection in `KeyCustody.ts`. |
+| L3-2b | High | **`src/services/KeyCustody.ts`** rewritten: two backings chosen once at module load. `NativeBackedKeyCustodyImpl` (device): synchronous `has()` via JS-side `live: Set`; per-handle readiness promise; no `resolve()`. `JsBackedKeyCustodyImpl` (Jest/dev): 2a behaviour retained; the only place AES-CBC/0x02 write path can run. |
+| L3-2b | High | **`src/services/CryptoService.ts`** — R1/R2/R3 `resolve()` seams eliminated on the native path. `encryptDataWithHandle`/`decryptDataWithHandle`: native branch routes through `keyCustody.encryptContent/decryptContent`; non-0x01 prefix on native is a hard error, no JS fallback. `unlockKEK` → `openVaultInstall`; `loadMasterKeyForBiometric` → `unwrapVaultWithKekInstall`; `changePassphrase` → `rewrapVault`. `setMasterHandle` adopts natively-minted handles without a raw-key crossing. |
+| L3-2b | — | **Device ceremony 2026-06-30** — `L3Phase4CeremonyTest` (6 tests) on SM-S906B (Galaxy S22+, arm64-v8a): **6/6 PASS, 0.38 s**. First native execution of `adoptRawKey`, `unwrapVaultWithKek`, `rewrapVault`. §15.5 updated: L3 status → **Done** (three documented limits: plaintext-per-op bridge crossing inherent; lazysodium `byte[]` transient; one-time B1/B5/legacy master touch). |
+| L3-2b | — | `__tests__/L3_KeyZeroing.test.ts` — `resolve()` calls guarded by `JsBackedKeyCustody` cast (Jest-only seam; `NativeBackedKeyCustody` has no `resolve()`). `tsc --noEmit` exit 0; Jest 27 suites / 115 tests green. |

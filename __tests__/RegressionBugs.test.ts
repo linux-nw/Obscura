@@ -38,8 +38,8 @@ describe('R-A: clearAllCaches() does NOT delete SecureStore keys', () => {
     expect(secureStore._store.has('filevault_master_iv')).toBe(true);
     expect(secureStore._store.has('filevault_master_mac')).toBe(true);
 
-    // Only in-memory cache cleared
-    expect((SecureCryptoService as any)._masterKeyCache).toBeNull();
+    // Only in-memory cache cleared (L3 Phase 2: master handle closed → no resolvable key)
+    expect(SecureCryptoService.__masterKeyHexForTest()).toBeNull();
     expect((SecureCryptoService as any).macKeyCache.size).toBe(0);
   }, 60000);
 
@@ -49,7 +49,7 @@ describe('R-A: clearAllCaches() does NOT delete SecureStore keys', () => {
 
     const unlocked = await SecureCryptoService.unlock('RegressionTest!');
     expect(unlocked).toBe(true);
-    expect((SecureCryptoService as any)._masterKeyCache).not.toBeNull();
+    expect(SecureCryptoService.__masterKeyHexForTest()).not.toBeNull();
   }, 60000);
 });
 
