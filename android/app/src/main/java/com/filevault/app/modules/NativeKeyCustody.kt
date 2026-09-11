@@ -6,6 +6,7 @@ import com.sun.jna.NativeLong
 import com.sun.jna.Pointer
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.locks.ReentrantReadWriteLock
 
 /**
  * NativeKeyCustody — libsodium secure-memory custody core (L3 Phase 1b).
@@ -40,7 +41,19 @@ object NativeKeyCustody {
 
     private val ls = LazySodiumAndroid(SodiumAndroid())
 
-    private class Session(val keyPtr: Pointer, val len: Int, val mlocked: Boolean)
+    // lock guards keyPtr's lifetime: withKey() holds the read lock while the key is copied
+    // out of the guarded region (many concurrent readers are fine — nothing ever mutates
+    // keyPtr's contents after storeUnder()), closeVault() takes the write lock before
+    // sodium_free'ing it. Without this, a withKey() that already resolved the Session via
+    // session(handle) could race a concurrent closeVault() on the SAME handle: the map
+    // lookup and the pointer read are two separate steps, and sodium_free between them is a
+    // use-after-free (crash, or in principle a read of freed/reused memory). `closed` lets a
+    // reader that loses the race to acquire the lock fail cleanly instead of touching freed
+    // memory once it does get the lock.
+    private class Session(val keyPtr: Pointer, val len: Int, val mlocked: Boolean) {
+        val lock = ReentrantReadWriteLock()
+        @Volatile var closed = false
+    }
 
     private val sessions = ConcurrentHashMap<String, Session>()
 
@@ -228,12 +241,20 @@ object NativeKeyCustody {
     /** Read the key out of the guarded region into a transient that is zeroed after use. */
     private fun <T> withKey(handle: String, block: (ByteArray) -> T): T {
         val s = session(handle)
-        val k = ByteArray(s.len)
-        s.keyPtr.read(0, k, 0, s.len)
+        s.lock.readLock().lock()
         try {
-            return block(k)
+            // Re-check after acquiring the lock: a closeVault() that won the race to the
+            // write lock already freed keyPtr by the time we get here.
+            if (s.closed) throw IllegalArgumentException("invalid or closed handle")
+            val k = ByteArray(s.len)
+            s.keyPtr.read(0, k, 0, s.len)
+            try {
+                return block(k)
+            } finally {
+                ls.sodium.sodium_memzero(k, k.size)
+            }
         } finally {
-            ls.sodium.sodium_memzero(k, k.size)
+            s.lock.readLock().unlock()
         }
     }
 
@@ -320,8 +341,16 @@ object NativeKeyCustody {
     /** memzero + sodium_free (canary-checked) + invalidate. Subsequent ops on the handle throw. */
     fun closeVault(handle: String): Boolean {
         val s = sessions.remove(handle) ?: return false
-        ls.sodium.sodium_mprotect_readwrite(s.keyPtr)
-        ls.sodium.sodium_free(s.keyPtr) // zeroes the guarded region + verifies the canary
+        // Exclusive lock: waits for any withKey() already in flight on this handle to finish
+        // reading before the pointer is freed (see Session's lock comment for the race).
+        s.lock.writeLock().lock()
+        try {
+            s.closed = true
+            ls.sodium.sodium_mprotect_readwrite(s.keyPtr)
+            ls.sodium.sodium_free(s.keyPtr) // zeroes the guarded region + verifies the canary
+        } finally {
+            s.lock.writeLock().unlock()
+        }
         return true
     }
 

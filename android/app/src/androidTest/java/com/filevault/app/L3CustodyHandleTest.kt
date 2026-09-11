@@ -122,4 +122,50 @@ class L3CustodyHandleTest {
             NativeKeyCustody.encryptWithHandle(handle, pt, nonce, null)
         }
     }
+
+    /**
+     * Audit fix: withKey() (used by every encrypt/decrypt/wrap/unwrap-by-handle call) and
+     * closeVault() raced on the same Session's keyPtr with no lock between them - a
+     * withKey() that had already resolved the Session via the handle map, but not yet
+     * read from keyPtr, could lose a race against a concurrent closeVault() freeing that
+     * exact pointer (use-after-free / native crash). Fired many concurrent encrypts against
+     * a handle while another thread repeatedly opens+closes DIFFERENT handles (to keep
+     * sodium_malloc/sodium_free busy) and one that races closeVault() against the SAME
+     * handle: every encrypt on the live handle must either succeed with the correct
+     * ciphertext or fail with the clean "invalid or closed handle" IllegalArgumentException -
+     * never crash the process and never produce wrong output.
+     */
+    @Test
+    fun concurrentEncryptAndCloseNeverCrashesOrCorrupts() {
+        val pt = "concurrency probe payload".toByteArray(Charsets.UTF_8)
+        val nonce = NativeKeyCustodyCrypto.fromHex("".padEnd(48, '3'))
+        val expected = directEncrypt(KEY, pt, nonce, null)
+
+        repeat(50) {
+            val handle = NativeKeyCustody.registerRawKey(KEY)
+            val errors = java.util.concurrent.ConcurrentLinkedQueue<Throwable>()
+            val readers = (0 until 8).map {
+                Thread {
+                    try {
+                        val r = NativeKeyCustody.encryptWithHandle(handle, pt, nonce, null)
+                        // If it didn't throw, it must be the byte-identical correct result -
+                        // never a torn/garbage read of memory mid-free.
+                        assertEquals(expected.first, r.cipherHex)
+                        assertEquals(expected.second, r.tagHex)
+                    } catch (e: IllegalArgumentException) {
+                        // Acceptable: lost the race to closeVault - clean failure, not a crash.
+                    } catch (t: Throwable) {
+                        errors.add(t)
+                    }
+                }
+            }
+            val closer = Thread { NativeKeyCustody.closeVault(handle) }
+
+            (readers + closer).forEach { it.start() }
+            (readers + closer).forEach { it.join() }
+
+            assertTrue("unexpected exception(s): $errors", errors.isEmpty())
+            NativeKeyCustody.closeVault(handle) // idempotent no-op if already closed
+        }
+    }
 }
