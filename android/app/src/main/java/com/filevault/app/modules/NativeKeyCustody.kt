@@ -70,6 +70,14 @@ object NativeKeyCustody {
 
     // ── store a raw key into a guarded secure-memory region ─────────────────────────
     private fun storeUnder(handle: String, rawKey: ByteArray): String {
+        // A caller-supplied handle (adoptRawKey) that collides with a still-open session
+        // must never be silently overwritten: the old Session's keyPtr would be dropped
+        // from the map without ever being sodium_free'd (a permanent secure-memory leak
+        // of the previous key), AND any other holder of that handle would suddenly start
+        // reading/writing a different key under it (handle hijacking). Reject instead.
+        if (sessions.containsKey(handle)) {
+            throw IllegalArgumentException("handle already in use — refusing to overwrite an open session")
+        }
         val mlocked = ensureInit()
         val ptr = ls.sodium.sodium_malloc(rawKey.size)
             ?: throw IllegalStateException("sodium_malloc returned null")
@@ -115,6 +123,10 @@ object NativeKeyCustody {
         encMasterCtHex: String,
         macHex: String
     ): String {
+        // crypto_pwhash_SALTBYTES == 16; JNA passes this straight to native code with no
+        // bounds check, so a wrong-length salt here is an out-of-bounds read, not just a
+        // derivation error (same class of bug as the nonce/mac checks above).
+        if (kekSalt.size != 16) throw IllegalArgumentException("KEK salt must be 16 bytes (got ${kekSalt.size})")
         ensureInit()
         val kek = ByteArray(32) // Argon2id output == raw 32-byte KEK (matches deriveKEK)
         val rc = ls.sodium.crypto_pwhash(
@@ -178,6 +190,7 @@ object NativeKeyCustody {
         memlimitKB: Long,
         newIv: ByteArray
     ): NativeKeyCustodyCrypto.Wrapped {
+        if (newSalt.size != 16) throw IllegalArgumentException("KEK salt must be 16 bytes (got ${newSalt.size})")
         ensureInit()
         val newKek = ByteArray(32)
         val rc = ls.sodium.crypto_pwhash(
@@ -225,8 +238,13 @@ object NativeKeyCustody {
     // ── content AEAD by handle (XChaCha20-Poly1305 detached, same as RNFileVaultModule) ──
     data class Aead(val cipherHex: String, val tagHex: String)
 
-    fun encryptWithHandle(handle: String, plaintext: ByteArray, nonce: ByteArray, aad: ByteArray?): Aead =
-        withKey(handle) { key ->
+    fun encryptWithHandle(handle: String, plaintext: ByteArray, nonce: ByteArray, aad: ByteArray?): Aead {
+        // JNA passes these byte[] straight through as native pointers with no JVM bounds
+        // check on the C side — a too-short nonce here is an out-of-bounds READ by
+        // libsodium past the end of the JVM array (crash/undefined behavior), not just a
+        // logic error. RNFileVaultModule validates the same shapes; this path didn't.
+        if (nonce.size != 24) throw IllegalArgumentException("Nonce must be 24 bytes (got ${nonce.size})")
+        return withKey(handle) { key ->
             val ct = ByteArray(plaintext.size)
             val mac = ByteArray(16)
             val macLen = LongArray(1)
@@ -240,14 +258,17 @@ object NativeKeyCustody {
             if (r != 0) throw SecurityException("encryptWithHandle failed (rc=$r)")
             Aead(NativeKeyCustodyCrypto.toHex(ct), NativeKeyCustodyCrypto.toHex(mac))
         }
+    }
 
     fun decryptWithHandle(
         handle: String, cipherHex: String, nonceHex: String, tagHex: String, aadHex: String?
-    ): ByteArray =
-        withKey(handle) { key ->
+    ): ByteArray {
+        val nonce = NativeKeyCustodyCrypto.fromHex(nonceHex)
+        val mac = NativeKeyCustodyCrypto.fromHex(tagHex)
+        if (nonce.size != 24) throw IllegalArgumentException("Nonce must be 24 bytes (got ${nonce.size})")
+        if (mac.size != 16) throw IllegalArgumentException("MAC must be 16 bytes (got ${mac.size})")
+        return withKey(handle) { key ->
             val ct = NativeKeyCustodyCrypto.fromHex(cipherHex)
-            val nonce = NativeKeyCustodyCrypto.fromHex(nonceHex)
-            val mac = NativeKeyCustodyCrypto.fromHex(tagHex)
             val aad = if (aadHex.isNullOrEmpty()) null else NativeKeyCustodyCrypto.fromHex(aadHex)
             val pt = ByteArray(ct.size)
             val r = ls.sodium.crypto_aead_xchacha20poly1305_ietf_decrypt_detached(
@@ -260,6 +281,7 @@ object NativeKeyCustody {
             if (r != 0) throw SecurityException("decryptWithHandle failed — integrity check")
             pt
         }
+    }
 
     // ── file-key wrap by handle (AES-CBC+HMAC via the Phase 1a parity-proven primitive) ──
     fun wrapWithHandle(handle: String, iv: ByteArray, plaintext: ByteArray): NativeKeyCustodyCrypto.Wrapped =
