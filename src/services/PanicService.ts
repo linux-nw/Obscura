@@ -6,7 +6,12 @@
  * - Separate Panic PIN
  * - Decoy Vault mit fake Daten
  * - Trigger-Aktionen bei Panik-Eingabe
- * - Selbstzerstörung bei wiederholten Fehlversuchen
+ *
+ * Selbstzerstörung/Sperre nach wiederholten FALSCHEN Passwörtern läuft NICHT hier,
+ * sondern in AuthScreen.checkLoginPass (eigener Zähler, gesteuert über
+ * SettingsService.maxFailedAttempts/maxFailedAttemptsAction) - dieser Service hat
+ * absichtlich keinen eigenen, zweiten Fehlversuchszähler (der wäre nie erreichbar,
+ * da AuthScreen bei falschem Passwort ohnehin schon vorher reagiert).
  */
 
 import * as SecureStore from 'expo-secure-store';
@@ -15,13 +20,12 @@ import { SecureDeleteService } from './SecureDeleteService';
 import { DecoyVaultService } from './DecoyVaultService';
 import { fastPbkdf2 } from './FastPBKDF2';
 import { Argon2idService, Argon2Params } from './Argon2idService';
+import { SettingsService } from './SettingsService';
 
 export interface PanicSettings {
   panicPinHash: string | null;
   panicPinSalt: string | null;
   triggerAction: 'wipe' | 'lock';
-  failedAttempts: number;
-  maxFailedAttempts: number;
 }
 
 export class PanicService {
@@ -31,9 +35,6 @@ export class PanicService {
   // PBKDF2-10k (migrated to Argon2id on the next successful verify).
   private static readonly STORAGE_PANIC_PIN_ALGO = 'filevault_panic_pin_algo';
   private static readonly STORAGE_PANIC_SETTINGS = 'filevault_panic_settings';
-  private static readonly STORAGE_PANIC_FAILED_ATTEMPTS = 'filevault_panic_failed_attempts';
-
-  private static readonly MAX_FAILED_ATTEMPTS = 3;
 
   // S1: Panic PIN is now stretched with Argon2id (memory-hard, same hardness class as the
   // vault KEK), NOT PBKDF2-10k. p=1 matches native libsodium crypto_pwhash (C1); 16-byte
@@ -63,6 +64,14 @@ export class PanicService {
    * Setzt die Panic PIN
    */
   static async setPanicPin(pin: string): Promise<void> {
+    // Consistent with DecoyVaultService.setDecoyPin - both secondary PINs are governed by
+    // the same user-configurable floor, instead of the panic PIN having no length floor
+    // at all at the service level (UI-only enforcement is bypassable by any other caller).
+    const settings = await SettingsService.get();
+    const minLen = settings.minPinLength;
+    if (pin.length < minLen) {
+      throw new Error(`PIN zu kurz — mindestens ${minLen} Zeichen erforderlich`);
+    }
     try {
       // S1: Argon2id-stretched, same as the vault passphrase hardness class.
       const { hash, salt } = await this.computePinHash(pin);
@@ -263,16 +272,12 @@ export class PanicService {
         panicPinHash: null,
         panicPinSalt: null,
         triggerAction: 'lock' as const,
-        failedAttempts: 0,
-        maxFailedAttempts: this.MAX_FAILED_ATTEMPTS,
       };
     } catch {
       return {
         panicPinHash: null,
         panicPinSalt: null,
         triggerAction: 'lock' as const,
-        failedAttempts: 0,
-        maxFailedAttempts: this.MAX_FAILED_ATTEMPTS,
       };
     }
   }
@@ -302,40 +307,6 @@ export class PanicService {
       console.log(`Panic: Trigger action set to ${action}`);
     } catch (error) {
       console.error('Error setting trigger action:', error);
-    }
-  }
-
-  /**
-   * Zählt fehlgeschlagene Versuche hoch
-   */
-  static async incrementFailedAttempts(): Promise<void> {
-    try {
-      const settings = await this.loadSettings();
-      settings.failedAttempts = (settings.failedAttempts || 0) + 1;
-
-      if (settings.failedAttempts >= settings.maxFailedAttempts) {
-        await this.triggerPanicAction();
-        await this.resetFailedAttempts();
-      } else {
-        await this.saveSettings(settings);
-      }
-
-      console.log(`Panic: Failed attempts: ${settings.failedAttempts}/${settings.maxFailedAttempts}`);
-    } catch (error) {
-      console.error('Error incrementing failed attempts:', error);
-    }
-  }
-
-  /**
-   * Setzt fehlgeschlagene Versuche zurück
-   */
-  private static async resetFailedAttempts(): Promise<void> {
-    try {
-      const settings = await this.loadSettings();
-      settings.failedAttempts = 0;
-      await this.saveSettings(settings);
-    } catch (error) {
-      console.error('Error resetting failed attempts:', error);
     }
   }
 

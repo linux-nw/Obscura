@@ -57,6 +57,12 @@ describe('R-A: clearAllCaches() does NOT delete SecureStore keys', () => {
 
 describe('R-B: isAppInitialized() survives clearAllCaches()', () => {
   test('setAppInitialized(true) → clearAllCaches() → still true', async () => {
+    // isAppInitialized() is self-healing (Entsperr-Flow audit fix): it also requires
+    // actual master-key material to be present, not just the flag, so a crash between
+    // key-deletion and the final setAppInitialized(false) of a wipe can never strand the
+    // app "initialized" with no way to unlock. Seed a real vault so this test reflects
+    // the real app sequence (setAppInitialized(true) always follows setupMasterKey()).
+    await SecureCryptoService.setupMasterKey('RegressionTest!');
     await SecureCryptoService.setAppInitialized(true);
     expect(await SecureCryptoService.isAppInitialized()).toBe(true);
 
@@ -64,7 +70,7 @@ describe('R-B: isAppInitialized() survives clearAllCaches()', () => {
 
     // Must still be true — clearAllCaches() must NOT call setAppInitialized(false)
     expect(await SecureCryptoService.isAppInitialized()).toBe(true);
-  });
+  }, 60000);
 });
 
 // ─── R-E: AutoLock-Callback ───────────────────────────────────────────────────

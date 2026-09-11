@@ -19,6 +19,11 @@ import { PanicService } from '../src/services/PanicService';
 const NFC_PASSPHRASE = 'über'; // ü (precomposed)
 const NFD_PASSPHRASE = 'über'; // u + combining umlaut
 
+// Same NFC/NFD distinction, but long enough to clear PanicService.minPinLength (the
+// 4-char strings above predate that floor and are only used for the raw-KDF checks).
+const NFC_PANIC_PIN = 'überüber'; // ü (precomposed) x2, 8 chars
+const NFD_PANIC_PIN = 'überüber'; // u + combining umlaut, x2
+
 const SALT_HEX = 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4'; // 32 hex = 16 bytes
 
 describe('NFC normalization', () => {
@@ -42,11 +47,11 @@ describe('NFC normalization', () => {
 
   test('PanicService: NFC and NFD panic PIN verify correctly', async () => {
     // Set the panic PIN using NFC passphrase.
-    await PanicService.setPanicPin(NFC_PASSPHRASE);
+    await PanicService.setPanicPin(NFC_PANIC_PIN);
 
     // Verify using NFD passphrase (same logical string, different encoding).
     // After .normalize('NFC') inside computePinHash they must match.
-    const result = await PanicService.verifyPanicPin(NFD_PASSPHRASE);
+    const result = await PanicService.verifyPanicPin(NFD_PANIC_PIN);
     expect(result).toBe(true);
-  });
+  }, 60000);
 });

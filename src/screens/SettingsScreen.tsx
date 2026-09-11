@@ -365,6 +365,15 @@ export default function SettingsScreen({
     title: 'Panic-PIN setzen',
     sub: 'Diese PIN löst beim Entsperren eine Sicherheitsaktion aus. Nutze sie in Bedrohungsszenarien.',
     onSubmit: async (pin) => {
+      // AuthScreen checks the panic PIN before the real passphrase — a collision would
+      // mean the normal, correct passphrase silently triggers the panic action instead
+      // of unlocking. Same idea for the decoy PIN (would make the decoy unreachable).
+      if (await SecureCryptoService.unlock(pin)) {
+        throw new Error('Panic-PIN darf nicht mit dem Tresor-Passwort übereinstimmen');
+      }
+      if (await DecoyVaultService.verifyDecoyPin(pin)) {
+        throw new Error('Panic-PIN darf nicht mit der Täusch-PIN übereinstimmen');
+      }
       await PanicService.setPanicPin(pin);
       setHasPanicPin(true);
       Alert.alert('Panic-PIN gesetzt', 'Eingabe dieser PIN beim Login löst die konfigurierte Aktion aus.');
@@ -412,6 +421,14 @@ export default function SettingsScreen({
     title: 'Täusch-PIN setzen',
     sub: 'Eingabe dieser PIN beim Login öffnet den Täusch-Tresor statt des echten Tresors.',
     onSubmit: async (pin) => {
+      // A decoy PIN matching the real passphrase would never be reachable (the real
+      // unlock wins); matching the panic PIN would trigger panic instead of the decoy.
+      if (await SecureCryptoService.unlock(pin)) {
+        throw new Error('Täusch-PIN darf nicht mit dem Tresor-Passwort übereinstimmen');
+      }
+      if (await PanicService.verifyPanicPin(pin)) {
+        throw new Error('Täusch-PIN darf nicht mit der Panic-PIN übereinstimmen');
+      }
       // L6: setDecoyPin derives + caches the guest content key; createFake*() then encrypt
       // the guest content with it. Drop the cached key afterwards so it does not linger in
       // memory during the real session — it is re-derived on an actual guest login.

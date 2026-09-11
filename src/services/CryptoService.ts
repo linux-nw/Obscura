@@ -1872,11 +1872,22 @@ export class SecureCryptoService {
 
   /**
    * Prüft ob App initialisiert wurde
+   *
+   * Selbstheilend: ein Wipe löscht das Master-Key-Material VOR dem Setzen des
+   * app_initialized-Flags (Crypto-Shred zuerst). Ein Crash zwischen diesem Löschen und
+   * dem finalen setAppInitialized(false) würde sonst ein Gerät hinterlassen, das sich
+   * für "initialisiert" hält, aber kein Passwort mehr akzeptieren kann (Schlüssel weg) -
+   * ein permanenter Lockout ohne Weg zurück zum Onboarding. Daher gilt die App nur dann
+   * als initialisiert, wenn zusätzlich zum Flag auch tatsächlich Master-Key-Material
+   * (aktuelles Format oder Legacy) vorhanden ist.
    */
   static async isAppInitialized(): Promise<boolean> {
     try {
       const value = await this.getItemSecure(this.STORAGE_APP_INIT);
-      return value === 'true';
+      if (value !== 'true') return false;
+      const hasMaster = await this.getItemSecure(this.STORAGE_MASTER_ENC);
+      const hasLegacyKey = await this.getItemSecure(this.STORAGE_KEY);
+      return !!(hasMaster || hasLegacyKey);
     } catch {
       return false;
     }
