@@ -12,11 +12,9 @@ class FileVaultPackage : ReactPackage {
         listOf(
             RNFileVaultModule(reactContext),
             NativeKeyCustodyModule(reactContext),
-            Argon2Module(reactContext),
             HardwareKeystoreModule(reactContext),
             DeviceSecurityModule(reactContext),
             IntegrityModule(reactContext),
-            ScreenSecurityModule(reactContext),
         )
 
     override fun createViewManagers(reactContext: ReactApplicationContext): List<ViewManager<*, *>> =
