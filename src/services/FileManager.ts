@@ -3,6 +3,7 @@ import * as Crypto from 'expo-crypto';
 import { SecureCryptoService as CryptoService } from './CryptoService';
 import { writeFileAtomic, cleanupTempFiles } from './fsAtomic';
 import { BlobVersionService } from './BlobVersionService';
+import { SecureDeleteService } from './SecureDeleteService';
 
 /**
  * Interface für die Key-Rotation: Re-Verschlüsselung aller Dateien nach PIN-Änderung
@@ -387,9 +388,13 @@ class SecureFileManager {
     try {
       const info = await FileSystem.getInfoAsync(uri);
       if (info.exists && typeof info.size === 'number' && info.size > 0) {
-        const cap = Math.min(info.size, 2 * 1024 * 1024); // cap overwrite work at 2 MiB
-        // base64 of zero bytes: 'AAAA' encodes 3 zero bytes → length scaled to cap.
-        const zeros = 'A'.repeat(Math.ceil(cap / 3) * 4);
+        // Overwrite the FULL file size — a previous 2 MiB cap left the tail of any
+        // larger plaintext temp untouched, which defeats the point of overwriting.
+        // expo-file-system/legacy has no positional/partial write, so a full-content
+        // write is the only way to overwrite at all; that means the whole zero-fill
+        // string is briefly held in memory, same as the content it replaces.
+        // base64 of zero bytes: 'AAAA' encodes 3 zero bytes → length scaled to size.
+        const zeros = 'A'.repeat(Math.ceil(info.size / 3) * 4);
         await FileSystem.writeAsStringAsync(uri, zeros, { encoding: FileSystem.EncodingType.Base64 });
       }
     } catch {
@@ -521,7 +526,8 @@ class SecureFileManager {
   }
 
   /**
-   * Löscht eine Datei
+   * Löscht eine Datei. Überschreibt Inhalt + Metadaten vor dem eigentlichen
+   * Löschen (SecureDeleteService), statt sie roh per deleteAsync zu entfernen.
    */
   static async deleteFile(fileId: string): Promise<void> {
     try {
@@ -532,8 +538,7 @@ class SecureFileManager {
         throw new Error('Datei nicht gefunden');
       }
 
-      await FileSystem.deleteAsync(`${this.VAULT_DIR}${file.name}`);
-      await FileSystem.deleteAsync(`${this.VAULT_DIR}${file.name}.meta.enc`);
+      await SecureDeleteService.secureDeleteFileById(fileId);
       await BlobVersionService.remove(fileId); // A3: random fileIds are never reused
     } catch (error) {
       console.error('Error deleting file:', error);
