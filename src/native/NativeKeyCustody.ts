@@ -31,6 +31,9 @@ interface NativeKeyCustodyBridge {
   wrapKey(params: { handle: string; ivHex: string; plaintextHex: string }):
     Promise<{ ctHex: string; macHex: string }>;
   unwrapKey(params: { handle: string; ivHex: string; ctHex: string; macHex: string }): Promise<string>;
+  unwrapKeyToHandle(params: {
+    handle: string; ivHex: string; ctHex: string; macHex: string; newHandle: string;
+  }): Promise<string>;
   hasHandle(params: { handle: string }): Promise<boolean>;
   closeVault(params: { handle: string }): Promise<boolean>;
   closeAll(): Promise<void>;
@@ -106,6 +109,18 @@ export async function unwrapKey(
   handle: string, ivHex: string, ctHex: string, macHex: string
 ): Promise<string> {
   return bridge().unwrapKey({ handle, ivHex, ctHex, macHex });
+}
+
+/**
+ * File-key EtM unwrap by handle, stored directly under a caller-minted newHandle instead of
+ * being resolved to JS as a string (audit fix - unwrapKey's plaintext result crossed the
+ * bridge on every real key-rotation-WAL recovery, the one LIVE caller of the native unwrap
+ * path; the per-file-key layer this was originally documented for is unused dead code).
+ */
+export async function unwrapKeyToHandle(
+  handle: string, ivHex: string, ctHex: string, macHex: string, newHandle: string
+): Promise<string> {
+  return bridge().unwrapKeyToHandle({ handle, ivHex, ctHex, macHex, newHandle });
 }
 
 export async function hasHandle(handle: string): Promise<boolean> {

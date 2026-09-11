@@ -239,6 +239,27 @@ class NativeKeyCustodyModule(reactContext: ReactApplicationContext) :
         }
     }
 
+    /**
+     * unwrapKeyToHandle({ handle, ivHex, ctHex, macHex, newHandle }) — like unwrapKey, but the
+     * recovered key is stored directly under the caller-provided newHandle (JS-minted, adopted
+     * the same way registerRawKey adopts one) instead of being resolved to JS as a string.
+     * Resolves newHandle back for symmetry with the Install-style methods.
+     */
+    @ReactMethod
+    fun unwrapKeyToHandle(params: ReadableMap, promise: Promise) {
+        try {
+            val handle    = params.getString("handle") ?: throw IllegalArgumentException("handle required")
+            val ivHex     = params.getString("ivHex") ?: throw IllegalArgumentException("ivHex required")
+            val ctHex     = params.getString("ctHex") ?: throw IllegalArgumentException("ctHex required")
+            val macHex    = params.getString("macHex") ?: throw IllegalArgumentException("macHex required")
+            val newHandle = params.getString("newHandle") ?: throw IllegalArgumentException("newHandle required")
+
+            promise.resolve(NativeKeyCustody.unwrapToHandle(handle, ivHex, ctHex, macHex, newHandle))
+        } catch (e: Exception) {
+            promise.reject("CUSTODY_UNWRAP_ERROR", e.message, e)
+        }
+    }
+
     // ── lifecycle ────────────────────────────────────────────────────────────────────────────
 
     @ReactMethod

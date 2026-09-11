@@ -1946,10 +1946,64 @@ export class SecureCryptoService {
   }
 
   /**
+   * Like decryptFileKeyWith, but for callers that only wanted the raw key back so they could
+   * immediately registerKeyHandle() it anyway (audit fix - that pattern is exactly what let a
+   * newly-rotated master key cross the bridge as a plaintext JS string on every real rotation
+   * resume, via keyCustody.unwrapKey's native path, contradicting KeyCustody's own "raw key
+   * never crosses the bridge" claim). Returns a handle directly in native mode (the key never
+   * touches JS); in JS-backed mode (Jest/dev - no bridge to protect) it decrypts and registers
+   * exactly as before.
+   */
+  static async decryptFileKeyToHandle(
+    encryptedKey: { encryptedKey: string; iv: string; mac: string; createdAt?: string },
+    sourceHandle: string
+  ): Promise<string> {
+    if (keyCustody.isNative) {
+      return keyCustody.unwrapKeyToHandle(sourceHandle, encryptedKey.iv, encryptedKey.encryptedKey, encryptedKey.mac);
+    }
+    const raw = await this.aesCBCDecrypt(
+      encryptedKey.encryptedKey,
+      encryptedKey.iv,
+      encryptedKey.mac,
+      keyCustody.resolve(sourceHandle)
+    );
+    return keyCustody.registerRawKey(raw);
+  }
+
+  /**
    * Installs a specific master key (e.g. after key rotation).
    * Wraps it with the given passphrase and caches it.
    */
   static async installMasterKey(masterKeyHex: string, passphrase: string): Promise<void> {
+    await this.wrapAndStoreMasterKey(passphrase, masterKeyHex);
+    this._masterKeyCache = masterKeyHex;
+  }
+
+  /**
+   * Like installMasterKey, but for a key that already lives behind a custody handle (e.g. from
+   * decryptFileKeyToHandle) instead of as a raw hex string. In native mode this never resolves
+   * the key to JS at all: keyCustody.rewrapVault already re-wraps ANY handle's key under a fresh
+   * passphrase-derived KEK entirely in secure memory (the same primitive changePassphrase uses
+   * for the currently-installed master) - it doesn't care whether that handle happens to be the
+   * currently-installed master, so it works equally well for "make THIS handle the new master".
+   * setMasterHandle takes care of closing whatever handle was previously installed.
+   */
+  static async installMasterKeyFromHandle(handle: string, passphrase: string): Promise<void> {
+    if (keyCustody.isNative) {
+      const newSaltHex = this.bufferToHex(await this.generateSecureBytes(16));
+      const newIvHex = this.bufferToHex(await this.generateSecureBytes(this.CBC_IV_LENGTH));
+      const blob = await keyCustody.rewrapVault(handle, {
+        newPassword: passphrase,
+        newSaltHex,
+        opslimit: this.ARGON2_ITERATIONS,
+        memlimitKB: this.ARGON2_MEMORY_KB,
+        newIvHex,
+      });
+      await this.storeWrappedMaster(newSaltHex, blob.ivHex, blob.ctHex, blob.macHex);
+      this.setMasterHandle(handle);
+      return;
+    }
+    const masterKeyHex = keyCustody.resolve(handle);
     await this.wrapAndStoreMasterKey(passphrase, masterKeyHex);
     this._masterKeyCache = masterKeyHex;
   }

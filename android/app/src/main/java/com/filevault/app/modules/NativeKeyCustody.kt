@@ -292,6 +292,26 @@ object NativeKeyCustody {
     fun unwrapWithHandle(handle: String, ivHex: String, ctHex: String, macHex: String): ByteArray =
         withKey(handle) { key -> NativeKeyCustodyCrypto.unwrapEtm(key, ivHex, ctHex, macHex) }
 
+    /**
+     * EtM file-key unwrap by handle that never returns the recovered key to the caller as
+     * bytes/String - it is stored directly into a SECOND guarded region under a
+     * caller-provided handle (JS-minted, same adopt convention as adoptRawKey), and only
+     * that handle is returned. Closes the audit finding that unwrapKey/unwrapWithHandle's
+     * plaintext-string result crossed the bridge on every use of decryptFileKeyWith's
+     * native path (live in production via the key-rotation WAL recovery flow, not only
+     * the unused per-file-key layer) - contradicting this module's own "raw key never
+     * crosses the bridge" claim for exactly that one call site.
+     */
+    fun unwrapToHandle(handle: String, ivHex: String, ctHex: String, macHex: String, newHandle: String): String {
+        val plain = unwrapWithHandle(handle, ivHex, ctHex, macHex)
+        try {
+            adoptRawKey(newHandle, plain)
+        } finally {
+            ls.sodium.sodium_memzero(plain, plain.size)
+        }
+        return newHandle
+    }
+
     // ── lifecycle ───────────────────────────────────────────────────────────────────
     fun isMlocked(handle: String): Boolean = session(handle).mlocked
 

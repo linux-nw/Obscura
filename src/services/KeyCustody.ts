@@ -146,6 +146,13 @@ export interface NativeBackedKeyCustody {
     Promise<{ ctHex: string; macHex: string }>;
   /** Returns the recovered file-key string. */
   unwrapKey(handle: string, ivHex: string, ctHex: string, macHex: string): Promise<string>;
+  /**
+   * Like unwrapKey, but the recovered key never returns to JS as a string - it is adopted
+   * directly into a freshly-minted handle (same one-time-touch shape as registerRawKey) and
+   * only that handle comes back. Use this instead of unwrapKey wherever the caller was just
+   * going to turn around and registerRawKey() the result anyway.
+   */
+  unwrapKeyToHandle(handle: string, ivHex: string, ctHex: string, macHex: string): Promise<string>;
 }
 
 class NativeBackedKeyCustodyImpl implements NativeBackedKeyCustody {
@@ -253,6 +260,13 @@ class NativeBackedKeyCustodyImpl implements NativeBackedKeyCustody {
   async unwrapKey(handle: string, ivHex: string, ctHex: string, macHex: string): Promise<string> {
     await this.awaitReady(handle);
     return Native.unwrapKey(handle, ivHex, ctHex, macHex);
+  }
+
+  async unwrapKeyToHandle(handle: string, ivHex: string, ctHex: string, macHex: string): Promise<string> {
+    await this.awaitReady(handle);
+    const freshHandle = newHandle();
+    this.track(freshHandle, Native.unwrapKeyToHandle(handle, ivHex, ctHex, macHex, freshHandle));
+    return freshHandle;
   }
 }
 

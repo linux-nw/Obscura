@@ -107,11 +107,17 @@ export class KeyRotationService {
 
     await this.migrateContent(oldHandle, newHandle);
 
-    // Commit: install the new master key (wrap with passphrase, register the live master
-    // handle — this also closes the old handle). Then drop our migration handle + the WAL.
-    await SecureCryptoService.installMasterKey(newMasterKeyHex, currentPassphrase);
-    SecureCryptoService.closeKeyHandle(newHandle);
-    SecureCryptoService.closeKeyHandle(oldHandle);
+    // Commit: install newHandle AS the live master (installMasterKeyFromHandle wraps it under
+    // the passphrase and, in native mode, re-wraps entirely in secure memory via
+    // keyCustody.rewrapVault - the new master key never resolves to JS as a string). This also
+    // closes whatever was previously __masterHandle (oldHandle) - do NOT separately close
+    // newHandle afterward, it IS the master now. (Audit fix: the previous version called
+    // installMasterKey(newMasterKeyHex, ...), which only ever updated the JS-backed-mode cache,
+    // never __masterHandle in native mode - then explicitly closed newHandle AND oldHandle
+    // right after, which on a real device would have closed both the stale old handle
+    // __masterHandle still pointed at AND the only handle holding the actual new master,
+    // leaving the vault with no live master handle at all after any on-device rotation.)
+    await SecureCryptoService.installMasterKeyFromHandle(newHandle, currentPassphrase);
     await SecureStore.deleteItemAsync(WAL_KEY);
 
     await this.incrementRotationCount();
@@ -143,10 +149,15 @@ export class KeyRotationService {
         console.warn(`[KeyRotation] Resuming a STALE rotation: started ${Math.round(ageMs / 3600000)}h ago (> ${MAX_WAL_AGE_MS / 3600000}h). Completing it now.`);
       }
 
-      let newMasterKeyHex: string;
+      let newHandle: string;
       try {
         // Succeeds iff currentHandle is the OLD master (the WAL was wrapped with it).
-        newMasterKeyHex = await SecureCryptoService.decryptFileKeyWith(wal.newMasterWrapped, currentHandle);
+        // decryptFileKeyToHandle (audit fix): the recovered new master key is adopted
+        // directly into a fresh handle and never resolves to JS as a string - unlike the
+        // old decryptFileKeyWith call this replaced, which handed it back as plaintext
+        // via keyCustody.unwrapKey on every real rotation-resume, the one call site
+        // where that native bridge method actually ran in production.
+        newHandle = await SecureCryptoService.decryptFileKeyToHandle(wal.newMasterWrapped, currentHandle);
       } catch {
         // currentHandle is NOT the old master → commit already happened (content fully
         // migrated, master already installed). Just clear the stale WAL.
@@ -155,11 +166,11 @@ export class KeyRotationService {
       }
 
       // currentHandle == old master: finish the migration idempotently, then commit.
-      const newHandle = SecureCryptoService.registerKeyHandle(newMasterKeyHex);
       await this.migrateContent(currentHandle, newHandle);
-      await SecureCryptoService.installMasterKey(newMasterKeyHex, currentPassphrase);
-      SecureCryptoService.closeKeyHandle(newHandle);
-      SecureCryptoService.closeKeyHandle(currentHandle);
+      // installMasterKeyFromHandle also closes the previous __masterHandle (currentHandle) -
+      // see the comment in performSecureRotation above for why nothing here closes handles
+      // explicitly afterward.
+      await SecureCryptoService.installMasterKeyFromHandle(newHandle, currentPassphrase);
       await SecureStore.deleteItemAsync(WAL_KEY);
 
       await this.incrementRotationCount();
