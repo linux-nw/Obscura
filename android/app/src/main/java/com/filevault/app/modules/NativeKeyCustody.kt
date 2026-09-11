@@ -12,11 +12,13 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * The master key lives ONLY here, in a sodium_malloc'd guarded region (guard pages +
  * canary + automatic zeroing on sodium_free), addressed by an opaque 128-bit handle.
- * The raw key never crosses the React bridge: JS holds the handle, never the key.
+ * The raw MASTER key never crosses the React bridge: JS holds the handle, never the key.
+ * (Audit note: this does NOT hold for the per-file key returned by
+ * NativeKeyCustodyModule.unwrapKey(), which does return the raw file key as a plaintext
+ * string across the bridge on every file open - a known, separate gap, not yet closed.)
  *
- * ADDITIVE — NOT WIRED. No @ReactMethod, no bridge registration, no production caller.
- * It is built next to the existing path and exercised only by L3CustodyHandleTest until
- * Phase 2 eliminates getMasterKey() and routes encrypt/decrypt through this core.
+ * WIRED: NativeKeyCustodyModule.kt exposes this core via @ReactMethod and is registered
+ * in FileVaultPackage.kt, so it does have production callers, not only L3CustodyHandleTest.
  *
  * The crypto is the SAME as today, proven byte-identical: content AEAD is libsodium
  * XChaCha20-Poly1305 detached (identical to RNFileVaultModule.encrypt); file-key wrapping
