@@ -70,7 +70,8 @@ Obscura/
 ```
 User's passphrase
     ↓ [Argon2id KDF: 64 MiB, 3 iterations]
-    ↓ (or PBKDF2-600k fallback if native unavailable)
+    ↓ (native libsodium, or the @noble/hashes JS implementation of the SAME Argon2id
+    ↓  params if the native module is unavailable — no PBKDF2 downgrade)
 KEK (Key Encryption Key) — 32 bytes, never persisted
     ↓ [AES-256-CBC-HMAC or native unwrap]
     ↓ (from SecureStore; wrapped master key)
@@ -177,7 +178,10 @@ npm run type-check
 ### Cryptographic Primitives
 
 - **KDF (Primary):** Argon2id (libsodium `crypto_pwhash`, m=64 MiB, t=3, p=1)
-- **KDF (Fallback):** PBKDF2-SHA256 (CryptoJS, 600k iterations)
+- **KDF (Fallback, native unavailable):** Argon2id via `@noble/hashes` (same m/t/p as above) —
+  no silent PBKDF2 downgrade. PBKDF2-SHA256 (600k) is retained ONLY to restore
+  pre-H1 legacy (v2) backup files; it is never produced for the vault KEK, a new
+  backup, or a new Panic/Decoy PIN.
 - **Symmetric (Primary):** XChaCha20-Poly1305 (libsodium, native)
 - **Symmetric (Fallback):** AES-256-CBC + Encrypt-then-MAC (HMAC-SHA256)
 - **Key Derivation:** HKDF-SHA256 (MAC key from master key)

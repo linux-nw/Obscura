@@ -20,7 +20,7 @@ Write-Ahead Log for atomic key rotation, and a Panic PIN that activates a decoy 
 ```
 Passphrase / PIN
        │
-       ▼  KDF (Argon2id primary / PBKDF2-SHA256 fallback)
+       ▼  KDF (Argon2id: native libsodium primary / @noble/hashes JS fallback — no PBKDF2 downgrade)
       KEK  (32 bytes, never persisted; derived on-demand, cleared after use)
        │
        ▼  AES-256-CBC-HMAC or XChaCha20-Poly1305 (backend-dependent)
@@ -55,17 +55,24 @@ Used when the Android native module (`RNFileVaultModule.kt`) is available.
 
 Salt is stored alongside the encrypted master key in SecureStore.
 
-### 3.2 Fallback KDF — PBKDF2-SHA256
+### 3.2 Fallback KDF — Argon2id (`@noble/hashes` JS implementation)
 
-Used when the native module is unavailable (e.g., emulator, integration tests).
+Used when the native module is unavailable (e.g., emulator, integration tests, Jest).
+This is the SAME Argon2id algorithm and parameters as §3.1 — never a downgrade to a
+weaker KDF. Historically (pre-H1) this fallback was PBKDF2-SHA256; that path was
+removed and PBKDF2-SHA256/600k now exists ONLY to restore pre-H1 legacy (v2) backup
+files (§8) — it is never produced for the vault KEK, a new backup, or a new
+Panic/Decoy PIN.
 
 | Parameter    | Value                                     |
 |--------------|-------------------------------------------|
-| Algorithm    | PBKDF2-HMAC-SHA256                        |
-| Iterations   | 600 000                                   |
+| Algorithm    | Argon2id (type=2), version 0x13           |
+| Memory cost  | 65 536 KB (64 MiB)                        |
+| Time cost    | 3 iterations                              |
+| Parallelism  | 1 lane (matches native libsodium `crypto_pwhash`) |
 | Output       | 32 bytes (hex-encoded)                    |
 | Salt         | 16 bytes CSPRNG (per setup)               |
-| Library      | CryptoJS 4.x                              |
+| Library      | `@noble/hashes` argon2id (JS)              |
 | NFC normal.  | `passphrase.normalize('NFC')` (R-03)      |
 
 ### 3.3 Panic PIN / Decoy PIN KDF — Argon2id (S1)
