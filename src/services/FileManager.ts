@@ -428,8 +428,41 @@ class SecureFileManager {
 
   /**
    * Re-verschlüsselt ALLE Datei-Inhalte + Metadaten vom alten auf den neuen
-   * Master-Key (Key-Rotation). Pro Blob idempotent via CryptoService.recryptBlob,
-   * daher crash-sicher wiederholbar.
+   * Master-Key (Key-Rotation).
+   *
+   * CRASH-SICHERHEIT (fixes the cross-file atomicity gap from the security audit):
+   * Content and metadata live in two SEPARATE files (contentPath, contentPath+'.meta.enc').
+   * The old implementation wrote the new content directly to contentPath, then the new
+   * meta (with the matching new iv/mac) to metaPath. A crash between those two writes
+   * left contentPath already re-encrypted under the NEW key while metaPath still named
+   * the OLD iv/mac — a combination that decrypts under NEITHER key, permanently.
+   *
+   * Fix: stage both the new content AND the new meta at side-by-side '.rotnew' paths
+   * FIRST (content stage written, THEN meta stage written - always in that order, each
+   * itself atomic via writeFileAtomic's own temp+rename), and only once BOTH are
+   * confirmed fully on disk, commit by renaming both '.rotnew' files into place. A
+   * rename is a single, near-instant filesystem metadata operation (no data copy), so
+   * the window in which the two commit-renames could be interrupted mid-pair is as
+   * small as this kind of two-file commit can be made without merging the files.
+   *
+   * Recovery reasons from a single, reliable signal: metaStagePath is always the LAST
+   * thing written during staging, so its existence proves staging fully completed
+   * (content stage necessarily succeeded first) - regardless of whether the content
+   * commit-rename has ALREADY happened since. That is why recovery must NOT key off
+   * "does contentStagePath still exist": after a crash between the two commit-renames,
+   * contentStagePath is (correctly) already gone, but metaPath still names the OLD
+   * iv/mac against the now-NEW content at contentPath - recomputing from that mismatched
+   * pair would reproduce the exact bug this fixes. So: metaStagePath present -> staging
+   * is done, go straight to finishing whichever commit-rename(s) remain; metaStagePath
+   * absent -> nothing trustworthy is staged (content stage may or may not have started;
+   * writeFileAtomic will simply overwrite it), so recompute both from the still-untouched
+   * original contentPath/metaPath. Either way the original files are never touched until
+   * the correct new versions are fully staged, so a crash at any point before commit
+   * leaves the file exactly as it was; a crash during commit is finished by the next run.
+   *
+   * No on-disk format change: the steady-state shape of contentPath/metaPath is
+   * unchanged. Only the transient '.rotnew' siblings are new, and only exist while a
+   * rotation is actually in flight.
    */
   static async reencryptAll(oldHandle: string, newHandle: string): Promise<void> {
     await this.initialize();
@@ -441,30 +474,49 @@ class SecureFileManager {
       const meta = JSON.parse(await FileSystem.readAsStringAsync(metaPath));
       const fileName = meta.name ?? metaFile.replace('.meta.enc', '');
       const contentPath = `${this.VAULT_DIR}${fileName}`;
+      const contentStagePath = `${contentPath}.rotnew`;
+      const metaStagePath = `${metaPath}.rotnew`;
 
-      // Datei-Inhalt (Ciphertext separat, iv/mac in der Metadatei).
-      // A3: dieselbe Version in alter+neuer AAD bewahren (recryptBlob ändert sie nicht).
-      const contentData = await FileSystem.readAsStringAsync(contentPath);
-      const fid = meta.id;
-      const v = meta.version ?? 1;
-      const newContent = await CryptoService.recryptBlob(
-        { data: contentData, iv: meta.iv, mac: meta.mac },
-        oldHandle,
-        newHandle,
-        `${fid}:content:v${v}`
-      );
-      const newOriginalName = await CryptoService.recryptBlob(meta.originalName, oldHandle, newHandle, `${fid}:name:v${v}`);
-      const newType = await CryptoService.recryptBlob(meta.type, oldHandle, newHandle, `${fid}:type:v${v}`);
+      const stagingComplete = (await FileSystem.getInfoAsync(metaStagePath)).exists;
 
-      // Inhalt zuerst, dann Metadatei schreiben (per-Blob-Idempotenz macht die
-      // Reihenfolge unkritisch — ein Abbruch dazwischen wird sauber resümiert).
-      // H3: atomic temp+rename so a crash never truncates a blob.
-      await writeFileAtomic(contentPath, newContent.data);
-      meta.iv = newContent.iv;
-      meta.mac = newContent.mac;
-      meta.originalName = newOriginalName;
-      meta.type = newType;
-      await writeFileAtomic(metaPath, JSON.stringify(meta));
+      if (!stagingComplete) {
+        // metaStagePath is written LAST during staging, so its absence means nothing
+        // trustworthy is staged - (re)compute both from the still-untouched original
+        // contentPath/metaPath. Datei-Inhalt (Ciphertext separat, iv/mac in der
+        // Metadatei). A3: dieselbe Version in alter+neuer AAD bewahren (recryptBlob
+        // ändert sie nicht).
+        const contentData = await FileSystem.readAsStringAsync(contentPath);
+        const fid = meta.id;
+        const v = meta.version ?? 1;
+        const newContent = await CryptoService.recryptBlob(
+          { data: contentData, iv: meta.iv, mac: meta.mac },
+          oldHandle,
+          newHandle,
+          `${fid}:content:v${v}`
+        );
+        const newOriginalName = await CryptoService.recryptBlob(meta.originalName, oldHandle, newHandle, `${fid}:name:v${v}`);
+        const newType = await CryptoService.recryptBlob(meta.type, oldHandle, newHandle, `${fid}:type:v${v}`);
+
+        const stagedMeta = { ...meta, iv: newContent.iv, mac: newContent.mac, originalName: newOriginalName, type: newType };
+
+        // Stage content THEN meta - writeFileAtomic overwrites a stale leftover
+        // contentStagePath from an earlier interrupted attempt without needing to
+        // delete it first. A crash here leaves metaStagePath still absent (it's
+        // written second), which `stagingComplete` above catches as "recompute" again.
+        await writeFileAtomic(contentStagePath, newContent.data);
+        await writeFileAtomic(metaStagePath, JSON.stringify(stagedMeta));
+      }
+
+      // Commit: rename whichever staged artifact(s) still need it. Re-checking
+      // existence here (rather than assuming both were just staged above) is what
+      // makes resume-after-crash correct: on a resumed run where staging already fully
+      // completed before the crash, we skip straight to finishing the commit.
+      if ((await FileSystem.getInfoAsync(contentStagePath)).exists) {
+        await FileSystem.moveAsync({ from: contentStagePath, to: contentPath });
+      }
+      if ((await FileSystem.getInfoAsync(metaStagePath)).exists) {
+        await FileSystem.moveAsync({ from: metaStagePath, to: metaPath });
+      }
     }
   }
 
