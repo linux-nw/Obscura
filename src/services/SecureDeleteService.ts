@@ -8,7 +8,11 @@
  * - Quick Wipe (1-Pass)
  * - Secure deletion for all vault data
  *
- * WICHTIG: NUTZT AES-256-CBC statt XChaCha20
+ * NAND-Disclaimer: Auf Flash-/F2FS-Speicher mit Wear-Leveling überschreibt ein
+ * erneuter Write denselben logischen Dateiinhalt nicht zuverlässig denselben
+ * physischen Block — Restdaten können dort bis zum Trim/Erase verbleiben. Das
+ * Überschreiben hier ist Defense-in-Depth, keine Garantie; der verlässliche
+ * Schutz bleibt Crypto-Shredding (Master-Key-Vernichtung bei Wipe).
  */
 
 import * as FileSystem from 'expo-file-system/legacy';
@@ -89,30 +93,30 @@ export class SecureDeleteService {
     filePath: string,
     method: SecureDeleteMethod
   ): Promise<void> {
-    try {
-      const fileInfo = await FileSystem.getInfoAsync(filePath);
-      if (!fileInfo.exists) return;
+    const fileInfo = await FileSystem.getInfoAsync(filePath);
+    if (!fileInfo.exists) return;
 
-      const fileSize = fileInfo.size;
+    const fileSize = fileInfo.size;
 
-      // Verschiedene Überschreibungs-Muster basierend auf Methode
-      switch (method) {
-        case 'quick':
-          await this.overwriteWithPattern(filePath, 1, fileSize);
-          break;
-        case 'dod':
-          await this.overwriteWithPattern(filePath, 3, fileSize);
-          break;
-        case 'guttman':
-          await this.overwriteWithPattern(filePath, 7, fileSize);
-          break;
-      }
-
-      // Datei endgültig löschen
-      await FileSystem.deleteAsync(filePath, { idempotent: true });
-    } catch (error) {
-      console.error(`SecureDelete: Failed to delete ${filePath}:`, error);
+    // Verschiedene Überschreibungs-Muster basierend auf Methode. overwriteWithPattern
+    // wirft jetzt bei Fehlern, statt sie zu verschlucken - eine Datei, deren Überschreiben
+    // fehlschlägt, wird NICHT gelöscht, damit ein Aufrufer den Fehlschlag sieht statt sich
+    // fälschlich in Sicherheit zu wiegen.
+    switch (method) {
+      case 'quick':
+        await this.overwriteWithPattern(filePath, 1, fileSize);
+        break;
+      case 'dod':
+        await this.overwriteWithPattern(filePath, 3, fileSize);
+        break;
+      case 'guttman':
+        await this.overwriteWithPattern(filePath, 7, fileSize);
+        break;
     }
+
+    // Datei endgültig löschen - wird nur erreicht, wenn das Überschreiben oben
+    // tatsächlich erfolgreich war.
+    await FileSystem.deleteAsync(filePath, { idempotent: true });
   }
 
   /**
@@ -147,6 +151,10 @@ export class SecureDeleteService {
       });
     } catch (error) {
       console.error('SecureDelete: Overwrite failed:', error);
+      // Rethrow - a swallowed overwrite failure previously let secureDeleteFile
+      // proceed straight to deleteAsync, reporting "deleted" for a file whose
+      // content was never actually overwritten.
+      throw error;
     }
   }
 
@@ -290,7 +298,17 @@ export class SecureDeleteService {
         console.log(`SecureDelete: Verified deletion of ${key}`);
       }
 
-      console.log('SecureDelete: Full secure wipe complete (AES-256)');
+      // Read-back Verification für die eigentlichen Vault-/Notizen-Verzeichnisse - die
+      // Key-Verifikation oben allein hätte einen fehlgeschlagenen Datei-Wipe nie bemerkt.
+      for (const dir of [this.VAULT_DIR, this.NOTES_DIR]) {
+        const info = await FileSystem.getInfoAsync(dir);
+        if (info.exists) {
+          throw new Error(`secureWipeAll: Directory still exists after deletion: ${dir}`);
+        }
+      }
+      console.log('SecureDelete: Verified deletion of vault/notes directories');
+
+      console.log('SecureDelete: Full secure wipe complete');
     } catch (error) {
       console.error('SecureDelete: Full wipe failed:', error);
       throw error;
@@ -298,20 +316,28 @@ export class SecureDeleteService {
   }
 
   /**
-   * Sichert und löscht eine einzelne Datei
+   * Sichert und löscht eine einzelne Datei (Content + Meta) aus dem Vault.
+   * Wird vom normalen Nutzer-Löschen (FileManager.deleteFile) aufgerufen - Default
+   * ist 'quick' (1 Pass), damit ein einzelner Löschvorgang in der UI nicht durch
+   * einen 7-fachen Full-File-Rewrite (Guttman) spürbar blockiert; Guttman bleibt
+   * der Default für den vollständigen Vault-/Notizen-Wipe (secureDeleteVault/
+   * secureDeleteNotes), der ohnehin ein bewusster, seltener Vorgang ist.
    */
-  static async secureDeleteFileById(fileId: string): Promise<void> {
+  static async secureDeleteFileById(
+    fileId: string,
+    method: SecureDeleteMethod = 'quick'
+  ): Promise<void> {
     try {
       const filePath = `${this.VAULT_DIR}file_${fileId}`;
       const metaPath = `${filePath}.meta.enc`;
 
       // Datei sicher löschen
-      await this.secureDeleteFile(filePath, 'guttman');
+      await this.secureDeleteFile(filePath, method);
 
       // Meta-Datei sicher löschen
       const metaInfo = await FileSystem.getInfoAsync(metaPath);
       if (metaInfo.exists) {
-        await this.secureDeleteFile(metaPath, 'guttman');
+        await this.secureDeleteFile(metaPath, method);
       }
 
       console.log(`SecureDelete: File ${fileId} deleted`);
