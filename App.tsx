@@ -51,6 +51,7 @@ import { DecoyVaultService } from './src/services/DecoyVaultService';
 import { BackupService } from './src/services/BackupService';
 import { KeyRotationService } from './src/services/KeyRotationService';
 import { HardwareBackedStorage } from './src/services/HardwareKeystoreService';
+import { IntegrityService } from './src/services/IntegrityService';
 
 export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -156,9 +157,23 @@ export default function App() {
       await KeyRotationService.initialize();
       console.log('KeyRotationService initialisiert');
 
-      // 8. Initialisiere Panic Service (früher: IntegrityService — entfernt, da alle Checks Stubs waren)
+      // 8. Initialisiere Panic Service
       await PanicService.initialize();
       console.log('PanicService initialisiert');
+
+      // 9. L7 APK-Signature-Check (fail-closed native check, warn-only — see
+      // IntegrityService.checkSignature). Was previously never called at all: the
+      // comment above this block used to say it was dropped "because all checks were
+      // stubs", but checkSignature() itself is real (native pinned-cert-hash compare)
+      // and only the OTHER three sub-checks in checkIntegrity() are stubs that always
+      // pass — so this never actually risks a false lockout. No auto-wipe here by
+      // design; only 'invalid' logs a warning (see IntegrityService.triggerTamperResponse
+      // for the separate, not-auto-wired response path).
+      try {
+        await IntegrityService.checkIntegrity();
+      } catch (e) {
+        console.error('IntegrityService: check failed:', e);
+      }
 
       // 10. Initialisiere Decoy Vault
       await DecoyVaultService.initialize();
