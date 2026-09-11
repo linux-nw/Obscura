@@ -36,6 +36,27 @@ export class IntegrityService {
   }
 
   /**
+   * The single fail-closed gate App.tsx uses to decide whether to refuse operation
+   * entirely (audit follow-up: checkSignature()/checkIntegrity() computed the right
+   * verdict but nothing ever consumed it to actually block anything - it only reached
+   * a console.warn). Deliberately narrow: true ONLY on a confirmed 'invalid' verdict
+   * (a real signing-cert mismatch - repackaged/re-signed APK). 'unverifiable' (native
+   * module absent, or a debug build with no pin configured) and 'valid' both return
+   * false, exactly as checkSignature() already treated them - this does not change
+   * when the app is willing to run, only what happens once it's already decided
+   * something is provably wrong.
+   */
+  static async isTampered(): Promise<boolean> {
+    try {
+      return (await this.verifyAppSignature()) === 'invalid';
+    } catch {
+      // Fail-closed means never falsely blocking on our OWN error - an exception here
+      // is "unverifiable", not "invalid". checkSignature() has the same shape.
+      return false;
+    }
+  }
+
+  /**
    * Prüft die App Integrität
    */
   static async checkIntegrity(): Promise<IntegrityStatus> {

@@ -91,3 +91,41 @@ describe('Layer 7: aggregate integrity is fail-closed but not self-bricking', ()
     await expect(svc.verifyAppSignature()).resolves.toBe('unverifiable');
   });
 });
+
+/**
+ * Audit follow-up: checkSignature()/checkIntegrity() computed the right verdict, but
+ * nothing consumed it to actually refuse to run the app - it only ever reached a
+ * console.warn (App.tsx would still mount AuthScreen/MainScreen regardless). isTampered()
+ * is the dedicated fail-closed GATE App.tsx now uses (see App.tsx: `tampered` state,
+ * set from IntegrityService.isTampered() in initializeApp, gates the whole render tree
+ * before AuthScreen/MainScreen ever mount - not independently re-tested here via a
+ * component-render harness, since this repo has none; verified by direct code reading).
+ * This test is the automated proof for the DECISION itself: true only on a confirmed
+ * 'invalid' verdict, false for every other case including the service's own errors.
+ */
+describe('Layer 7: isTampered() — the actual block/allow gate', () => {
+  test('mismatched cert (repackaged/re-signed APK) -> tampered = true', async () => {
+    const svc = loadService({ verifyPinnedSignature: ok({ isValid: false }) });
+    await expect(svc.isTampered()).resolves.toBe(true);
+  });
+
+  test('matching cert -> tampered = false', async () => {
+    const svc = loadService({ verifyPinnedSignature: ok() });
+    await expect(svc.isTampered()).resolves.toBe(false);
+  });
+
+  test('unverifiable (native module absent, e.g. debug/Expo Go) -> tampered = false (never a false lockout)', async () => {
+    const svc = loadService(undefined);
+    await expect(svc.isTampered()).resolves.toBe(false);
+  });
+
+  test('unverifiable (no hash pinned, e.g. debug build) -> tampered = false', async () => {
+    const svc = loadService({ verifyPinnedSignature: ok({ configured: false, isValid: false }) });
+    await expect(svc.isTampered()).resolves.toBe(false);
+  });
+
+  test('native bridge throws -> tampered = false (fail-closed means never falsely blocking on our own error)', async () => {
+    const svc = loadService({ verifyPinnedSignature: jest.fn(async () => { throw new Error('bridge error'); }) });
+    await expect(svc.isTampered()).resolves.toBe(false);
+  });
+});

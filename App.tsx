@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, StyleSheet, AppState, AppStateStatus, NativeModules } from 'react-native';
+import { View, Text, StyleSheet, AppState, AppStateStatus, NativeModules } from 'react-native';
 import * as SecureStore from 'expo-secure-store';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import AuthScreen from './src/screens/AuthScreen';
@@ -58,6 +58,7 @@ export default function App() {
   const [isFirstLaunch, setIsFirstLaunch]     = useState<boolean | null>(null);
   const [isCryptoReady, setIsCryptoReady]     = useState(false);
   const [securityStatus, setSecurityStatus]   = useState<'secure' | 'warning' | 'critical'>('secure');
+  const [tampered, setTampered]               = useState(false);
   const [isDecoy, setIsDecoy]                 = useState(false);
   // Layer 1: privacy overlay shown whenever the app is not in the foreground, so any frame
   // the OS or an onlooker could capture during a transition shows a blank brand screen
@@ -161,16 +162,24 @@ export default function App() {
       await PanicService.initialize();
       console.log('PanicService initialisiert');
 
-      // 9. L7 APK-Signature-Check (fail-closed native check, warn-only — see
-      // IntegrityService.checkSignature). Was previously never called at all: the
-      // comment above this block used to say it was dropped "because all checks were
-      // stubs", but checkSignature() itself is real (native pinned-cert-hash compare)
-      // and only the OTHER three sub-checks in checkIntegrity() are stubs that always
-      // pass — so this never actually risks a false lockout. No auto-wipe here by
-      // design; only 'invalid' logs a warning (see IntegrityService.triggerTamperResponse
-      // for the separate, not-auto-wired response path).
+      // 9. L7 APK-Signature-Check (fail-closed native check). checkSignature() itself
+      // is real (native pinned-cert-hash compare) and only the OTHER three sub-checks
+      // in checkIntegrity() are stubs that always pass, so this never risks a false
+      // lockout from those. checkIntegrity() itself is still just recorded for the
+      // status screen; isTampered() is the actual fail-closed GATE — audit follow-up:
+      // a previous pass wired the check up but nothing ever consumed the verdict to
+      // block anything (it only reached a console.warn). isTampered() returns true
+      // ONLY on a confirmed 'invalid' verdict (never on 'unverifiable', e.g. a debug
+      // build with no pin configured, or the native module being absent) - see
+      // src/screens/... below, `tampered` gates the entire render tree before
+      // AuthScreen/MainScreen ever mount.
       try {
         await IntegrityService.checkIntegrity();
+        const isTampered = await IntegrityService.isTampered();
+        if (isTampered) {
+          console.error('SECURITY: APK signing certificate does not match the pinned hash - refusing to run.');
+          setTampered(true);
+        }
       } catch (e) {
         console.error('IntegrityService: check failed:', e);
       }
@@ -339,6 +348,29 @@ export default function App() {
     );
   }
 
+  // L7 fail-closed gate: a confirmed signing-certificate mismatch (repackaged/re-signed
+  // APK) stops here, unconditionally, before AuthScreen or MainScreen ever mount - no
+  // passphrase prompt, no vault access, nothing to dismiss. This check runs BEFORE the
+  // isAuthenticated branch below on purpose: an already-unlocked session (master key
+  // still cached from before this check ran) must not be able to bypass it either.
+  if (tampered) {
+    return (
+      <SafeAreaProvider>
+        <View style={[styles.root, styles.tamperedRoot]}>
+          <Text style={styles.tamperedTitle}>Sicherheitsprüfung fehlgeschlagen</Text>
+          <Text style={styles.tamperedBody}>
+            Die Signatur dieser App stimmt nicht mit der erwarteten Signatur überein. Das
+            deutet auf eine manipulierte oder neu gepackte Installation hin. Obscura wird
+            aus Sicherheitsgründen nicht gestartet.
+          </Text>
+          <Text style={styles.tamperedHint}>
+            Bitte installieren Sie die App erneut aus einer vertrauenswürdigen Quelle.
+          </Text>
+        </View>
+      </SafeAreaProvider>
+    );
+  }
+
   return (
     <SafeAreaProvider>
     <View style={styles.root}>
@@ -376,5 +408,29 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     zIndex: 9999,
+  },
+  tamperedRoot: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 32,
+  },
+  tamperedTitle: {
+    color: '#FF6B6B',
+    fontSize: 20,
+    fontWeight: '700',
+    textAlign: 'center',
+    marginBottom: 16,
+  },
+  tamperedBody: {
+    color: '#E4E4E7',
+    fontSize: 15,
+    textAlign: 'center',
+    lineHeight: 22,
+    marginBottom: 16,
+  },
+  tamperedHint: {
+    color: '#9A9AA5',
+    fontSize: 13,
+    textAlign: 'center',
   },
 });
