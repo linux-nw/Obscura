@@ -71,14 +71,13 @@ export class SafeBuffer {
       this.buffer[i] = 255;
     }
 
-    // Pattern 3: 0x00 (wieder)
+    // Pattern 3: 0x00 (final) - a method named zeroize() must leave the buffer at
+    // 0x00. The previous 4th pass XORed every byte with the constant 0xFF, which
+    // (after pattern 3 already zeroed everything) simply flipped the whole buffer
+    // to 0xFF and left it there - the opposite of zeroized, and not actually random
+    // either (XOR with a fixed byte is deterministic).
     for (let i = 0; i < this.size; i++) {
       this.buffer[i] = 0;
-    }
-
-    // Pattern 4: Zufällig (simuliert mit XOR)
-    for (let i = 0; i < this.size; i++) {
-      this.buffer[i] ^= 0xFF;
     }
 
     this.zeroized = true;
