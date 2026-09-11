@@ -145,7 +145,27 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
     setIsHashing(true);
     try {
       const lockStatus = await SecureCryptoService.getLockStatus();
+
+      // The panic PIN must keep working even while the real vault's own brute-force
+      // lockout is active — under duress is exactly when it matters most. Checking it
+      // here, before the lockout early-return, doesn't reintroduce a timing leak:
+      // verifyPanicPin() always runs its full Argon2id check regardless of lock state,
+      // so its timing is uniform across every entered value in this branch too.
       if (lockStatus.locked) {
+        const panicMatchWhileLocked = await PanicService.verifyPanicPin(entered);
+        if (panicMatchWhileLocked) {
+          SecureCryptoService.clearAllCaches();
+          const triggerAction = await PanicService.getTriggerAction();
+          if (triggerAction === 'wipe') {
+            try { await onWipeVault?.(); } catch {}
+            return;
+          }
+          try { await SecureStore.setItemAsync('filevault_lock_until', String(Number.MAX_SAFE_INTEGER)); } catch {}
+          showError('Tresor dauerhaft gesperrt.');
+          setPass('');
+          return;
+        }
+
         const isPermanent = lockStatus.unlockAt >= Number.MAX_SAFE_INTEGER - 86400000;
         if (isPermanent) {
           showError('Tresor dauerhaft gesperrt.');
@@ -194,6 +214,12 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
         setUnlocking(true);
         setTimeout(doAuth, 300);
       } else if (decoyMatch) {
+        // A correct decoy-PIN entry is not a real-vault brute-force attempt, even
+        // though the parallel unlock(entered) above just incremented the real vault's
+        // failed-attempt counter (entered != the real passphrase). Undo that so
+        // legitimate, repeated decoy-vault use never burns down to a lockout that
+        // would also block the panic PIN check above.
+        await SecureCryptoService.clearFailedAttempts();
         // Decoy PIN: clear real master key (loaded by parallel unlock()), show empty vault.
         SecureCryptoService.clearAllCaches();
         setFailedAttempts(0);
