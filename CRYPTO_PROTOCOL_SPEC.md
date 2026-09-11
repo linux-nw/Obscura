@@ -26,13 +26,13 @@ Passphrase / PIN
        ▼  AES-256-CBC-HMAC or XChaCha20-Poly1305 (backend-dependent)
   Master Key  (32 bytes, stored encrypted in SecureStore)
        │
-       ├─▶  File Key₁  (32 bytes, AES-256-CBC-HMAC or XChaCha20-Poly1305)
-       ├─▶  File Key₂
-       └─▶  File Keyₙ
-                 │
-                 ▼  Same backend as above
-             File Ciphertext  (stored on-device filesystem)
+       ▼  AES-256-CBC-HMAC or XChaCha20-Poly1305 (same backend as above)
+  File / Note Ciphertext  (stored on-device filesystem)
 ```
+
+> **Note.** Content is encrypted **directly with the Master Key**, not via a
+> per-file key layer — see §6 for the rationale. `EncryptedFileKey` wrapping
+> helpers exist in the codebase but are not used by the active vault.
 
 ---
 
