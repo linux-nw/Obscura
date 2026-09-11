@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Referenced by AndroidManifest.xml's android:fullBackupContent (pre-Android-12 backup
+  path), set unconditionally by expo-secure-store's own config plugin
+  (node_modules/expo-secure-store/plugin/src/withSecureStore.ts) - which points at this
+  resource but never generates the file itself. Without this file present, AAPT2 fails
+  the build with "resource xml/secure_store_backup_rules not found".
+
+  android:allowBackup="false" (see plugins/withDisableAndroidBackup.js) already disables
+  ALL backup for this app on every Android version, which makes this file's content moot
+  in the current configuration. It still has to exist and still excludes everything
+  explicitly, so nothing backs up even if allowBackup is ever changed back to true later
+  without someone remembering to revisit this file too.
+-->
+<full-backup-content>
+    <exclude domain="root" path="." />
+</full-backup-content>

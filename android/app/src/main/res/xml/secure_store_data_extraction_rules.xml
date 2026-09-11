@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Referenced by AndroidManifest.xml's android:dataExtractionRules (Android 12+ cloud
+  backup / device-transfer path), set unconditionally by expo-secure-store's own config
+  plugin - same situation as secure_store_backup_rules.xml (see comment there): the
+  plugin references this resource but never generates it, so the build would fail
+  resource linking without this file.
+
+  Moot under android:allowBackup="false" (disables both paths outright), kept as an
+  explicit belt-and-suspenders exclude-everything in case that ever changes.
+-->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" path="." />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" path="." />
+    </device-transfer>
+</data-extraction-rules>

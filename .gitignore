@@ -42,6 +42,6 @@ scraps/
 # typescript
 *.tsbuildinfo
 
-# generated native folders
+# generated native folder (iOS project isn't checked in - Android is, see android/.gitignore
+# for what's excluded there: build/, .gradle/, local.properties, etc.)
 /ios
-/android
