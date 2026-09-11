@@ -30,6 +30,12 @@ yarn-error.*
 .DS_Store
 *.pem
 
+# IDE
+.idea/
+
+# scratch/local notes, not for distribution
+scraps/
+
 # local env files
 .env*.local
 
