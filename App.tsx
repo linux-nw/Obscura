@@ -215,7 +215,9 @@ export default function App() {
         if (ds?.getActiveInputMethod) {
           const ime = await ds.getActiveInputMethod();
           if (ime && ime.isSystem === false) {
-            console.warn(`[security][IME] Third-party keyboard active (${ime.packageName}). A malicious IME can read everything you type, including the passphrase. Prefer the system keyboard for unlock.`);
+            // Deliberately not logging ime.packageName: it identifies which third-party
+            // keyboard app the user has installed, which is more than this warning needs.
+            console.warn('[security][IME] Third-party keyboard active. A malicious IME can read everything you type, including the passphrase. Prefer the system keyboard for unlock.');
           }
         }
       } catch {}
