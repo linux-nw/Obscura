@@ -299,6 +299,11 @@ export default function App() {
       await FileManager.cleanupViewTemps();
       await CryptoService.setAppInitialized(false);
 
+      // A "complete" wipe (5 failed attempts, or Settings > wipe vault) must not leave
+      // the panic PIN or the decoy vault behind, same as the panic-triggered wipe path.
+      try { await PanicService.clearPanicPin(); } catch (e) { console.error('Wipe: clearPanicPin failed:', e); }
+      try { await DecoyVaultService.destroyDecoyVault(); } catch (e) { console.error('Wipe: destroyDecoyVault failed:', e); }
+
       setIsFirstLaunch(true);
     } catch (error) {
       console.error('Wipe-Fehler:', error);

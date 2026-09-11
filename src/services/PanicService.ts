@@ -12,6 +12,7 @@
 import * as SecureStore from 'expo-secure-store';
 import { SecureCryptoService } from './CryptoService';
 import { SecureDeleteService } from './SecureDeleteService';
+import { DecoyVaultService } from './DecoyVaultService';
 import { fastPbkdf2 } from './FastPBKDF2';
 import { Argon2idService, Argon2Params } from './Argon2idService';
 
@@ -208,6 +209,12 @@ export class PanicService {
 
       // Vault löschen
       await SecureDeleteService.secureWipeAll();
+
+      // A "complete" wipe must not leave the panic PIN or the decoy vault behind -
+      // otherwise the next setup starts with a stale panic/decoy configuration from
+      // before the wipe, and their data survives on disk despite the wipe.
+      try { await this.clearPanicPin(); } catch (e) { console.error('Panic: clearPanicPin during wipe failed:', e); }
+      try { await DecoyVaultService.destroyDecoyVault(); } catch (e) { console.error('Panic: destroyDecoyVault during wipe failed:', e); }
 
       // App als nicht initialisiert markieren
       await SecureCryptoService.setAppInitialized(false);
