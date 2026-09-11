@@ -20,6 +20,7 @@ import { fastPbkdf2 } from './FastPBKDF2';
 import { FileManager } from './FileManager';
 import { NotesService } from './NotesService';
 import { SettingsService } from './SettingsService';
+import { writeFileAtomic, cleanupTempFiles } from './fsAtomic';
 
 // Legacy v2: PBKDF2 iterations (accepted on restore, never produced anymore).
 const BACKUP_PBKDF2_ITERATIONS = 600000;
@@ -75,6 +76,8 @@ export class BackupService {
       if (!dirInfo.exists) {
         await FileSystem.makeDirectoryAsync(this.BACKUP_DIR, { intermediates: true });
       }
+      // H3: drop any leftover .tmp from an interrupted atomic backup write.
+      await cleanupTempFiles(this.BACKUP_DIR);
     } catch (error) {
       console.error('Backup: init failed:', error);
     }
@@ -129,7 +132,9 @@ export class BackupService {
 
       const backupId = this.generateBackupId();
       const backupPath = `${this.BACKUP_DIR}backup_${backupId}.json`;
-      await FileSystem.writeAsStringAsync(backupPath, JSON.stringify(encrypted));
+      // H3: temp file + rename, so a crash mid-write never leaves a truncated,
+      // unparseable backup at backupPath.
+      await writeFileAtomic(backupPath, JSON.stringify(encrypted));
       await SecureStore.setItemAsync(this.LAST_BACKUP_KEY, Date.now().toString());
 
       return backupId;
