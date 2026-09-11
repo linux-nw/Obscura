@@ -270,6 +270,16 @@ export default function App() {
    */
   const handleChangePin = async (oldPin: string, newPin: string): Promise<boolean> => {
     try {
+      if (isDecoy) {
+        // Decoy session: "change PIN" in Settings must act on the DECOY PIN, never
+        // silently rewrap the REAL master passphrase the user can't currently see and
+        // may not intend to touch - exactly the wrong outcome in the duress scenario
+        // the decoy vault exists for.
+        const oldMatches = await DecoyVaultService.verifyDecoyPin(oldPin);
+        if (!oldMatches) return false;
+        await DecoyVaultService.setDecoyPin(newPin);
+        return true;
+      }
       return await CryptoService.changePassphrase(oldPin, newPin);
     } catch (error) {
       console.error('PIN-Änderung fehlgeschlagen:', error);
@@ -282,6 +292,16 @@ export default function App() {
    */
   const handleWipeVault = async (): Promise<void> => {
     try {
+      if (isDecoy) {
+        // Decoy session: "wipe vault" in Settings must only affect the decoy vault
+        // currently on screen - never the real vault, its notes/files, the master key,
+        // or the panic PIN. resetDecoyVault() destroys and regenerates fresh fake
+        // content, so the visible (decoy) vault still looks freshly wiped to an
+        // onlooker without touching anything real.
+        await DecoyVaultService.resetDecoyVault();
+        return;
+      }
+
       await FileManager.clearVault();
 
       const notes = await NotesService.getNotes();
