@@ -27,7 +27,8 @@
         }
       ],
       "expo-secure-store",
-      "expo-video"
+      "expo-video",
+      "./plugins/withDisableAndroidBackup.js"
     ],
     "ios": {
       "supportsTablet": true,
