@@ -216,8 +216,11 @@ export class PanicService {
       await SecureCryptoService.deleteEncryptionKey();
       await SecureCryptoService.deletePinData();
 
-      // Vault löschen
-      await SecureDeleteService.secureWipeAll();
+      // Vault löschen. secureWipeAll() now fails closed (throws) if the file-level
+      // deletion is incomplete - own try/catch so that failure can't skip the
+      // panic-PIN/decoy-vault cleanup below, which are independent concerns and must
+      // still run (matches this function's existing best-effort/never-throws contract).
+      try { await SecureDeleteService.secureWipeAll(); } catch (e) { console.error('Panic: secureWipeAll failed:', e); }
 
       // A "complete" wipe must not leave the panic PIN or the decoy vault behind -
       // otherwise the next setup starts with a stale panic/decoy configuration from

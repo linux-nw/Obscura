@@ -2014,6 +2014,11 @@ export class SecureCryptoService {
     }
     const masterKeyHex = keyCustody.resolve(handle);
     await this.wrapAndStoreMasterKey(passphrase, masterKeyHex);
+    // _masterKeyCache's setter mints its own fresh handle for masterKeyHex - it does not
+    // adopt the caller's `handle`, so that one would otherwise never be closed (a
+    // JsBackedKeyCustody session leak, JS-backed/dev-only - never reaches a real device,
+    // where the native branch above already retires `handle` via setMasterHandle).
+    keyCustody.close(handle);
     this._masterKeyCache = masterKeyHex;
   }
 

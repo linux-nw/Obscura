@@ -25,8 +25,12 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
  *      output matches the raw-key output), and the handle is NOT the key;
  *   4. closeVault invalidates — subsequent ops throw, hasHandle == false;
  *   5. the mlock probe runs without crashing and reports a boolean (RLIMIT_MEMLOCK honest path).
+ *   6. withKey()/closeVault() concurrency: many concurrent handle ops racing a close on the
+ *      same handle never crash or corrupt - every outcome is either the correct result or a
+ *      clean "invalid or closed handle" (see concurrentEncryptAndCloseNeverCrashesOrCorrupts).
  *
- * NativeKeyCustody has no production caller yet (Phase 2 wires it); this is its only caller.
+ * WIRED: NativeKeyCustodyModule.kt exposes this core via @ReactMethod and is registered in
+ * FileVaultPackage.kt, so it has production callers (L3 Phase 2b) - this is not its only caller.
  */
 @RunWith(AndroidJUnit4::class)
 class L3CustodyHandleTest {
