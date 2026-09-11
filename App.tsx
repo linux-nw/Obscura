@@ -196,14 +196,16 @@ export default function App() {
         }
       } catch {}
 
-      // Layer 4: definitive per-key Keystore security level (KeyInfo via native module),
-      // preferred over the biometric heuristic above. Warn if keys are software-backed.
+      // Layer 4: device Keystore security-level CAPABILITY probe (KeyInfo via native
+      // module) - a fresh probe key, not the app's actual stored secrets (expo-secure-store
+      // manages its own Keystore alias with no queryable securityLevel API). Still a useful
+      // signal of what this device supports; preferred over the biometric heuristic above.
       try {
         const lvl = await HardwareBackedStorage.assessKeystoreSecurityLevel();
         if (lvl.securityLevel === 'SOFTWARE') {
-          console.warn('[security][L4] Keystore keys are SOFTWARE-backed (no TEE/StrongBox). On a rooted/compromised device the key material is at materially higher risk.');
+          console.warn('[security][L4] Device Keystore capability probe is SOFTWARE-backed (no TEE/StrongBox available). On a rooted/compromised device, key material is at materially higher risk.');
         } else if (lvl.securityLevel !== 'UNAVAILABLE') {
-          console.log(`[security][L4] Keystore security level: ${lvl.securityLevel} (hardwareBacked=${lvl.isHardwareBacked}).`);
+          console.log(`[security][L4] Device Keystore capability probe: ${lvl.securityLevel} (hardwareBacked=${lvl.isHardwareBacked}).`);
         }
       } catch {}
 

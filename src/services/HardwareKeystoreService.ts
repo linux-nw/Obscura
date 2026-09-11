@@ -83,10 +83,19 @@ export class HardwareBackedStorage {
   }
 
   /**
-   * Layer 4 — REAL per-key security level via the native HardwareKeystore module
+   * Layer 4 — device StrongBox/TEE CAPABILITY probe via the native HardwareKeystore module
    * (KeyInfo.securityLevel). Generates a throwaway probe key, reads its level, deletes it.
    * Returns 'STRONGBOX' | 'TRUSTED_ENVIRONMENT' | 'SOFTWARE' | 'HARDWARE' | 'UNKNOWN' |
-   * 'UNAVAILABLE'. This is a definitive per-key check, unlike the biometric heuristic above.
+   * 'UNAVAILABLE'. This is a definitive check of what THIS device's Keystore can hand out
+   * for a fresh key generated the same way — but it is a SEPARATE key from anything the
+   * app actually stores. expo-secure-store (used for the real vault secrets: wrapped
+   * master key, PIN data, etc.) manages its own internal Keystore alias and exposes no
+   * API to query that alias's specific securityLevel, so this probe cannot attest the
+   * REAL secrets' actual backing — only that the device is capable of the level reported.
+   * A definitive per-secret check would require routing real secret storage through this
+   * module's own key-wrapping instead of expo-secure-store, which is a real architecture
+   * change (custom native encryption surface + a migration path for existing SecureStore
+   * data), not a small fix.
    */
   static async assessKeystoreSecurityLevel(): Promise<{ securityLevel: string; isHardwareBacked: boolean }> {
     try {
