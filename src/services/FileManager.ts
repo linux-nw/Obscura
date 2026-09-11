@@ -76,6 +76,8 @@ class SecureFileManager {
       await cleanupTempFiles(this.VAULT_DIR);
       // Layer 5: sweep any plaintext view-temp left in cache by a previous crash/kill.
       await this.cleanupViewTemps();
+      // Layer 5: sweep any leftover plaintext picker-cache copy from an interrupted import.
+      await this.cleanupPickerCacheTemps();
     } catch (error) {
       console.error('Error initializing vault:', error);
       throw new Error('Konnte Tresor nicht initialisieren');
@@ -418,6 +420,49 @@ class SecureFileManager {
           .filter(name => name.startsWith('vault_view_'))
           .map(name => this.overwriteThenDelete(`${cacheDir}${name}`).catch(() => {})),
       );
+    } catch {
+      // best-effort
+    }
+  }
+
+  /**
+   * Layer 5: sweep leftover plaintext picker-cache copies. saveFile deletes the
+   * copy expo-document-picker/-image-picker leave in cache (deletePlaintextCacheCopy)
+   * right after import, but that delete is itself only best-effort - a crash/kill
+   * between the copy and that delete previously left the plaintext original behind
+   * with no startup fallback (unlike vault_view_* temps, which cleanupViewTemps
+   * already sweeps). Only the two subdirectories these pickers are documented to
+   * copy into are touched, never the whole cache dir, so unrelated framework cache
+   * data is never at risk of being swept away.
+   */
+  static async cleanupPickerCacheTemps(): Promise<void> {
+    const cacheDir = FileSystem.cacheDirectory || '';
+    if (!cacheDir) return;
+    await Promise.all(
+      ['DocumentPicker/', 'ImagePicker/'].map(sub =>
+        this.overwriteThenDeleteRecursive(`${cacheDir}${sub}`, 0).catch(() => {})
+      )
+    );
+  }
+
+  /**
+   * Recursively overwrite-then-delete a file, or a directory's contents then itself.
+   * depth is capped defensively (real picker-cache layouts are 1-2 levels deep) so a
+   * symlink loop or a misbehaving filesystem can never turn this into a runaway walk.
+   */
+  private static async overwriteThenDeleteRecursive(path: string, depth: number): Promise<void> {
+    if (depth > 8) return;
+    try {
+      const info = await FileSystem.getInfoAsync(path);
+      if (!info.exists) return;
+      if (info.isDirectory) {
+        const dir = path.endsWith('/') ? path : `${path}/`;
+        const entries = await FileSystem.readDirectoryAsync(dir);
+        await Promise.all(entries.map(name => this.overwriteThenDeleteRecursive(`${dir}${name}`, depth + 1)));
+        await FileSystem.deleteAsync(dir, { idempotent: true });
+      } else {
+        await this.overwriteThenDelete(path);
+      }
     } catch {
       // best-effort
     }
