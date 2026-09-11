@@ -747,10 +747,9 @@ export class SecureCryptoService {
     }
   }
 
-  /** Löscht alle In-Memory Caches (Master-Key + MAC-Key). Beim Sperren aufrufen. */
+  /** Löscht den In-Memory Master-Key-Cache. Beim Sperren aufrufen. */
   static clearAllCaches(): void {
     this._masterKeyCache = null;
-    this.macKeyCache.clear();
   }
 
   // ─────────────────────────────── Passphrase-based unlock (KEK wrapping) ───────────────────────────────
@@ -1376,9 +1375,6 @@ export class SecureCryptoService {
     this.__masterHandle = handle;
   }
 
-  // MAC-Key Cache: deterministisch ableitbar pro Master-Key, daher safely cacheable
-  private static macKeyCache = new Map<string, string>();
-
   /**
    * Derives a separate HMAC subkey from a strong key using HKDF-SHA256 (RFC 5869).
    *
@@ -1386,15 +1382,17 @@ export class SecureCryptoService {
    * passwords, not for deriving subkeys from already-strong 256-bit keys.
    * HKDF with a domain-separation label is the correct tool.
    *
-   * Cached: deterministic, same key → same MAC key.
+   * Not cached: this only ever runs in the JS-backed fallback (native custody never
+   * reaches this call), and the previous cache used the raw key hex itself — master
+   * key, KEK, or content key — as a Map key. Unlike KeyCustody's own session map
+   * (opaque handle → zeroable Uint8Array), that meant sensitive key material sat as
+   * an immutable, unzeroable JS string for as long as the cache entry lived, well
+   * past the single call that needed it. HKDF here is two cheap HMAC-SHA256 calls,
+   * so recomputing is not a meaningful cost - the win is not persisting the key
+   * material as a cache key at all.
    */
   static async deriveMacKey(keyHex: string): Promise<string> {
-    const cached = this.macKeyCache.get(keyHex);
-    if (cached) return cached;
-
-    const result = hkdfSha256(keyHex, 'filevault-mac-v1', 32);
-    this.macKeyCache.set(keyHex, result);
-    return result;
+    return hkdfSha256(keyHex, 'filevault-mac-v1', 32);
   }
 
   // M4: one-shot flag so the non-constant-time warning is logged at most once.

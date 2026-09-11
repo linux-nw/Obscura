@@ -40,7 +40,6 @@ describe('R-A: clearAllCaches() does NOT delete SecureStore keys', () => {
 
     // Only in-memory cache cleared (L3 Phase 2: master handle closed → no resolvable key)
     expect(SecureCryptoService.__masterKeyHexForTest()).toBeNull();
-    expect((SecureCryptoService as any).macKeyCache.size).toBe(0);
   }, 60000);
 
   test('vault is still unlockable after clearAllCaches()', async () => {
