@@ -72,6 +72,14 @@ export default function App() {
     // AutoLock-Callback: sperrt UI wenn Timer abläuft oder App in Background geht
     AutoLockService.setLockCallback(() => {
       CryptoService.clearAllCaches();
+      // L6: drop the cached guest content key AND the persisted decoy-active flag on
+      // every lock (timeout or background), not just explicit logout. Without this, a
+      // decoy-vault session left active by a lock (rather than the logout button) makes
+      // the NEXT successful real-passphrase/biometric unlock re-read the stale flag in
+      // handleAuthentication() and show the decoy vault instead of the real one.
+      DecoyVaultService.clearDecoyCache();
+      SecureStore.deleteItemAsync('filevault_guest_active').catch(() => {});
+      setIsDecoy(false);
       // Layer 5: drop any decrypted view-temp plaintext from the cache on lock.
       FileManager.cleanupViewTemps().catch(() => {});
       setIsAuthenticated(false);
