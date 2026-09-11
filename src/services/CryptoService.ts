@@ -36,28 +36,6 @@ const BACKEND_AESCBCHMAC = 0x02; // AES-256-CBC + HMAC-SHA256 (pure-JS fallback,
 const BACKEND_CRYPTOJS = 0x03; // CryptoJS (last resort, not recommended)
 
 /**
- * Extracts backend identifier from ciphertext header
- * First byte of decrypted data is the backend ID
- */
-const extractBackendFromHeader = (encryptedData: string): 'xchacha' | 'aescbchmac' | 'cryptojs' => {
-  try {
-    const header = parseInt(encryptedData.substring(0, 2), 16);
-    switch (header) {
-      case BACKEND_XCHACHA:
-        return 'xchacha';
-      case BACKEND_AESCBCHMAC:
-        return 'aescbchmac';
-      case BACKEND_CRYPTOJS:
-        return 'cryptojs';
-      default:
-        return 'cryptojs'; // Default to CryptoJS for unknown headers
-    }
-  } catch {
-    return 'cryptojs'; // Default fallback
-  }
-};
-
-/**
  * Versucht XChaCha20-Poly1305 mit native Module
  * Dies ist die PRIMARY encryption path (erstes, was verwendet wird)
  *
@@ -656,22 +634,6 @@ export class SecureCryptoService {
    * nicht geladen ist.
    */
   private static getEncryptionBackend(): 'xchacha' | 'aescbchmac' | 'cryptojs' {
-    if (canUseXChaCha20()) {
-      return 'xchacha';
-    }
-    if (canUseAesCbcHmac()) {
-      return 'aescbchmac';
-    }
-    return 'cryptojs';
-  }
-
-  /**
-   * Wählt das beste verfügbare Decryption Backend basierend auf Datenformat
-   * Priorität: XChaCha20 > AES-CBC+HMAC > CryptoJS
-   */
-  private static getDecryptionBackend(encryptedData: string): 'xchacha' | 'aescbchmac' | 'cryptojs' {
-    // Wenn wir die Daten selbst verschlüsselt haben, wissen wir das Backend
-    // Andernfalls versuchen wir XChaCha20 first, dann AES-CBC+HMAC, dann CryptoJS
     if (canUseXChaCha20()) {
       return 'xchacha';
     }
@@ -1598,53 +1560,6 @@ export class SecureCryptoService {
     await this.deleteItemSecure(this.STORAGE_MASTER_IV);
     await this.deleteItemSecure(this.STORAGE_MASTER_MAC);
     await this.deleteItemSecure(this.STORAGE_BIO_KEK);
-  }
-
-  /**
-   * Ändert den PIN und aktualisiert alle verschlüsselten Daten
-   * Rotiert den Master-Schlüssel und verschlüsselt alle bestehenden
-   * Dateien und Notizen mit dem neuen Schlüssel neu.
-   */
-  static async rotateEncryptionKey(newPassphrase: string): Promise<void> {
-    try {
-      // Alten Schlüssel abrufen
-      const oldKeyHex = await this.getItemSecure(this.STORAGE_KEY);
-      if (!oldKeyHex) {
-        throw new Error('Kein alter Schlüssel vorhanden');
-      }
-
-      // Alte PIN-Daten laden (verschlüsselt mit altem Master-Key)
-      const oldPinData = await this.getStoredPin();
-      if (!oldPinData) {
-        throw new Error('Keine PIN-Daten vorhanden');
-      }
-
-      // Neuen Master-Schlüssel generieren (nicht aus PIN ableiten!)
-      const newKeyHex = await this.generateSecureKey();
-      const newMacKey = await this.deriveMacKey(newKeyHex);
-
-      // Speichert den neuen Schlüssel
-      await this.setItemSecure(this.STORAGE_KEY, newKeyHex);
-
-      // PIN-Daten mit neuem Schlüssel neu verschlüsseln (AES-CBC, 16-byte IV)
-      const pinData = JSON.stringify(oldPinData);
-      const iv = await this.generateSecureBytes(this.CBC_IV_LENGTH);
-
-      const cipher = CryptoJS.AES.encrypt(pinData, CryptoJS.enc.Hex.parse(newKeyHex), {
-        iv: CryptoJS.enc.Hex.parse(this.bufferToHex(iv)),
-        mode: CryptoJS.mode.CBC,
-        padding: CryptoJS.pad.Pkcs7,
-      });
-
-      await this.setItemSecure(this.STORAGE_PIN_HASH, cipher.ciphertext.toString(CryptoJS.enc.Hex));
-      await this.setItemSecure(this.STORAGE_PIN_IV, this.bufferToHex(iv));
-      await this.setItemSecure(this.STORAGE_PIN_KEY, newKeyHex);
-
-      // HMAC-MacKey neu ableiten - alter MacKey wird ignoriert, neuer wird immer erzeugt
-      // (Der neue MacKey wird dynamisch aus dem neuen Master-Key abgeleitet)
-    } catch {
-      throw new Error('Konnte Schlüssel nicht rotieren - Daten könnten unzugänglich sein');
-    }
   }
 
   /**
