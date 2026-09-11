@@ -2,7 +2,9 @@
 
 **A privacy-first, cryptographically secured file and note vault for Android and iOS.**
 
-Obscura is a cross-platform mobile application (built with React Native/Expo) that encrypts files and notes on-device using military-grade cryptography. It implements a sophisticated three-layer key hierarchy, Argon2id key derivation, XChaCha20-Poly1305 authenticated encryption, and multiple anti-forensic and anti-tampering features including a panic PIN for emergency data denial, decoy vault functionality, secure auto-lock, and atomic key rotation with crash recovery.
+Obscura is a cross-platform mobile application (built with React Native/Expo) that encrypts files and notes on-device. It implements Argon2id key derivation, XChaCha20-Poly1305 authenticated encryption, and multiple anti-forensic and anti-tampering features including a panic PIN for emergency data denial, decoy vault functionality, secure auto-lock, and atomic key rotation with crash recovery. See `CRYPTO_PROTOCOL_SPEC.md` for the full cryptographic design, including its documented threat model and known weaknesses.
+
+> **Status:** source code only. There is currently no packaged release or downloadable APK — building the app yourself (see below) is the only way to run it.
 
 ---
 
@@ -298,6 +300,6 @@ On vault wipe, the app:
 
 ## License & Citation
 
-This project implements cryptographic protocols. For academic/commercial use, please refer to `CRYPTO_PROTOCOL_SPEC.md` for the formal specification and verify the implementation against the documented invariants.
+This project is licensed under the MIT License — see `LICENSE`. It implements cryptographic protocols; for academic/commercial use, please refer to `CRYPTO_PROTOCOL_SPEC.md` for the formal specification and verify the implementation against the documented invariants.
 
 **Status:** Production-ready after Round 3 security fixes. Ready for independent cryptographic audit before wide release.
