@@ -443,18 +443,20 @@ class SecureFileManager {
    * caps the zero-fill so a large leftover does not stall startup.
    */
   private static async cleanupPickerTemps(): Promise<void> {
-    try {
-      const cacheDir = FileSystem.cacheDirectory || '';
-      if (!cacheDir) return;
-      const pickerDir = `${cacheDir}DocumentPicker/`;
-      const info = await FileSystem.getInfoAsync(pickerDir);
-      if (!info.exists) return;
-      const entries = await FileSystem.readDirectoryAsync(pickerDir);
-      await Promise.all(
-        entries.map(name => this.overwriteThenDelete(`${pickerDir}${name}`).catch(() => {})),
-      );
-    } catch {
-      // best-effort
+    const cacheDir = FileSystem.cacheDirectory || '';
+    if (!cacheDir) return;
+    for (const dirName of ['DocumentPicker', 'ImagePicker']) {
+      try {
+        const pickerDir = `${cacheDir}${dirName}/`;
+        const info = await FileSystem.getInfoAsync(pickerDir);
+        if (!info.exists) continue;
+        const entries = await FileSystem.readDirectoryAsync(pickerDir);
+        await Promise.all(
+          entries.map(name => this.overwriteThenDelete(`${pickerDir}${name}`).catch(() => {})),
+        );
+      } catch {
+        // best-effort
+      }
     }
   }
 
