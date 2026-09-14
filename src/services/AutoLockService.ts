@@ -27,11 +27,23 @@ export class AutoLockService {
   private static timeoutId: ReturnType<typeof setTimeout> | null = null;
   private static lockCallback: (() => void) | null = null;
 
-  // F2/Picker: while a system picker (image/document) is open, the app
-  // necessarily goes to background. Suppress the background-lock during that
-  // controlled window so the master key survives until the picked file is saved.
-  // Set ONLY around an explicit in-app picker launch; always cleared in finally.
+  // F2/Picker: while a system picker (image/document) is open, the app necessarily goes to
+  // background. Suppress the background-lock during that controlled window so the master key
+  // survives until the picked file is saved. Set ONLY around an explicit in-app picker launch.
+  //
+  // HARD DEADLINE: the suppression also expires on its own after PICKER_MAX_MS. endPickerSession()
+  // runs in a finally, but a finally does not run if the process is killed — and the picker path
+  // is exactly where that happens (the OS kills a backgrounded app under memory pressure, which a
+  // large pick provokes). Without a deadline, one such kill left pickerActive stuck at true for
+  // the rest of the session: every background- and inactivity-lock became a silent no-op and the
+  // vault stayed unlocked in the background indefinitely. A stale flag must fail CLOSED.
   private static pickerActive = false;
+  private static pickerStartedAt = 0;
+  private static readonly PICKER_MAX_MS = 5 * 60 * 1000;
+
+  private static operationCount = 0;
+  private static operationStartedAt = 0;
+  private static readonly OPERATION_MAX_MS = 5 * 60 * 1000;
 
   private static settings: AutoLockSettings = {
     enabled: true,
@@ -39,21 +51,53 @@ export class AutoLockService {
     lastActivity: Date.now(),
   };
 
-  /** True while a system picker launched from within the app is in progress. */
+  /**
+   * True while a system picker launched from within the app is in progress AND the
+   * suppression window has not expired. Self-healing: an expired window clears the flag,
+   * so a picker session that never got its endPickerSession() cannot disable locking forever.
+   */
   static isPickerActive(): boolean {
-    return this.pickerActive;
+    if (!this.pickerActive) return false;
+    if (Date.now() - this.pickerStartedAt > this.PICKER_MAX_MS) {
+      console.warn('[AutoLock] picker suppression window expired — re-enabling auto-lock');
+      this.pickerActive = false;
+      return false;
+    }
+    return true;
   }
 
   /** Call immediately BEFORE launching a system picker (document/image). */
   static beginPickerSession(): void {
     this.pickerActive = true;
+    this.pickerStartedAt = Date.now();
   }
 
   /** Call in a finally AFTER the picker flow (incl. save) completes or cancels. */
   static endPickerSession(): void {
     this.pickerActive = false;
+    this.pickerStartedAt = 0;
     // Reset the inactivity timer: the picker round-trip counts as activity.
     this.resetTimer();
+  }
+
+  static isOperationInProgress(): boolean {
+    if (this.operationCount <= 0) return false;
+    if (Date.now() - this.operationStartedAt > this.OPERATION_MAX_MS) {
+      console.warn('[AutoLock] operation suppression window expired — re-enabling auto-lock');
+      this.operationCount = 0;
+      return false;
+    }
+    return true;
+  }
+
+  static beginOperation(): void {
+    if (this.operationCount === 0) this.operationStartedAt = Date.now();
+    this.operationCount++;
+  }
+
+  static endOperation(): void {
+    this.operationCount = Math.max(0, this.operationCount - 1);
+    if (this.operationCount === 0) this.operationStartedAt = 0;
   }
 
   /**
@@ -72,7 +116,6 @@ export class AutoLockService {
       await this.loadSettings();
       await this.setupAppStateListener();
       await this.checkAndLock();
-      console.log('AutoLock: Service initialized');
     } catch (error) {
       console.error('Error initializing AutoLock:', error);
     }
@@ -124,19 +167,35 @@ export class AutoLockService {
     }
   }
 
+  private static appStateSub: { remove(): void } | null = null;
+
   /**
-   * Setup AppState Listener für Background/Foreground
+   * Setup AppState Listener für Background/Foreground.
+   *
+   * Idempotent: the previous subscription is removed first. initialize() can legitimately run
+   * more than once (a re-mount, a retried startup) and every call used to add ANOTHER listener
+   * that was never removed — so triggerLock() fired N times per background transition, each
+   * writing SecureStore and vibrating the device.
    */
   private static async setupAppStateListener(): Promise<void> {
-    AppState.addEventListener('change', (state) => {
+    this.appStateSub?.remove();
+    this.appStateSub = AppState.addEventListener('change', (state) => {
       if (state === 'background') {
         this.triggerLock();
       } else if (state === 'active') {
         this.resetTimer();
       }
     });
+  }
 
-    console.log('AutoLock: AppState listener set up');
+  /** Remove the AppState subscription (teardown / tests). */
+  static teardown(): void {
+    this.appStateSub?.remove();
+    this.appStateSub = null;
+    if (this.timeoutId) {
+      clearTimeout(this.timeoutId);
+      this.timeoutId = null;
+    }
   }
 
   // ─────────────────────────────── Timer Management ───────────────────────────────
@@ -172,8 +231,6 @@ export class AutoLockService {
     this.timeoutId = setTimeout(() => {
       this.triggerLock();
     }, timeoutMs);
-
-    console.log(`AutoLock: Timer started (${this.settings.timeoutSeconds}s)`);
   }
 
   /**
@@ -205,9 +262,10 @@ export class AutoLockService {
    */
   static async triggerLock(): Promise<void> {
     try {
-      // F2/Picker: do not lock while a system picker launched from within the
-      // app is in progress — that backgrounding is expected and controlled.
-      if (this.pickerActive) {
+      // F2/Picker: do not lock while a system picker launched from within the app is in
+      // progress — that backgrounding is expected and controlled. isPickerActive() (not the
+      // raw flag) so an expired/stuck suppression window still locks.
+      if (this.isPickerActive() || this.isOperationInProgress()) {
         return;
       }
       if (Platform.OS === 'android') {
@@ -232,7 +290,6 @@ export class AutoLockService {
     try {
       await SecureStore.deleteItemAsync(this.LOCKED_KEY);
       this.resetTimer();
-      console.log('AutoLock: Vault unlocked');
     } catch (error) {
       console.error('Error unlocking:', error);
     }
@@ -287,18 +344,16 @@ export class AutoLockService {
   }
 
   /**
-   * Verlängert die Zeit (z.B. bei aktiver Nutzung)
-   */
-  static extendTimeout(extraSeconds: number = 30): void {
-    this.settings.lastActivity = Date.now() - (extraSeconds * 1000);
-    this.resetTimer();
-  }
-
-  /**
-   * Prüft ob Timeout bald erreicht wird
+   * Prüft ob das Timeout bald (>= 90 % der Zeitspanne) erreicht wird.
+   *
+   * (extendTimeout() wurde entfernt: es setzte lastActivity in die VERGANGENHEIT — verkürzte
+   * die Restzeit also, statt sie zu verlängern — und rief danach resetTimer() auf, das
+   * lastActivity ohnehin wieder auf jetzt setzte. Es war invertiert, wirkungslos und ohne
+   * Aufrufer. Wer die Sperre hinausschieben will, ruft resetTimer() auf.)
    */
   static async isNearTimeout(): Promise<boolean> {
     try {
+      if (!this.settings.enabled) return false;
       const lastActivity = await SecureStore.getItemAsync(this.LAST_ACTIVITY_KEY);
       if (!lastActivity) return false;
 

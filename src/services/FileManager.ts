@@ -1,8 +1,9 @@
 import * as FileSystem from 'expo-file-system/legacy';
-import * as Crypto from 'expo-crypto';
 import { SecureCryptoService as CryptoService } from './CryptoService';
 import { writeFileAtomic, cleanupTempFiles } from './fsAtomic';
 import { BlobVersionService } from './BlobVersionService';
+import { generateSecureId } from './ids';
+import { AutoLockService } from './AutoLockService';
 
 /**
  * Interface für die Key-Rotation: Re-Verschlüsselung aller Dateien nach PIN-Änderung
@@ -75,6 +76,11 @@ class SecureFileManager {
       await cleanupTempFiles(this.VAULT_DIR);
       // Layer 5: sweep any plaintext view-temp left in cache by a previous crash/kill.
       await this.cleanupViewTemps();
+      // Blocker 28: sweep plaintext picker copies left in cache by a crash or OOM-kill DURING
+      // an import — before saveFile's finally could delete them (the exact path that left two
+      // 150 MB plaintext .bin on-device). Runs at boot, before setIsCryptoReady flips and the
+      // auth screen renders, so a stale plaintext original never survives into a session.
+      await this.cleanupPickerTemps();
     } catch (error) {
       console.error('Error initializing vault:', error);
       throw new Error('Konnte Tresor nicht initialisieren');
@@ -159,6 +165,14 @@ class SecureFileManager {
         version,
       };
     } catch (error) {
+      // Surface the REJECTION REASON verbatim; only unexpected failures get the generic
+      // wrapper. Both of these are actionable by the user ("pick a smaller file", "rename
+      // it"), and hiding them behind "Konnte Datei nicht speichern" left the user with no
+      // idea what to change. Unexpected errors stay generic so nothing internal leaks.
+      if (error instanceof Error &&
+          (/^Datei zu groß/.test(error.message) || error.message === 'Ungültiger Dateiname')) {
+        throw error;
+      }
       console.error('Error saving file:', error);
       throw new Error('Konnte Datei nicht speichern');
     }
@@ -177,9 +191,11 @@ class SecureFileManager {
   ): Promise<FileMetadata> {
     await this.initialize();
 
-    if (this.containsPathTraversal(originalName)) {
-      throw new Error('Ungültiger Dateiname');
-    }
+    // Restore path: SANITISE rather than reject. A single odd name inside a backup (an old
+    // export, a name with a slash) must not abort the whole restore and strand the user's
+    // remaining files — saveFile() still rejects outright, because there the user can simply
+    // pick a different file.
+    originalName = this.sanitizeFileName(originalName);
 
     const fileId = await this.generateSecureFileId();
     const fileName = `file_${fileId}`;
@@ -419,6 +435,30 @@ class SecureFileManager {
   }
 
   /**
+   * Blocker 28: sweep any plaintext copies expo-document-picker left in cache/DocumentPicker/.
+   * saveFile's finally deletes the copy on every NORMAL import outcome, but a crash or an
+   * OOM-kill DURING an import (exactly what oversized picks trigger) kills the process before
+   * the finally runs, stranding the unencrypted original. Called at boot from initialize() so
+   * such a leftover is wiped before the vault becomes usable. Best-effort; overwriteThenDelete
+   * caps the zero-fill so a large leftover does not stall startup.
+   */
+  private static async cleanupPickerTemps(): Promise<void> {
+    try {
+      const cacheDir = FileSystem.cacheDirectory || '';
+      if (!cacheDir) return;
+      const pickerDir = `${cacheDir}DocumentPicker/`;
+      const info = await FileSystem.getInfoAsync(pickerDir);
+      if (!info.exists) return;
+      const entries = await FileSystem.readDirectoryAsync(pickerDir);
+      await Promise.all(
+        entries.map(name => this.overwriteThenDelete(`${pickerDir}${name}`).catch(() => {})),
+      );
+    } catch {
+      // best-effort
+    }
+  }
+
+  /**
    * Liefert die Dateiendung (inkl. Punkt, klein geschrieben) eines Namens, oder ''.
    */
   private static extensionOf(name: string): string {
@@ -432,39 +472,44 @@ class SecureFileManager {
    * daher crash-sicher wiederholbar.
    */
   static async reencryptAll(oldHandle: string, newHandle: string): Promise<void> {
-    await this.initialize();
-    const files = await FileSystem.readDirectoryAsync(this.VAULT_DIR);
-    const metaFiles = files.filter(f => f.endsWith('.meta.enc'));
+    AutoLockService.beginOperation();
+    try {
+      await this.initialize();
+      const files = await FileSystem.readDirectoryAsync(this.VAULT_DIR);
+      const metaFiles = files.filter(f => f.endsWith('.meta.enc'));
 
-    for (const metaFile of metaFiles) {
-      const metaPath = `${this.VAULT_DIR}${metaFile}`;
-      const meta = JSON.parse(await FileSystem.readAsStringAsync(metaPath));
-      const fileName = meta.name ?? metaFile.replace('.meta.enc', '');
-      const contentPath = `${this.VAULT_DIR}${fileName}`;
+      for (const metaFile of metaFiles) {
+        const metaPath = `${this.VAULT_DIR}${metaFile}`;
+        const meta = JSON.parse(await FileSystem.readAsStringAsync(metaPath));
+        const fileName = meta.name ?? metaFile.replace('.meta.enc', '');
+        const contentPath = `${this.VAULT_DIR}${fileName}`;
 
-      // Datei-Inhalt (Ciphertext separat, iv/mac in der Metadatei).
-      // A3: dieselbe Version in alter+neuer AAD bewahren (recryptBlob ändert sie nicht).
-      const contentData = await FileSystem.readAsStringAsync(contentPath);
-      const fid = meta.id;
-      const v = meta.version ?? 1;
-      const newContent = await CryptoService.recryptBlob(
-        { data: contentData, iv: meta.iv, mac: meta.mac },
-        oldHandle,
-        newHandle,
-        `${fid}:content:v${v}`
-      );
-      const newOriginalName = await CryptoService.recryptBlob(meta.originalName, oldHandle, newHandle, `${fid}:name:v${v}`);
-      const newType = await CryptoService.recryptBlob(meta.type, oldHandle, newHandle, `${fid}:type:v${v}`);
+        // Datei-Inhalt (Ciphertext separat, iv/mac in der Metadatei).
+        // A3: dieselbe Version in alter+neuer AAD bewahren (recryptBlob ändert sie nicht).
+        const contentData = await FileSystem.readAsStringAsync(contentPath);
+        const fid = meta.id;
+        const v = meta.version ?? 1;
+        const newContent = await CryptoService.recryptBlob(
+          { data: contentData, iv: meta.iv, mac: meta.mac },
+          oldHandle,
+          newHandle,
+          `${fid}:content:v${v}`
+        );
+        const newOriginalName = await CryptoService.recryptBlob(meta.originalName, oldHandle, newHandle, `${fid}:name:v${v}`);
+        const newType = await CryptoService.recryptBlob(meta.type, oldHandle, newHandle, `${fid}:type:v${v}`);
 
-      // Inhalt zuerst, dann Metadatei schreiben (per-Blob-Idempotenz macht die
-      // Reihenfolge unkritisch — ein Abbruch dazwischen wird sauber resümiert).
-      // H3: atomic temp+rename so a crash never truncates a blob.
-      await writeFileAtomic(contentPath, newContent.data);
-      meta.iv = newContent.iv;
-      meta.mac = newContent.mac;
-      meta.originalName = newOriginalName;
-      meta.type = newType;
-      await writeFileAtomic(metaPath, JSON.stringify(meta));
+        // Inhalt zuerst, dann Metadatei schreiben (per-Blob-Idempotenz macht die
+        // Reihenfolge unkritisch — ein Abbruch dazwischen wird sauber resümiert).
+        // H3: atomic temp+rename so a crash never truncates a blob.
+        await writeFileAtomic(contentPath, newContent.data);
+        meta.iv = newContent.iv;
+        meta.mac = newContent.mac;
+        meta.originalName = newOriginalName;
+        meta.type = newType;
+        await writeFileAtomic(metaPath, JSON.stringify(meta));
+      }
+    } finally {
+      AutoLockService.endOperation();
     }
   }
 
@@ -526,18 +571,12 @@ class SecureFileManager {
   // ─────────────────────────────── Hilfsfunktionen ───────────────────────────────
 
   /**
-   * Generiert eine nicht vorhersagbare File-ID (ohne Präfix).
-   * Der Aufrufer ist verantwortlich für das Präfix im Dateinamen.
+   * Nicht vorhersagbare File-ID (ohne Präfix). Der Aufrufer setzt das Präfix im Dateinamen.
+   * Gemeinsame Implementierung mit NotesService/DecoyVaultService — siehe ids.ts.
    */
   private static async generateSecureFileId(): Promise<string> {
     try {
-      const timestamp = Date.now().toString(36);
-      const randomBytes = await Crypto.getRandomBytesAsync(8);
-      const randomHex = Array.from(new Uint8Array(randomBytes))
-        .map(b => b.toString(16).padStart(2, '0'))
-        .join('');
-
-      return `${timestamp}_${randomHex}`;
+      return await generateSecureId();
     } catch (error) {
       console.error('Error generating file ID:', error);
       throw new Error('Konnte File-ID nicht generieren');
@@ -545,12 +584,49 @@ class SecureFileManager {
   }
 
   /**
-   * Prüft ob der Dateiname Directory Traversal enthält
+   * Prüft ob der Dateiname für die Speicherung unsicher ist.
+   *
+   * Der Originalname wird zwar verschlüsselt abgelegt und NICHT als Pfad verwendet — er
+   * fließt aber über extensionOf() in den Namen der Klartext-Vorschaudatei im Cache ein und
+   * wird beim Export/Teilen an andere Apps weitergereicht. Die alte Prüfung deckte nur `..`
+   * und `//` ab und ließ damit durch:
+   *   - Backslash-Traversal (`..\\..\\x`) — auf Android ein gültiges Pfadtrennzeichen für
+   *     manche Consumer,
+   *   - absolute Pfade (`/etc/x`, `C:\\x`),
+   *   - NUL und Steuerzeichen, die Pfad-APIs in nativem Code abschneiden können
+   *     (`foo.jpg\u0000.exe`),
+   *   - leere oder rein aus Punkten bestehende Namen (`.`, `..`).
    */
   private static containsPathTraversal(filename: string): boolean {
-    // Prüft auf .../ oder ..\ und andere potenziell gefährliche Muster
-    return filename.includes('..') || filename.includes('//');
+    if (typeof filename !== 'string' || filename.trim().length === 0) return true;
+    if (filename.length > 255) return true;
+    // NUL + sonstige Steuerzeichen
+    if (/[\u0000-\u001f\u007f]/.test(filename)) return true;
+    // Pfadtrennzeichen jeglicher Art
+    if (filename.includes('/') || filename.includes('\\')) return true;
+    // Traversal-Segmente und Windows-Laufwerksbuchstaben
+    if (filename.includes('..') || /^[A-Za-z]:/.test(filename)) return true;
+    // Reine Punkt-Namen
+    if (/^\.+$/.test(filename)) return true;
+    return false;
   }
+
+  /**
+   * Macht einen beliebigen Namen speicherbar: Pfadtrennzeichen und Steuerzeichen raus,
+   * Traversal-Segmente entschärft, Länge begrenzt. Leert der Name dabei aus, wird ein
+   * neutraler Ersatzname verwendet. Nur für den Restore-/Import-Pfad (siehe importFile).
+   */
+  static sanitizeFileName(name: string): string {
+    const cleaned = (typeof name === 'string' ? name : '')
+      .replace(/[\u0000-\u001f\u007f]/g, '')             // NUL + Steuerzeichen
+      .replace(/[\/\\]/g, '_')                // Pfadtrennzeichen neutralisieren
+      .replace(/\.{2,}/g, '.')                // Traversal-Segmente entschaerfen
+      .replace(/^[A-Za-z]:/, '')              // Windows-Laufwerksbuchstabe
+      .trim()
+      .slice(0, 255);
+    return cleaned.length > 0 && !/^\.+$/.test(cleaned) ? cleaned : 'unbenannt';
+  }
+
 }
 
 export { SecureFileManager as FileManager };

@@ -17,6 +17,7 @@ import * as SecureStore from 'expo-secure-store';
 import { SecureCryptoService } from './CryptoService';
 import { FileManager } from './FileManager';
 import { NotesService } from './NotesService';
+import { AutoLockService } from './AutoLockService';
 
 const WAL_KEY = 'filevault_keyrotation_wal';
 // W-05: a rotation WAL older than this is "stale" — surfaced (warned) before resume.
@@ -91,31 +92,36 @@ export class KeyRotationService {
     const unlocked = await SecureCryptoService.unlock(currentPassphrase);
     if (!unlocked) throw new Error('Falsches Passwort — Rotation abgebrochen');
 
-    // L3 Phase 2: the master key is addressed by a custody handle, never a raw value.
-    const oldHandle = SecureCryptoService.currentMasterHandle();
+    AutoLockService.beginOperation();
+    try {
+      // L3 Phase 2: the master key is addressed by a custody handle, never a raw value.
+      const oldHandle = SecureCryptoService.currentMasterHandle();
 
-    const newMasterKeyBuf = await SecureCryptoService.generateSecureBytes(32);
-    const newMasterKeyHex = SecureCryptoService.bufferToHex(newMasterKeyBuf);
-    const newHandle = SecureCryptoService.registerKeyHandle(newMasterKeyHex);
+      const newMasterKeyBuf = await SecureCryptoService.generateSecureBytes(32);
+      const newMasterKeyHex = SecureCryptoService.bufferToHex(newMasterKeyBuf);
+      const newHandle = SecureCryptoService.registerKeyHandle(newMasterKeyHex);
 
-    // Wrap the new master key with the OLD master key so a resume can retrieve it
-    // while the OLD master is still the installed one.
-    const newMasterWrapped = await SecureCryptoService.encryptFileKeyWith(newMasterKeyHex, oldHandle);
+      // Wrap the new master key with the OLD master key so a resume can retrieve it
+      // while the OLD master is still the installed one.
+      const newMasterWrapped = await SecureCryptoService.encryptFileKeyWith(newMasterKeyHex, oldHandle);
 
-    const wal: RotationWAL = { newMasterWrapped, startedAt: Date.now() };
-    await SecureStore.setItemAsync(WAL_KEY, JSON.stringify(wal));
+      const wal: RotationWAL = { newMasterWrapped, startedAt: Date.now() };
+      await SecureStore.setItemAsync(WAL_KEY, JSON.stringify(wal));
 
-    await this.migrateContent(oldHandle, newHandle);
+      await this.migrateContent(oldHandle, newHandle);
 
-    // Commit: install the new master key (wrap with passphrase, register the live master
-    // handle — this also closes the old handle). Then drop our migration handle + the WAL.
-    await SecureCryptoService.installMasterKey(newMasterKeyHex, currentPassphrase);
-    SecureCryptoService.closeKeyHandle(newHandle);
-    SecureCryptoService.closeKeyHandle(oldHandle);
-    await SecureStore.deleteItemAsync(WAL_KEY);
+      // Commit: install the new master key (wrap with passphrase, register the live master
+      // handle — this also closes the old handle). Then drop our migration handle + the WAL.
+      await SecureCryptoService.installMasterKey(newMasterKeyHex, currentPassphrase);
+      SecureCryptoService.closeKeyHandle(newHandle);
+      SecureCryptoService.closeKeyHandle(oldHandle);
+      await SecureStore.deleteItemAsync(WAL_KEY);
 
-    await this.incrementRotationCount();
-    await this.scheduleNextRotation();
+      await this.incrementRotationCount();
+      await this.scheduleNextRotation();
+    } finally {
+      AutoLockService.endOperation();
+    }
   }
 
   /**
@@ -126,6 +132,7 @@ export class KeyRotationService {
     const walStr = await SecureStore.getItemAsync(WAL_KEY);
     if (!walStr) return;
 
+    AutoLockService.beginOperation();
     try {
       const wal = JSON.parse(walStr) as RotationWAL;
       let currentHandle: string;
@@ -167,6 +174,8 @@ export class KeyRotationService {
     } catch (error) {
       console.error('KeyRotation: resume failed:', error);
       // Keep the WAL so the next unlock can retry.
+    } finally {
+      AutoLockService.endOperation();
     }
   }
 
@@ -193,7 +202,6 @@ export class KeyRotationService {
       }
       if (Date.now() >= parseInt(nextRotation, 10)) {
         // Automatic rotation requires a passphrase; skip here and let the UI prompt.
-        console.log('KeyRotation: Rotation due — awaiting user interaction');
       }
     } catch (error) {
       console.error('KeyRotation: checkAndRotate failed:', error);
