@@ -1,0 +1,43 @@
+name: Verify (types + host test suite)
+
+# The host suite is the fast safety net — it covers the whole TypeScript service layer
+# (crypto, key custody, wipe completeness, backup hardening, auth accounting, decoy vault)
+# and runs in well under a minute. It was not wired into CI at all: android-kat.yml only
+# runs the on-device native KATs, and only when android/** or src/native/** changes. So a
+# regression anywhere in src/services/ could land without a single check firing.
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Type-check
+        run: npm run type-check
+
+      - name: Host test suite
+        run: npm test -- --ci --runInBand
+
+      # Coverage is reported, not gated: a hard threshold on a codebase with deliberately
+      # unreachable native branches (Argon2idService's libsodium path cannot run under Jest)
+      # would fail for the wrong reason. The number is surfaced so a drop is visible in review.
+      - name: Coverage summary
+        if: always()
+        run: npm run test:coverage -- --ci --runInBand --coverageReporters=text-summary

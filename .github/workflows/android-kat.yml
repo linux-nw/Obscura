@@ -15,6 +15,9 @@ name: Android Native Crypto KAT (S4/S7)
 # `-PreactNativeArchitectures=arm64-v8a`. Done: device SM-S906B, 2026-06-26,
 # tests=15 failures=0 (see CRYPTO_PROTOCOL_SPEC.md §13.1).
 
+permissions:
+  contents: read
+
 on:
   push:
     paths:

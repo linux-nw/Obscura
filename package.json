@@ -10,6 +10,8 @@
     "web": "expo start --web",
     "type-check": "tsc --noEmit",
     "test": "jest --forceExit",
+    "test:coverage": "jest --forceExit --coverage --collectCoverageFrom=\"src/services/**/*.ts\"",
+    "verify": "npm run type-check && npm test",
     "postinstall": "node scripts/fix-expo-formdata.js && node scripts/fix-performance-logger.js"
   },
   "dependencies": {
