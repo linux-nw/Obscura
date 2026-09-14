@@ -104,19 +104,9 @@ export class XChaCha20CryptoService {
     return await SecureCryptoService.computeMac(macKey, data);
   }
 
-  /**
-   * DEPRECATED - Nutze SecureCryptoService.deriveKeyFromPassphrase()
-   */
-  static async deriveKeyFromPassphrase(
-    password: string,
-    saltBase64?: string,
-    iterations = 2,
-    memory = 65536
-  ): Promise<string> {
-    console.warn('XChaCha20CryptoService.deriveKeyFromPassphrase() ist veraltet!');
-    const { SecureCryptoService } = await import('./CryptoService');
-    return await SecureCryptoService.deriveKeyFromPassphrase(password);
-  }
+  // ENTFERNT: deriveKeyFromPassphrase(). Rief SecureCryptoService.deriveKeyFromPassphrase()
+  // auf, das C1 als toten Code entfernt hat (kein Aufrufer, gefährlicher stiller
+  // PBKDF2-Fallback). Dieser Wrapper selbst hatte ebenfalls keinen Aufrufer.
 
   // ─────────────────────────────── Dateiverschlüsselung ───────────────────────────────
 

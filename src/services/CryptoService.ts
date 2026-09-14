@@ -4,7 +4,7 @@ import { NativeModules } from 'react-native';
 import CryptoJS from 'crypto-js';
 import { Argon2idService, Argon2Params } from './Argon2idService';
 import { HardwareBackedStorage } from './HardwareKeystoreService';
-import { fastPbkdf2, hkdfSha256, isNobleAvailable } from './FastPBKDF2';
+import { fastPbkdf2, hkdfSha256 } from './FastPBKDF2';
 import { aesCbcEncryptRaw, aesCbcDecryptRaw } from './AesCbcHmac';
 import { keyCustody } from './KeyCustody';
 // XChaCha20-Poly1305 native Module (erstellt bei ADB-Test)
@@ -34,28 +34,6 @@ import { encrypt as xchachaEncrypt, decrypt as xchachaDecrypt, verifyConstantTim
 const BACKEND_XCHACHA = 0x01; // XChaCha20-Poly1305
 const BACKEND_AESCBCHMAC = 0x02; // AES-256-CBC + HMAC-SHA256 (pure-JS fallback, formerly "FastAES")
 const BACKEND_CRYPTOJS = 0x03; // CryptoJS (last resort, not recommended)
-
-/**
- * Extracts backend identifier from ciphertext header
- * First byte of decrypted data is the backend ID
- */
-const extractBackendFromHeader = (encryptedData: string): 'xchacha' | 'aescbchmac' | 'cryptojs' => {
-  try {
-    const header = parseInt(encryptedData.substring(0, 2), 16);
-    switch (header) {
-      case BACKEND_XCHACHA:
-        return 'xchacha';
-      case BACKEND_AESCBCHMAC:
-        return 'aescbchmac';
-      case BACKEND_CRYPTOJS:
-        return 'cryptojs';
-      default:
-        return 'cryptojs'; // Default to CryptoJS for unknown headers
-    }
-  } catch {
-    return 'cryptojs'; // Default fallback
-  }
-};
 
 /**
  * Versucht XChaCha20-Poly1305 mit native Module
@@ -156,6 +134,7 @@ export class SecureCryptoService {
   private static readonly STORAGE_MASTER_ENC = 'filevault_master_enc';
   private static readonly STORAGE_MASTER_IV = 'filevault_master_iv';
   private static readonly STORAGE_MASTER_MAC = 'filevault_master_mac';
+  private static readonly STORAGE_MASTER_WAL = 'filevault_master_wal';
   private static readonly STORAGE_BIO_KEK = 'filevault_bio_kek';
   private static readonly LOCK_DURATION_MS = 300000; // 5 Minuten
 
@@ -446,54 +425,6 @@ export class SecureCryptoService {
     return this.base64ToUtf8(result);
   }
 
-  // ─── CryptoJS CBC Implementierung (Legacy, für Key Wrapping) ───
-
-  private static async cryptoJSCBCEncrypt(
-    data: string,
-    keyHex: string,
-    ivHex: string
-  ): Promise<{ encryptedData: string; tag: string }> {
-    const keyBytes = CryptoJS.enc.Hex.parse(keyHex);
-    const ivBytes = CryptoJS.enc.Hex.parse(ivHex);
-    const cipher = CryptoJS.AES.encrypt(data, keyBytes, {
-      iv: ivBytes,
-      mode: CryptoJS.mode.CBC,
-      padding: CryptoJS.pad.Pkcs7,
-    });
-    const encryptedHex = cipher.ciphertext.toString(CryptoJS.enc.Hex);
-    const macKey = await this.deriveMacKey(keyHex);
-    const mac = await this.computeMac(macKey, ivHex + encryptedHex);
-    return { encryptedData: encryptedHex, tag: mac };
-  }
-
-  private static async cryptoJSCBCDecrypt(
-    encryptedData: string,
-    ivHex: string,
-    tag: string,
-    keyHex: string
-  ): Promise<string> {
-    const keyBytes = CryptoJS.enc.Hex.parse(keyHex);
-    const ivBytes = CryptoJS.enc.Hex.parse(ivHex);
-    const macKey = await this.deriveMacKey(keyHex);
-    const expectedMac = await this.computeMac(macKey, ivHex + encryptedData);
-    if (!await this.constantsTimeEquals(expectedMac, tag)) {
-      throw new Error('Integritätsprüfung fehlgeschlagen');
-    }
-    const cipherParams = CryptoJS.lib.CipherParams.create({
-      ciphertext: CryptoJS.enc.Hex.parse(encryptedData),
-    });
-    const cipher = CryptoJS.AES.decrypt(
-      cipherParams,
-      keyBytes,
-      {
-        iv: ivBytes,
-        mode: CryptoJS.mode.CBC,
-        padding: CryptoJS.pad.Pkcs7,
-      }
-    );
-    return cipher.toString(CryptoJS.enc.Utf8);
-  }
-
   // ─────────────────────────────── AES-256-CBC + HMAC Backend (First Fallback) ───────────────────────────────
 
   /**
@@ -665,22 +596,6 @@ export class SecureCryptoService {
     return 'cryptojs';
   }
 
-  /**
-   * Wählt das beste verfügbare Decryption Backend basierend auf Datenformat
-   * Priorität: XChaCha20 > AES-CBC+HMAC > CryptoJS
-   */
-  private static getDecryptionBackend(encryptedData: string): 'xchacha' | 'aescbchmac' | 'cryptojs' {
-    // Wenn wir die Daten selbst verschlüsselt haben, wissen wir das Backend
-    // Andernfalls versuchen wir XChaCha20 first, dann AES-CBC+HMAC, dann CryptoJS
-    if (canUseXChaCha20()) {
-      return 'xchacha';
-    }
-    if (canUseAesCbcHmac()) {
-      return 'aescbchmac';
-    }
-    return 'cryptojs';
-  }
-
   // ─────────────────────────────── Public API ───────────────────────────────
 
   /**
@@ -742,6 +657,7 @@ export class SecureCryptoService {
   static async loadMasterKeyForBiometric(): Promise<boolean> {
     if (this.__masterHandle && keyCustody.has(this.__masterHandle)) return true;
     try {
+      await this.restoreMasterWalIfNeeded();
       const kek = await SecureStore.getItemAsync(this.STORAGE_BIO_KEK, {
         requireAuthentication: true,
         authenticationPrompt: 'Tresor entsperren',
@@ -804,12 +720,55 @@ export class SecureCryptoService {
   }
 
   /**
+   * A3-AUTH: while true, a failed unlock does NOT bump the lockout counter.
+   *
+   * AuthScreen probes ALL THREE credentials in parallel (real / panic / decoy) so the three
+   * paths are indistinguishable by timing. Two of the three necessarily fail on every login,
+   * so an unconditional incrementFailedAttempts() here meant a *successful decoy or panic*
+   * login still charged the real vault a failed attempt — five decoy logins locked the real
+   * vault for 5 minutes, and the resulting lockout message told an observer that a second,
+   * real credential exists (a deniability leak, not just an annoyance).
+   *
+   * The counter is therefore owned by the caller that knows the combined outcome: AuthScreen
+   * probes inside withAttemptCountSuppressed() and calls registerFailedUnlock() only when
+   * NONE of the three matched.
+   */
+  private static _suppressAttemptCount = false;
+
+  /**
+   * Run `fn` with lockout counting suppressed. Re-entrant-safe and always restores the flag.
+   * Use when several credentials are probed against the same input and only the combined
+   * result is a real authentication failure.
+   */
+  static async withAttemptCountSuppressed<T>(fn: () => Promise<T>): Promise<T> {
+    const prev = this._suppressAttemptCount;
+    this._suppressAttemptCount = true;
+    try {
+      return await fn();
+    } finally {
+      this._suppressAttemptCount = prev;
+    }
+  }
+
+  /** Charge one failed authentication attempt (locks the vault at MAX_FAILED_ATTEMPTS). */
+  static async registerFailedUnlock(): Promise<void> {
+    const prev = this._suppressAttemptCount;
+    this._suppressAttemptCount = false;
+    try {
+      await this.incrementFailedAttempts();
+    } finally {
+      this._suppressAttemptCount = prev;
+    }
+  }
+
+  /**
    * Login: derive KEK from passphrase, decrypt master key, cache it.
    * Handles legacy format migration transparently.
    * Returns false if passphrase is wrong or vault is locked.
    */
   static async unlock(passphrase: string): Promise<boolean> {
     try {
+      await this.restoreMasterWalIfNeeded();
       const isLocked = await this.isAccountLocked();
       if (isLocked) return false;
 
@@ -972,11 +931,32 @@ export class SecureCryptoService {
   private static async storeWrappedMaster(
     kekSaltHex: string, ivHex: string, ctHex: string, macHex: string
   ): Promise<void> {
+    const wal = JSON.stringify({ kekSaltHex, kdfMeta: this.KDF_META_CURRENT, ctHex, ivHex, macHex });
+    await this.setItemSecure(this.STORAGE_MASTER_WAL, wal);
     await this.setItemSecure(this.STORAGE_KEK_SALT, kekSaltHex);
-    await this.setItemSecure(this.STORAGE_KDF_META, this.KDF_META_CURRENT); // C1
+    await this.setItemSecure(this.STORAGE_KDF_META, this.KDF_META_CURRENT);
     await this.setItemSecure(this.STORAGE_MASTER_ENC, ctHex);
     await this.setItemSecure(this.STORAGE_MASTER_IV, ivHex);
     await this.setItemSecure(this.STORAGE_MASTER_MAC, macHex);
+    await this.deleteItemSecure(this.STORAGE_MASTER_WAL);
+  }
+
+  private static async restoreMasterWalIfNeeded(): Promise<void> {
+    const wal = await this.getItemSecure(this.STORAGE_MASTER_WAL);
+    if (!wal) return;
+    try {
+      const parsed = JSON.parse(wal) as {
+        kekSaltHex: string; kdfMeta: string; ctHex: string; ivHex: string; macHex: string;
+      };
+      if (!parsed.kekSaltHex || !parsed.kdfMeta || !parsed.ctHex || !parsed.ivHex || !parsed.macHex) return;
+      await this.setItemSecure(this.STORAGE_KEK_SALT, parsed.kekSaltHex);
+      await this.setItemSecure(this.STORAGE_KDF_META, parsed.kdfMeta);
+      await this.setItemSecure(this.STORAGE_MASTER_ENC, parsed.ctHex);
+      await this.setItemSecure(this.STORAGE_MASTER_IV, parsed.ivHex);
+      await this.setItemSecure(this.STORAGE_MASTER_MAC, parsed.macHex);
+    } finally {
+      await this.deleteItemSecure(this.STORAGE_MASTER_WAL);
+    }
   }
 
   /**
@@ -1027,7 +1007,9 @@ export class SecureCryptoService {
 
     const nativeArgon2 = (global as any).__argon2_native_available;
     if (!this._kdfLogged) {
-      console.log(`[KDF] deriveKEK using ${nativeArgon2 ? 'Argon2id (native libsodium)' : 'Argon2id (@noble/hashes JS fallback)'}`);
+      if (typeof __DEV__ !== 'undefined' && __DEV__) {
+        console.log(`[KDF] deriveKEK using ${nativeArgon2 ? 'Argon2id (native libsodium)' : 'Argon2id (@noble/hashes JS fallback)'}`);
+      }
       this._kdfLogged = true;
     }
 
@@ -1287,51 +1269,12 @@ export class SecureCryptoService {
     return /^[a-f0-9]{64}$/i.test(hash);
   }
 
-  /**
-   * Leitet einen Verschlüsselungsschlüssel aus einer Passphrase (PIN) ab
-   * Nutzt Argon2id (empfohlen) mit fastPbkdf2 Fallback für Kompatibilität
-   * ACHTUNG: Kein CryptoJS Fallback mehr - fastPbkdf2 nutzt native Backends
-   * @param passphrase Die Passphrase (PIN)
-   * @returns Hex-string des abgeleiteten Schlüssels
-   */
-  static async deriveKeyFromPassphrase(passphrase: string): Promise<string> {
-    try {
-      let saltHex = await this.getItemSecure(this.STORAGE_SALT);
-      if (!saltHex) {
-        // Fallback: wenn kein Salt existiert, generiere einen
-        const salt = await this.generateSecureBytes(16);
-        saltHex = this.bufferToHex(salt);
-        await this.setItemSecure(this.STORAGE_SALT, saltHex);
-      }
-
-      const saltBuffer = this.hexToBuffer(saltHex);
-
-      // Prüfe ob native Argon2 Module verfügbar ist
-      const useArgon2 = (global as any).__argon2_native_available;
-
-      if (useArgon2) {
-        // Argon2id verwenden
-        const params: Argon2Params = {
-          version: this.ARGON2_VERSION,
-          type: 2, // Argon2id
-          memoryKB: this.ARGON2_MEMORY_KB,
-          iterations: this.ARGON2_ITERATIONS, // 3 Iterationen
-          parallelism: this.ARGON2_PARALLELISM,
-          hashLength: this.ARGON2_HASH_LENGTH,
-        };
-
-        const derivedKey = await Argon2idService.deriveKey(passphrase, saltBuffer, params);
-        return this.bufferToHex(derivedKey);
-      } else {
-        // Fallback auf fastPbkdf2 (fast-sha256 oder native quick-crypto)
-        // Kein CryptoJS Fallback - wir werfen statt dessen einen Error
-        const derivedKey = await fastPbkdf2(passphrase, saltHex, this.PBKDF2_ITERATIONS, this.PBKDF2_KEY_LENGTH);
-        return derivedKey;
-      }
-    } catch {
-      throw new Error('Konnte Schlüssel nicht aus Passphrase ableiten');
-    }
-  }
+  // ─────────────────────────────── HMAC ───────────────────────────────
+  //
+  // ENTFERNT: deriveKeyFromPassphrase(). Toter Code, und gefährlich tot: er hätte bei
+  // fehlendem nativen Argon2 stillschweigend auf PBKDF2 zurückgeschaltet, obwohl F1 den
+  // PBKDF2-Downgrade-Pfad genau deshalb abgeschafft hat. Die einzige produktive
+  // Passwort-KDF ist deriveKEK() (immer Argon2id, kein Fallback).
 
   /**
    * Erstellt einen HMAC für Integritätsprüfung
@@ -1371,14 +1314,6 @@ export class SecureCryptoService {
   }
 
   // ─────────────────────────────── Hilfsfunktionen ───────────────────────────────
-
-  /**
-   * Generiert kryptographisch sichere Zufallsbytes
-   */
-  private static async generateSecureKey(): Promise<string> {
-    const buffer = await this.generateSecureBytes(32);
-    return this.bufferToHex(buffer);
-  }
 
   // L3 Phase 2: the master key is addressed by an opaque custody HANDLE, never held as raw
   // bytes on the service. `__masterHandle` indexes KeyCustody (JS-backed in 2a — the raw key
@@ -1600,70 +1535,20 @@ export class SecureCryptoService {
     await this.deleteItemSecure(this.STORAGE_BIO_KEK);
   }
 
-  /**
-   * Ändert den PIN und aktualisiert alle verschlüsselten Daten
-   * Rotiert den Master-Schlüssel und verschlüsselt alle bestehenden
-   * Dateien und Notizen mit dem neuen Schlüssel neu.
-   */
-  static async rotateEncryptionKey(newPassphrase: string): Promise<void> {
-    try {
-      // Alten Schlüssel abrufen
-      const oldKeyHex = await this.getItemSecure(this.STORAGE_KEY);
-      if (!oldKeyHex) {
-        throw new Error('Kein alter Schlüssel vorhanden');
-      }
-
-      // Alte PIN-Daten laden (verschlüsselt mit altem Master-Key)
-      const oldPinData = await this.getStoredPin();
-      if (!oldPinData) {
-        throw new Error('Keine PIN-Daten vorhanden');
-      }
-
-      // Neuen Master-Schlüssel generieren (nicht aus PIN ableiten!)
-      const newKeyHex = await this.generateSecureKey();
-      const newMacKey = await this.deriveMacKey(newKeyHex);
-
-      // Speichert den neuen Schlüssel
-      await this.setItemSecure(this.STORAGE_KEY, newKeyHex);
-
-      // PIN-Daten mit neuem Schlüssel neu verschlüsseln (AES-CBC, 16-byte IV)
-      const pinData = JSON.stringify(oldPinData);
-      const iv = await this.generateSecureBytes(this.CBC_IV_LENGTH);
-
-      const cipher = CryptoJS.AES.encrypt(pinData, CryptoJS.enc.Hex.parse(newKeyHex), {
-        iv: CryptoJS.enc.Hex.parse(this.bufferToHex(iv)),
-        mode: CryptoJS.mode.CBC,
-        padding: CryptoJS.pad.Pkcs7,
-      });
-
-      await this.setItemSecure(this.STORAGE_PIN_HASH, cipher.ciphertext.toString(CryptoJS.enc.Hex));
-      await this.setItemSecure(this.STORAGE_PIN_IV, this.bufferToHex(iv));
-      await this.setItemSecure(this.STORAGE_PIN_KEY, newKeyHex);
-
-      // HMAC-MacKey neu ableiten - alter MacKey wird ignoriert, neuer wird immer erzeugt
-      // (Der neue MacKey wird dynamisch aus dem neuen Master-Key abgeleitet)
-    } catch {
-      throw new Error('Konnte Schlüssel nicht rotieren - Daten könnten unzugänglich sein');
-    }
-  }
-
-  /**
-   * Re-encrypts all files with the current encryption key.
-   * Wird von FileManager aufgerufen, wenn Key-Rotation stattfindet.
-   */
-  static async reencryptFile(fileData: string): Promise<{
-    encryptedData: string;
-    iv: string;
-    mac: string;
-  }> {
-    try {
-      return await this.encryptFile(fileData);
-    } catch {
-      throw new Error('Datei konnte nicht neu verschlüsselt werden');
-    }
-  }
-
   // ─────────────────────────────── PIN-Verwaltung ───────────────────────────────
+  //
+  // ENTFERNT: rotateEncryptionKey() / updatePinHash() / reencryptFile().
+  //
+  // rotateEncryptionKey und updatePinHash schrieben den ROHEN Master-Key im Klartext nach
+  // SecureStore (STORAGE_PIN_KEY) — genau die Eigenschaft, die das gesamte KEK-Wrapping (und
+  // später die native Key-Custody) beseitigen sollte. Beide waren toter Code: Rotation läuft
+  // über KeyRotationService.performSecureRotation(), Passwortwechsel über changePassphrase().
+  // Ein toter Pfad, der bei versehentlichem Aufruf den Master-Key ungeschützt persistiert, ist
+  // eine Landmine — daher gelöscht statt kommentiert.
+  //
+  // Der verbleibende Legacy-PIN-Code (verifyPin/getStoredPin) ist NUR-LESEND und existiert
+  // ausschließlich, damit migrateLegacy() einen alten Tresor einmalig übernehmen kann; danach
+  // löscht es alle filevault_pin_* Schlüssel.
 
   /**
    * Prüft ob PIN korrekt ist
@@ -1769,6 +1654,24 @@ export class SecureCryptoService {
   }
 
   /**
+   * Sperrt den Tresor dauerhaft (Panic-Aktion 'lock', Max-Fehlversuche 'lock').
+   *
+   * Zwingend über setItemSecure — dieselbe Storage-Schicht, aus der isAccountLocked() und
+   * getLockStatus() lesen. Die Aufrufer schrieben `filevault_lock_until` bisher direkt per
+   * SecureStore.setItemAsync, also mit anderen keychainAccessible-Optionen als der Lesepfad
+   * (HardwareBackedStorage). Auf iOS kann derselbe Schlüssel dadurch unter einer anderen
+   * Zugriffsklasse landen und die "dauerhafte" Sperre beim nächsten Start ins Leere greifen.
+   */
+  static async lockPermanently(): Promise<void> {
+    await this.setItemSecure(this.STORAGE_LOCK_UNTIL, String(Number.MAX_SAFE_INTEGER));
+  }
+
+  /** True wenn die Sperre eine Dauersperre ist (nicht nur das 5-Minuten-Rate-Limit). */
+  static isPermanentLock(unlockAt: number): boolean {
+    return unlockAt >= Number.MAX_SAFE_INTEGER - 86400000;
+  }
+
+  /**
    * Prüft ob der Account aktuell gesperrt ist
    */
   private static async isAccountLocked(): Promise<boolean> {
@@ -1796,6 +1699,9 @@ export class SecureCryptoService {
    * Zählt fehlgeschlagene Versuche hoch und sperrt Account bei Überschreitung
    */
   private static async incrementFailedAttempts(): Promise<void> {
+    // A3-AUTH: suppressed while a multi-credential probe is in flight — see
+    // withAttemptCountSuppressed(). The caller charges the attempt once, if at all.
+    if (this._suppressAttemptCount) return;
     try {
       let attemptsStr = await this.getItemSecure(this.STORAGE_FAILED_ATTEMPTS);
       let attempts = attemptsStr ? parseInt(attemptsStr, 10) : 0;
@@ -1821,40 +1727,6 @@ export class SecureCryptoService {
       await this.deleteItemSecure(this.STORAGE_LOCK_UNTIL);
     } catch {
       // Silent fail for resetting failed attempts
-    }
-  }
-
-  /**
-   * Aktualisiert den PIN-Hash
-   * @param newPassphrase Die neue PIN
-   */
-  static async updatePinHash(newPassphrase: string): Promise<void> {
-    try {
-      const { hash, salt, iterationCount, algorithm } = await this.computePinHash(newPassphrase);
-
-      // Lade den existierenden Master-Key aus dem Hardware Keystore
-      const masterKeyHex = await this.getItemSecure(this.STORAGE_KEY);
-      if (!masterKeyHex) {
-        throw new Error('Kein Master-Key vorhanden');
-      }
-      const masterKeyBuffer = this.hexToBuffer(masterKeyHex);
-
-      const pinData = JSON.stringify({ hash, salt, iterationCount, algorithm });
-
-      // Verschlüsselt PIN-Daten mit Master-Key (AES-CBC, 16-byte IV)
-      const iv = await this.generateSecureBytes(this.CBC_IV_LENGTH);
-
-      const cipher = CryptoJS.AES.encrypt(pinData, CryptoJS.enc.Hex.parse(masterKeyHex), {
-        iv: CryptoJS.enc.Hex.parse(this.bufferToHex(iv)),
-        mode: CryptoJS.mode.CBC,
-        padding: CryptoJS.pad.Pkcs7,
-      });
-
-      await this.setItemSecure(this.STORAGE_PIN_HASH, cipher.ciphertext.toString(CryptoJS.enc.Hex));
-      await this.setItemSecure(this.STORAGE_PIN_IV, this.bufferToHex(iv));
-      await this.setItemSecure(this.STORAGE_PIN_KEY, masterKeyHex);
-    } catch {
-      throw new Error('Konnte PIN-Hash nicht aktualisieren');
     }
   }
 
@@ -1900,56 +1772,6 @@ export class SecureCryptoService {
       return json;
     } catch {
       return null;
-    }
-  }
-
-  /**
-   * Berechnet PIN-Hash und Salt
-   * Nutzt Argon2id standardmäßig mit fastPbkdf2 Fallback (kein CryptoJS!)
-   */
-  private static async computePinHash(passphrase: string): Promise<{ hash: string; salt: string; iterationCount: number; algorithm: string }> {
-    try {
-      passphrase = passphrase.normalize('NFC'); // R-03
-      const salt = await this.generateSecureBytes(16);
-      const saltHex = this.bufferToHex(salt);
-      const saltBuffer = this.hexToBuffer(saltHex);
-
-      // Prüfe ob native Argon2 Module verfügbar ist
-      const useArgon2 = (global as any).__argon2_native_available;
-
-      let hash: string;
-      let iterationCount: number;
-      let algorithm: string;
-
-      if (useArgon2) {
-        const params: Argon2Params = {
-          version: this.ARGON2_VERSION,
-          type: 2,
-          memoryKB: this.ARGON2_MEMORY_KB,
-          iterations: this.ARGON2_ITERATIONS, // 3 Iterationen
-          parallelism: this.ARGON2_PARALLELISM,
-          hashLength: this.ARGON2_HASH_LENGTH,
-        };
-        const derivedKey = await Argon2idService.deriveKey(passphrase, saltBuffer, params);
-        hash = this.bufferToHex(derivedKey);
-        iterationCount = this.ARGON2_ITERATIONS;
-        algorithm = 'argon2id';
-      } else {
-        // Kein CryptoJS Fallback mehr - nur fastPbkdf2
-        const derivedKey = await fastPbkdf2(passphrase, saltHex, this.PBKDF2_ITERATIONS, this.PBKDF2_KEY_LENGTH);
-        hash = derivedKey;
-        iterationCount = this.PBKDF2_ITERATIONS;
-        algorithm = 'pbkdf2';
-      }
-
-      return {
-        hash,
-        salt: saltHex,
-        iterationCount,
-        algorithm,
-      };
-    } catch {
-      throw new Error('Konnte PIN-Hash nicht berechnen');
     }
   }
 
@@ -2107,9 +1929,6 @@ export class SecureCryptoService {
     }
   }
 }
-
-// DEPRECATED: XChaCha20CryptoService ist veraltet - nutze SecureCryptoService
-export { XChaCha20CryptoService } from './XChaCha20CryptoService';
 
 // SecureCryptoService ist der primäre Service mit XChaCha20-Poly1305 (AES-CBC+HMAC als Fallback)
 export default SecureCryptoService;
