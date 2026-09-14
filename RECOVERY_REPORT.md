@@ -161,10 +161,14 @@ each is called out below with what's missing and why I didn't fabricate a replac
      recovery notes, not on any branch I can see. `src/services/ScreenProtectionService.ts`
      already treats `NativeModules.ScreenSecurity` as optionally `undefined`, so the JS side
      degrades gracefully, but the Kotlin side will not compile until this class exists or
-     the reference is removed from `FileVaultPackage.kt`. I did not touch
-     `FileVaultPackage.kt` for this — it predates this session and is outside every audit
-     item I was given. Flagging it here rather than guessing at an implementation for a
-     module I have zero source or spec for.
+     the reference is removed from `FileVaultPackage.kt`.
+
+     **Tracked as N2 — a new, standalone finding, explicitly NOT part of this recovery.**
+     Per instruction: the code (`FileVaultPackage.kt` and everything downstream of it) has
+     **not been touched** for this. No stub, no removal of the reference, nothing — it's
+     left exactly as it already was on `main`, broken exactly as found. This is here purely
+     as a documented finding for you to look at and decide on (write the module, or remove
+     the reference) before anyone acts on it.
 
 9. **`assets/logo-vector.svg` — nothing to insert, not just "unconfirmed."** The task said
    to "insert the last version shown in the bundle," but the bundle itself contains no SVG
@@ -209,10 +213,11 @@ b3168c8 Add MIT License
 2. **A device or emulator with `adb`** to finish M1/L3: pull the four uncommitted files
    out of this container's working tree first if you're not continuing in this exact
    session, then run `npm run test:device` and commit once green.
-3. **A decision on `ScreenSecurityModule`** (new finding, item 8 above) — it's referenced
-   by already-committed code and blocks the native Android build entirely, independent of
-   anything in this recovery. Either write the module or remove the reference from
-   `FileVaultPackage.kt`.
+3. **A decision on `ScreenSecurityModule` (N2)** — item 8 above. Referenced by
+   already-committed code, blocks the native Android build entirely, independent of
+   anything in this recovery. Deliberately untouched pending your review — either write
+   the module or remove the reference from `FileVaultPackage.kt`, but that's your call to
+   make, not something I did on my own initiative.
 4. **The logo.** No SVG source exists to insert (item 9) — needs to be redrawn from
    scratch in the browser, not just re-confirmed.
 5. **A call on the README** (informational section above) — cross-platform framing vs.
