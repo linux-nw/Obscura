@@ -189,6 +189,63 @@ was about README existing/being comprehensive, not about auditing its accuracy, 
 want to silently rewrite an already-committed, already-reviewed document on my own judgment.
 Worth a human decision on whether the iOS framing is aspirational or simply wrong.
 
+## N3 — `android-kat.yml` has never passed a single CI run (pre-existing, unrelated to this audit)
+
+Found while verifying the F1 (`046bcbc`) and L8 (`d57c03b`) commits on GitHub: both show a
+failed check. Investigated via the actual GitHub Actions logs (not guessed) before writing
+anything below.
+
+**Not N2.** The failure has nothing to do with `ScreenSecurityModule`/`FileVaultPackage.kt`.
+It happens before any Kotlin compile step even starts.
+
+**The actual failure**, identical on both runs:
+
+```
+.github/workflows/android-kat.yml, job "androidTest", step "Prime missing debug AARs into local-maven"
+##[error]An error occurred trying to start process '/usr/bin/bash' with working directory
+'/home/runner/work/Obscura/Obscura/android/local-maven'. No such file or directory
+```
+
+That's `.github/workflows/android-kat.yml:67-68`:
+```yaml
+      - name: Prime missing debug AARs into local-maven
+        working-directory: android/local-maven
+```
+
+`android/local-maven` is a machine-local, `.gitignore`d offline Gradle Maven cache (per the
+step's own comment: "This is exactly the manual fix used to get the first on-device run
+green"). It has never been committed to this repo. On a fresh GitHub-hosted runner checkout
+that directory does not exist, so the step fails trying to `cd` into it, before it can even
+run the `find`/`curl` logic that would populate it.
+
+**Confirmed pre-existing, not caused by F1/L8, via `list_workflow_runs` on this workflow:**
+21 total runs since 2026-06-26, across `main`, `feat/round6-crypto-final`,
+`feat/endpoint-hardening`, `feat/l3-native-key-custody`, and `claude/vibrant-dijkstra-y9hwyf`
+— **21/21 failed**. Pulled the actual job log for run #13 (2026-09-11, branch
+`claude/vibrant-dijkstra-y9hwyf`, three days before this session started): byte-identical
+`android/local-maven` error. Also confirmed via `git show b3168c8:.github/workflows/android-kat.yml`
+that the "Prime missing debug AARs" step with this exact `working-directory` already existed
+before this session touched the file at all — my L8 commit only added a `permissions:` block
+above it, nothing in this step. (Earlier runs, e.g. #4 from June, failed for a different
+reason — an `npm ci` lockfile error — so the specific symptom has shifted over time, but the
+workflow has never once gone green.)
+
+Why F1 and L8 are the ones showing red on GitHub for *this* branch: neither commit caused
+anything — they're simply the first two commits on `claude/compassionate-davinci-rlhp36`
+that match the workflow's own trigger paths (F1 touches `android/**`; L8 edits
+`.github/workflows/android-kat.yml` itself, which is also a listed trigger path). Every
+earlier commit in this session (H5, C1, M2, H1, H2, H3) touched none of those paths, so the
+workflow simply never ran on this branch until F1.
+
+**Not fixed. Not proposed as a patch. `android-kat.yml` was not touched for this.** Per
+instruction this is tracked as a standalone finding (N3), explicitly out of scope for
+today's audit — a candidate direction (the step may need a prior job that actually populates
+`android/local-maven` from Gradle's own resolution, or the whole on-device-KAT workflow may
+never have been intended to run unattended in CI at all — the file's own header comment
+documents a *manual* on-device run: "Done: device SM-S906B, 2026-06-26, tests=15
+failures=0") is noted here for context only, not as a decision. `verify.yml` (the other L8
+addition) is unaffected and green on every run so far.
+
 ## Current `git log --oneline` (top of branch down to before this session)
 
 ```
@@ -228,3 +285,7 @@ b3168c8 Add MIT License
    indirectly by the existing suite; if you have the original chat history these tests came
    from, that's the only path to recovering them verbatim rather than me writing new tests
    that "look like" the originals.
+7. **N3 — `android-kat.yml` (the on-device KAT workflow) has never passed, ever, on any
+   branch.** Pre-existing, unrelated to this audit, not touched. You said you'll look at it
+   yourself in a separate session (likely conclusion: it was never wired for real headless
+   CI, only documents a manual on-device run). `verify.yml` is unaffected.
