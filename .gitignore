@@ -12,11 +12,23 @@ expo-env.d.ts
 # Native
 .kotlin/
 *.orig.*
+*.mobileprovision
+
+# ── Signing material and local machine config ────────────────────────────────
+# The release keystore IS the app's identity: anyone holding it plus the password can
+# publish an update that Android accepts as authentic. Keystores and the properties file
+# that carries their passwords must never reach the repo. `/android` below already covers
+# these, but the android/ tree has selectively force-added source files, so a future
+# `git add -f android/...` could sweep them in — hence the explicit entries.
 *.jks
+*.keystore
 *.p8
 *.p12
 *.key
-*.mobileprovision
+*.pem
+android/gradle.properties
+android/local.properties
+local.properties
 
 # Metro
 .metro-health-check*
@@ -28,7 +40,6 @@ yarn-error.*
 
 # macOS
 .DS_Store
-*.pem
 
 # local env files
 .env*.local
@@ -36,6 +47,22 @@ yarn-error.*
 # typescript
 *.tsbuildinfo
 
+# test + tooling output
+coverage/
+/ss
+
+# editors
+.idea/
+.vscode/
+
 # generated native folders
 /ios
-/android
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/app/.cxx/
+/android/local-maven/
+/android/build_pinned.bat
+/android/build_pinned.log
+/android/build_release.bat
+/android/verify_apk.bat
