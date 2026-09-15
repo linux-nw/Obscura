@@ -1,8 +1,8 @@
 # Obscura FileVault
 
-**A privacy-first, cryptographically secured file and note vault for Android and iOS.**
+**A privacy-first, cryptographically secured file and note vault for Android.**
 
-Obscura is a cross-platform mobile application (built with React Native/Expo) that encrypts files and notes on-device using military-grade cryptography. It implements a sophisticated three-layer key hierarchy, Argon2id key derivation, XChaCha20-Poly1305 authenticated encryption, and multiple anti-forensic and anti-tampering features including a panic PIN for emergency data denial, decoy vault functionality, secure auto-lock, and atomic key rotation with crash recovery.
+Obscura is an Android mobile application (built with React Native/Expo) that encrypts files and notes on-device using military-grade cryptography. It implements a sophisticated three-layer key hierarchy, Argon2id key derivation, XChaCha20-Poly1305 authenticated encryption, and multiple anti-forensic and anti-tampering features including a panic PIN for emergency data denial, decoy vault functionality, secure auto-lock, and atomic key rotation with crash recovery.
 
 ---
 
@@ -22,7 +22,7 @@ Obscura FileVault is a **zero-knowledge encrypted storage** application designed
 - **Languages:** TypeScript (66%), JavaScript (15%), Kotlin (15%), CSS, HTML, Java
 - **Framework / Runtime:** Expo 54 + React Native 0.81.5 + React 19
 - **Notable Libraries:**
-  - `expo-secure-store`: hardware-backed key storage (Android Keystore / iOS Keychain)
+  - `expo-secure-store`: hardware-backed key storage (Android Keystore)
   - `@noble/hashes`: pure-JS Argon2id fallback and HKDF-SHA256
   - `crypto-js`: AES-256-CBC and PBKDF2 encryption backends
   - `hash-wasm`: WebAssembly Argon2id (optimized JS fallback)
@@ -36,22 +36,30 @@ Obscura FileVault is a **zero-knowledge encrypted storage** application designed
 ```
 Obscura/
 ├── src/
-│   ├── components/       UI components (VaultMark, screens)
-│   ├── screens/          Two main screens: AuthScreen (login) + MainScreen (vault interface)
-│   ├── services/         14+ service modules implementing crypto, file ops, security
-│   ├── native/           TypeScript bridge to Kotlin native module (RNFileVault)
+│   ├── components/       UI components (VaultMark, icons, FileViewer)
+│   ├── screens/          AuthScreen (login), MainScreen (vault), FilesView, NotesScreen,
+│   │                       NoteEditor, SettingsScreen
+│   ├── services/         20+ service modules implementing crypto, file ops, security
+│   ├── native/           TypeScript bridges to the Kotlin native modules — file crypto
+│   │                       (RNFileVault), key custody (NativeKeyCustody), integrity (IntegrityNative)
 │   └── fonts.ts + theme.ts   Custom Obscura fonts and dark-mode theme
-├── android/              Android native bridge + Kotlin module (RNFileVaultModule.kt)
-├── __tests__/            Jest unit tests (12 suites covering crypto, KDF, WAL, backup)
+├── android/              Android native bridge — Kotlin modules for file crypto
+│                           (RNFileVaultModule.kt), native key custody (NativeKeyCustodyModule.kt,
+│                           libsodium secure-memory backing), hardware keystore, integrity,
+│                           device security
+├── __tests__/            Jest unit tests covering crypto, KDF, WAL, backup, key custody,
+│                           decoy vault, auto-lock, and more
 ├── __mocks__/            Mock implementations for secure-store, crypto, file-system (for testing)
 ├── App.tsx               Root component + app initialization
 ├── index.ts              Expo entry point + performance polyfill
-├── app.json              Expo config (Android/iOS permissions, metadata)
+├── app.json              Expo config (Android permissions, metadata)
 ├── package.json          Dependencies + test/build scripts
 ├── CRYPTO_PROTOCOL_SPEC.md   70 KB detailed cryptographic protocol specification
-├── FINAL_REPORT_ROUND3.md    Production-readiness audit; lists 8 new files, 12 fixes, 0 TS errors
+├── FINAL_REPORT_ROUND3.md    Production-readiness audit (2026-05-22); lists 8 new files, 12 fixes, 0 TS errors
 ├── L3_CUSTODY_AUDIT.md       Map of raw key locations in memory; phase 0 for hardware backing
-└── .github/workflows/    CI for Android KAT verification + lint
+├── SECURITY.md               Vulnerability reporting process + audit scope
+├── RECOVERY_REPORT.md        Accounting of the 2026-09-14 branch-loss recovery + newly found gaps
+└── .github/workflows/    CI for Android KAT verification + the host Jest/type-check suite
 ```
 
 ### How it fits together
@@ -94,7 +102,7 @@ Ciphertext → filesystem
 
 - **Node.js 18+** and npm
 - **Expo CLI**: `npm install -g expo-cli`
-- **Android Studio** (for Android emulator) or **Xcode** (for iOS simulator)
+- **Android Studio** (for the Android emulator)
 - **Kotlin/Android SDK** (if building the native Kotlin module; APK builds via EAS or local Gradle)
 
 ### Quick Start
@@ -105,9 +113,6 @@ npm install
 
 # Run on Android emulator
 npm run android
-
-# Run on iOS simulator
-npm run ios
 
 # Run on web (development preview, no native crypto)
 npm run web
@@ -128,13 +133,17 @@ eas build --platform android --profile preview
 ### Run Tests
 
 ```bash
-# Jest unit tests (crypto, KDF, WAL, backup)
+# Jest unit tests (crypto, KDF, WAL, backup, key custody, decoy vault, auto-lock, ...)
 npm test
 
 # Type-check TypeScript
 npm run type-check
 
-# All 12 tests should pass (no platform-specific steps needed)
+# Both of the above together
+npm run verify
+
+# Jest with a coverage report over src/services/
+npm run test:coverage
 ```
 
 ### Key Build Scripts (in package.json)
@@ -143,19 +152,25 @@ npm run type-check
 |--------|---------|
 | `npm start` | Start Expo dev server |
 | `npm run android` | Run on Android emulator |
-| `npm run ios` | Run on iOS simulator |
 | `npm run web` | Run on web (no native crypto, pure-JS fallback) |
 | `npm run type-check` | TypeScript check (should report 0 errors) |
-| `npm test` | Jest test suite (12 test files) |
+| `npm test` | Jest host test suite |
+| `npm run test:coverage` | Jest with coverage over `src/services/` |
+| `npm run verify` | `type-check` + `test` |
 | `postinstall` | Patches Expo FormData + performance logger for React Native compatibility |
+
+Note: `npm run test:device` (on-device native `androidTest` suite) is referenced in this
+project's audit history but is not currently defined as an npm script — running it means
+invoking Gradle's `connectedDebugAndroidTest` task directly against a connected device or
+emulator.
 
 ### Environment & Security Notes
 
-- **No secrets required** — the app uses only on-device key storage (Android Keystore, iOS Keychain, Expo SecureStore)
+- **No secrets required** — the app uses only on-device key storage (Android Keystore, Expo SecureStore)
 - **DEV vs. PROD mode:**
   - `__DEV__` (Expo dev build): allows pure-JS crypto fallback for testing without native module
   - Production APK/IPA: requires native crypto module; writes fail if the module is missing (anti-downgrade protection)
-- **Hardware-backed storage:** On Android, keys are protected in the TEE (Trustzone Execution Environment) or StrongBox if available; iOS uses Keychain with device-specific entitlements
+- **Hardware-backed storage:** Keys are protected in the TEE (Trustzone Execution Environment) or StrongBox if available
 
 ---
 
@@ -167,7 +182,7 @@ npm run type-check
 |-------|-----------|---------|
 | **L1: Screen Protection** | `FLAG_SECURE` (Android) + privacy overlay | Prevents screenshot/recents capture of vault content |
 | **L2: IME Warning** | Device security check on launch | Warns if a third-party keyboard is active (can log keystrokes) |
-| **L3: Hardware Keystore** | `expo-secure-store` → Android Keystore / iOS Keychain | Hardware-backed key storage (TEE/StrongBox when available) |
+| **L3: Hardware Keystore** | `expo-secure-store` → Android Keystore | Hardware-backed key storage (TEE/StrongBox when available) |
 | **L4: In-Memory Zeroing** | `Uint8Array.fill(0)` + cache clear on lock/background | Prevents plaintext key residue in heap |
 | **L5: Crypto-Shred on Wipe** | Master key destruction renders all ciphertexts unreadable | Permanent deletion even if bytes linger on flash |
 | **L6: Decoy Vault Cache** | Separate cache key for decoy content | Prevents mixing real and decoy plaintext in memory |
@@ -186,10 +201,10 @@ npm run type-check
 | Service | Responsibility |
 |---------|-----------------|
 | `SecureCryptoService` | Master key unwrap, content encrypt/decrypt, constant-time comparison |
-| `XChaCha20CryptoService` | Native XChaCha20-Poly1305 backend |
+| `KeyCustody` | Custody seam: every master/content key is addressed by an opaque handle, never passed around as a raw value. Backed by `NativeKeyCustody` (libsodium secure memory, on-device — the raw key crosses the JS/native bridge only once, at registration) or a JS-backed fallback used in tests/dev without the native module |
 | `FileManager` | File import/export, storage layout, atomic writes |
 | `NotesService` | Encrypted note CRUD, re-encryption on key rotation |
-| `AutoLockService` | 5-minute timeout, lock on background, timer reset on foreground |
+| `AutoLockService` | Configurable inactivity timeout, lock on background, operation-lock suppression during multi-step crypto ops (key rotation) |
 | `PanicService` | Panic PIN verification, decoy vault activation |
 | `DecoyVaultService` | Separate encrypted vault (activated by panic PIN) |
 | `BackupService` | Create/restore portable encrypted backups |
@@ -197,6 +212,12 @@ npm run type-check
 | `ScreenProtectionService` | `FLAG_SECURE`, privacy overlay |
 | `DeviceSecurityService` | IME check, hardware keystore assessment |
 | `HardwareKeystoreService` | SecureStore wrapper, key storage hardening |
+
+`XChaCha20CryptoService` still exists in `src/services/` but is a deprecated compatibility
+shim (every method logs a warning and forwards to `SecureCryptoService`) — the services
+above are where the real logic lives. On the native side, `NativeKeyCustodyModule.kt` /
+`NativeKeyCustody.kt` (Kotlin) are the counterpart to `KeyCustody`/`NativeKeyCustody.ts`
+above; see `L3_CUSTODY_AUDIT.md` for the full custody design.
 
 ---
 
@@ -254,12 +275,14 @@ On vault wipe, the app:
 | `Argon2idReal.test.ts` | @noble/hashes Argon2id KAT verification |
 | `A3Rollback.test.ts` | WAL version binding, note rollback rejection |
 | `FsAtomic.test.ts` | Atomic file writes, temp cleanup |
-| Plus Android on-device KAT tests (3 suites, verified on x86_64 + arm64) |
+| Plus Android on-device instrumented tests (crypto KATs, key-custody handle/parity, hardware keystore, bridge roundtrips — verified manually on-device on x86_64 + arm64) |
+
+This table lists representative suites, not the full set — see `__tests__/` for the complete host test suite.
 
 ### Production Readiness
 
 - ✅ **0 TypeScript errors** (strict mode enabled)
-- ✅ **12/12 tests green** (no platform-specific issues)
+- ✅ **Full host test suite green**
 - ✅ **Critical bug fixed:** Prefix-strip bug (all data was unreadable until Round 3 fix)
 - ✅ **5 security bugs fixed:** Panic PIN timing, backup KDF, WAL handling, NFC normalization, unauthenticated prefix
 - ⚠️ **5 known weaknesses** (all Medium/Low/Info severity, documented in `CRYPTO_PROTOCOL_SPEC.md` §10):
@@ -271,9 +294,11 @@ On vault wipe, the app:
 
 ### Audit & Verification
 
-- **FINAL_REPORT_ROUND3.md:** Complete accountability report (Phase 1 reality audit, Phase 2 fixes applied, Phase 3 quality gates)
-- **CRYPTO_PROTOCOL_SPEC.md:** 70 KB detailed cryptographic specification (threat model, primitives, wire formats, test coverage, known weaknesses)
+- **FINAL_REPORT_ROUND3.md:** Complete accountability report (Phase 1 reality audit, Phase 2 fixes applied, Phase 3 quality gates) — dated 2026-05-22, predates the L3 native-custody work below
 - **L3_CUSTODY_AUDIT.md:** Map of every point where the raw master key materialises in the JS heap; roadmap for Phase 1 hardware key custody
+- **CRYPTO_PROTOCOL_SPEC.md:** 70 KB detailed cryptographic specification (threat model, primitives, wire formats, test coverage, known weaknesses)
+- **SECURITY.md:** Vulnerability reporting process and audit scope
+- **RECOVERY_REPORT.md:** Accounting of the 2026-09-14 branch-loss recovery — what was reconstructed, what's a documented gap, and standalone findings (N-series) turned up along the way
 
 ---
 
@@ -288,11 +313,11 @@ On vault wipe, the app:
 - **"How is the backup encrypted differently from vault content?"**  
   Backup uses a separate Argon2id-derived key from a user-supplied backup passphrase. This makes backups portable (independent of the vault master key) and useful for offline archival.
 
-- **"Can I restore a backup created on iOS to Android?"**  
-  Yes—the backup format is platform-agnostic JSON. Restore is just a decryption + re-import step, so the content is re-encrypted under the current vault's master key on the target device.
+- **"Can I restore a backup on a different device?"**  
+  Yes—the backup format is device-agnostic JSON. Restore is just a decryption + re-import step, so the content is re-encrypted under the current vault's master key on the target device.
 
-- **"What if someone roots/jailbreaks my device?"**  
-  Hardware-backed key storage (Android Keystore, iOS Keychain) makes it harder, but not impossible, for an attacker to extract keys from a rooted device. The 64 MiB Argon2id KDF also makes brute-force expensive. See `L3_CUSTODY_AUDIT.md` for the roadmap to move the raw master key out of the JS heap entirely.
+- **"What if someone roots my device?"**  
+  Hardware-backed key storage (Android Keystore) makes it harder, but not impossible, for an attacker to extract keys from a rooted device. The 64 MiB Argon2id KDF also makes brute-force expensive. See `L3_CUSTODY_AUDIT.md` for the roadmap to move the raw master key out of the JS heap entirely.
 
 ---
 

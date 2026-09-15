@@ -179,15 +179,61 @@ each is called out below with what's missing and why I didn't fabricate a replac
    drawing a new SVG from a text description. **This needs Noah to redo it visually in the
    browser from scratch** — there's no draft to confirm, unconfirmed or otherwise.
 
-## README divergence (informational, not fixed)
+## H4 follow-up — README was fixed, not just incomplete (2026-09-15)
 
-`README.md` (already on `main`) describes Obscura as cross-platform ("Android and iOS")
-and lists an `ios` folder-adjacent stack. There is no `ios/` directory in this repo, `app.json`
-has never had it built, and `SECURITY.md` (this run) plus `.github/workflows/android-kat.yml`
-both describe the project as Android-only. I did not change the README — the H4 audit item
-was about README existing/being comprehensive, not about auditing its accuracy, and I didn't
-want to silently rewrite an already-committed, already-reviewed document on my own judgment.
-Worth a human decision on whether the iOS framing is aspirational or simply wrong.
+The original H4 pass above under-reported this. What actually happened: `README.md` was
+never missing (H4 was never a "file doesn't exist" gap) — the bundle just assumed a short,
+Android-only README would be added, and what's actually on `main` (commit `0478c90`, "Add
+comprehensive README.md") is a long, richer document that was written before the L3
+native-custody refactor and never updated afterward. On review with the repo owner, the
+decision was to **keep** this richer README (it has real content the bundle's short H4 text
+doesn't — a security-layer table, a service overview, a "Try asking" section) rather than
+replace it with the bundle's text, and instead fact-check and correct it against the current
+repo state on this branch. Every claim was checked against `git ls-files`, `package.json`,
+and the actual current file contents — nothing assumed. Discrepancies found and fixed:
+
+- **Cross-platform/iOS framing was wrong, not just aspirational.** "for Android and iOS",
+  "cross-platform", `npm run ios`, an iOS-simulator prerequisite section, "iOS Keychain"
+  mentioned four separate times, and an iOS-specific "Try asking" question. There is no
+  `ios/` directory anywhere in this repo's history and no evidence it was ever built. Fixed
+  throughout — README now consistently says Android-only, matching `SECURITY.md` and
+  `android-kat.yml`. Note: `npm run ios` (`expo run:ios`) does technically exist as a script
+  in `package.json` — added automatically by `expo prebuild`'s Expo boilerplate — but it was
+  still removed from the README on the Android-only framing, since keeping it would
+  contradict that framing and there's nothing for it to build against.
+- **Test counts were stale.** "12/12 tests", "Jest test suite (12 test files)" — actually 28
+  suites / 117 tests as of this session. Rather than hardcode a new number that will just go
+  stale again, replaced with qualitative descriptions of what's covered.
+- **The entire native key-custody architecture (the centerpiece of the L3 phase work and
+  this whole audit) was completely unmentioned.** The "Key Services" table listed
+  `XChaCha20CryptoService` as "Native XChaCha20-Poly1305 backend" — that class is now a
+  deprecated compatibility shim (every method just logs a warning and forwards to
+  `SecureCryptoService`; confirmed by reading the file). Replaced that table row with an
+  accurate `KeyCustody` entry (the actual custody-handle seam, backed by `NativeKeyCustody`)
+  and added a note pointing to the Kotlin-side counterpart
+  (`NativeKeyCustodyModule.kt`/`NativeKeyCustody.kt`) and `L3_CUSTODY_AUDIT.md`. Also
+  corrected `src/screens/` (six screens exist, not two) and `src/native/` (three native
+  bridges exist — file crypto, key custody, integrity — not just one).
+- **Correcting my own earlier assumption:** I originally told the repo owner
+  `FINAL_REPORT_ROUND3.md` and `L3_CUSTODY_AUDIT.md` had been deleted alongside the
+  `XChaCha20CryptoService` cleanup. That was wrong — checked via `git log --follow` on both
+  files: neither has been touched by any commit in this session or ever removed. Both still
+  exist, and the README's descriptions of them (as point-in-time historical documents) were
+  already accurate — no fix needed there. Added `SECURITY.md` and this `RECOVERY_REPORT.md`
+  as two further entries in "Audit & Verification" and the file tree, since both are real,
+  current, and directly relevant.
+- **Every `npm run X` command mentioned in the README was cross-checked against
+  `package.json` on this branch.** All exist except `test:device`, which is referenced
+  throughout this project's own audit history (including the instructions for this recovery
+  session) as if it were a real script — it isn't. Rather than silently drop it or invent a
+  script, the README now explicitly notes it's not currently defined and states what running
+  the on-device suite actually requires (`gradlew connectedDebugAndroidTest` directly).
+- **Every directory-tree entry and every "Key Services" table row was checked against
+  `git ls-files`** — all pre-existing entries turned out to reference real files; the fixes
+  above were about missing/wrong entries and descriptions, not phantom files.
+
+Commit: `docs(H4): correct README against current repo state (was never updated after the
+L3 refactor)`.
 
 ## N3 — `android-kat.yml` has never passed a single CI run (pre-existing, unrelated to this audit)
 
@@ -277,8 +323,10 @@ b3168c8 Add MIT License
    make, not something I did on my own initiative.
 4. **The logo.** No SVG source exists to insert (item 9) — needs to be redrawn from
    scratch in the browser, not just re-confirmed.
-5. **A call on the README** (informational section above) — cross-platform framing vs.
-   the Android-only reality documented everywhere else.
+5. ~~A call on the README~~ — **Resolved 2026-09-15.** Decision was to keep the richer
+   README and correct it against current repo state rather than replace it with the
+   bundle's short H4 text. See "H4 follow-up" section above for the full list of what was
+   fixed.
 6. Two test files are gaps I couldn't responsibly fill (items 1–2 above):
    `__tests__/SecurityServices.test.ts` and `__tests__/AutoLockOperationSuppression.test.ts`.
    The underlying code fixes (H5 mock infra, M2 operation lock) are committed and covered
