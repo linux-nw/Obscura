@@ -160,11 +160,18 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
       // R-01: All three checks run in parallel — no timing leak between paths.
       // unlock() loads the real master key into cache if passphrase is correct.
       // verifyPanicPin() and verifyDecoyPin() are independent.
-      const [panicMatch, realMatch, decoyMatch] = await Promise.all([
-        PanicService.verifyPanicPin(entered),
-        SecureCryptoService.unlock(entered),
-        DecoyVaultService.verifyDecoyPin(entered),
-      ]);
+      //
+      // A3-AUTH: wrapped in withAttemptCountSuppressed() because unlock() fails (and would
+      // otherwise charge a failed attempt against the REAL vault) on every decoy/panic login —
+      // two of the three paths necessarily fail on every login. The combined outcome is charged
+      // exactly once, below, via registerFailedUnlock() — only when none of the three matched.
+      const [panicMatch, realMatch, decoyMatch] = await SecureCryptoService.withAttemptCountSuppressed(() =>
+        Promise.all([
+          PanicService.verifyPanicPin(entered),
+          SecureCryptoService.unlock(entered),
+          DecoyVaultService.verifyDecoyPin(entered),
+        ])
+      );
 
       if (panicMatch) {
         // Panic PIN: clear master key, then dispatch wipe or permanent lock.
@@ -211,6 +218,9 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
         setUnlocking(true);
         setTimeout(doAuth, 300);
       } else {
+        // A3-AUTH: none of the three credentials matched — this is the one place a failed
+        // attempt is actually charged against the real vault's lockout counter.
+        await SecureCryptoService.registerFailedUnlock();
         const maxAttempts = appSettings?.maxFailedAttempts ?? 5;
         const newCount = failedAttempts + 1;
         setFailedAttempts(newCount);
