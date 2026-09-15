@@ -3,7 +3,7 @@
  *
  * Sicherheitsmerkmale:
  * - Argon2id (hybrid mode: resistant to both GPU and side-channel attacks)
- * - Configurable memory (64MB default), iterations (3), parallelism (4)
+ * - Configurable memory (64MB default), iterations (3), parallelism (1)
  * - Version 1.3 (latest stable)
  * - 32-byte hash output
  *
