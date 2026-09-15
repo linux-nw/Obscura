@@ -27,7 +27,8 @@
         }
       ],
       "expo-secure-store",
-      "expo-video"
+      "expo-video",
+      "./plugins/withStrippedAndroidPermissions.js"
     ],
     "ios": {
       "supportsTablet": true,
