@@ -23,9 +23,8 @@ Obscura FileVault is a **zero-knowledge encrypted storage** application designed
 - **Framework / Runtime:** Expo 54 + React Native 0.81.5 + React 19
 - **Notable Libraries:**
   - `expo-secure-store`: hardware-backed key storage (Android Keystore)
-  - `@noble/hashes`: pure-JS Argon2id fallback and HKDF-SHA256
+  - `@noble/hashes`: pure-JS Argon2id fallback and HKDF-SHA256 (replaced `hash-wasm` — Hermes has no WebAssembly runtime)
   - `crypto-js`: AES-256-CBC and PBKDF2 encryption backends
-  - `hash-wasm`: WebAssembly Argon2id (optimized JS fallback)
   - `expo-crypto`: CSPRNG and platform crypto primitives
   - `lazysodium-android`: native libsodium via JNI for production XChaCha20-Poly1305 and Argon2id
 

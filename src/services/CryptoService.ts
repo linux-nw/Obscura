@@ -1005,7 +1005,7 @@ export class SecureCryptoService {
    *
    * F1: ALWAYS uses Argon2id (memory-hard, GPU/ASIC-resistant). The old PBKDF2
    * fallback is removed entirely — there is no downgrade path. Argon2idService
-   * routes to native libsodium crypto_pwhash when available, else hash-wasm.
+   * routes to native libsodium crypto_pwhash when available, else @noble/hashes.
    *
    * NOTE: the KEK salt MUST be 16 bytes — libsodium crypto_pwhash requires
    * exactly crypto_pwhash_SALTBYTES (16). See wrapAndStoreMasterKey.
