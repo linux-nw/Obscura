@@ -255,6 +255,8 @@ export class SecureDeleteService {
       'filevault_master_iv',
       'filevault_master_mac',
       'filevault_bio_kek',
+      'filevault_master_wal',
+      'filevault_kdf_meta',
       'filevault_pin_hash',
       'filevault_pin_salt',
       'filevault_pin_iv',

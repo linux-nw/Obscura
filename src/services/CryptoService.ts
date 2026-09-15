@@ -944,19 +944,28 @@ export class SecureCryptoService {
   private static async restoreMasterWalIfNeeded(): Promise<void> {
     const wal = await this.getItemSecure(this.STORAGE_MASTER_WAL);
     if (!wal) return;
+
+    let parsed: { kekSaltHex: string; kdfMeta: string; ctHex: string; ivHex: string; macHex: string };
     try {
-      const parsed = JSON.parse(wal) as {
-        kekSaltHex: string; kdfMeta: string; ctHex: string; ivHex: string; macHex: string;
-      };
-      if (!parsed.kekSaltHex || !parsed.kdfMeta || !parsed.ctHex || !parsed.ivHex || !parsed.macHex) return;
-      await this.setItemSecure(this.STORAGE_KEK_SALT, parsed.kekSaltHex);
-      await this.setItemSecure(this.STORAGE_KDF_META, parsed.kdfMeta);
-      await this.setItemSecure(this.STORAGE_MASTER_ENC, parsed.ctHex);
-      await this.setItemSecure(this.STORAGE_MASTER_IV, parsed.ivHex);
-      await this.setItemSecure(this.STORAGE_MASTER_MAC, parsed.macHex);
-    } finally {
+      parsed = JSON.parse(wal);
+    } catch {
+      // Unparseable WAL entry can never be repaired from — safe to discard.
       await this.deleteItemSecure(this.STORAGE_MASTER_WAL);
+      return;
     }
+    if (!parsed.kekSaltHex || !parsed.kdfMeta || !parsed.ctHex || !parsed.ivHex || !parsed.macHex) {
+      await this.deleteItemSecure(this.STORAGE_MASTER_WAL);
+      return;
+    }
+
+    await this.setItemSecure(this.STORAGE_KEK_SALT, parsed.kekSaltHex);
+    await this.setItemSecure(this.STORAGE_KDF_META, parsed.kdfMeta);
+    await this.setItemSecure(this.STORAGE_MASTER_ENC, parsed.ctHex);
+    await this.setItemSecure(this.STORAGE_MASTER_IV, parsed.ivHex);
+    await this.setItemSecure(this.STORAGE_MASTER_MAC, parsed.macHex);
+    // B.6: only delete the WAL once every field write actually succeeded — if one of them
+    // throws, leave it in place so the next unlock attempt can retry the repair.
+    await this.deleteItemSecure(this.STORAGE_MASTER_WAL);
   }
 
   /**
@@ -1533,6 +1542,11 @@ export class SecureCryptoService {
     await this.deleteItemSecure(this.STORAGE_MASTER_IV);
     await this.deleteItemSecure(this.STORAGE_MASTER_MAC);
     await this.deleteItemSecure(this.STORAGE_BIO_KEK);
+    // B.7: the WAL/KDF-meta marker can hold wrapped-master key material too (written by
+    // storeWrappedMaster before the field writes it stages complete) — a wipe that skips
+    // them can leave old key material behind in the crash-recovery window.
+    await this.deleteItemSecure(this.STORAGE_MASTER_WAL);
+    await this.deleteItemSecure(this.STORAGE_KDF_META);
   }
 
   // ─────────────────────────────── PIN-Verwaltung ───────────────────────────────
