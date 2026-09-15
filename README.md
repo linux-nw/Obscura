@@ -217,7 +217,8 @@ emulator.
 shim (every method logs a warning and forwards to `SecureCryptoService`) — the services
 above are where the real logic lives. On the native side, `NativeKeyCustodyModule.kt` /
 `NativeKeyCustody.kt` (Kotlin) are the counterpart to `KeyCustody`/`NativeKeyCustody.ts`
-above; see `L3_CUSTODY_AUDIT.md` for the full custody design.
+above, already shipped and marked "Done" in `CRYPTO_PROTOCOL_SPEC.md` §15.4-15.5 — see there
+for the full custody design.
 
 ---
 
@@ -295,7 +296,7 @@ This table lists representative suites, not the full set — see `__tests__/` fo
 ### Audit & Verification
 
 - **FINAL_REPORT_ROUND3.md:** Complete accountability report (Phase 1 reality audit, Phase 2 fixes applied, Phase 3 quality gates) — dated 2026-05-22, predates the L3 native-custody work below
-- **L3_CUSTODY_AUDIT.md:** Map of every point where the raw master key materialises in the JS heap; roadmap for Phase 1 hardware key custody
+- **L3_CUSTODY_AUDIT.md:** Phase 0 pre-work map of every point where the raw master key materialised in the JS heap — historical; the native key custody it scoped has since shipped (`KeyCustody.ts`, `NativeKeyCustody.ts`/`.kt`, `NativeKeyCustodyModule.kt`), see `CRYPTO_PROTOCOL_SPEC.md` §15.4-15.5 for its current, "Done" status
 - **CRYPTO_PROTOCOL_SPEC.md:** 70 KB detailed cryptographic specification (threat model, primitives, wire formats, test coverage, known weaknesses)
 - **SECURITY.md:** Vulnerability reporting process and audit scope
 - **RECOVERY_REPORT.md:** Accounting of the 2026-09-14 branch-loss recovery — what was reconstructed, what's a documented gap, and standalone findings (N-series) turned up along the way
@@ -317,7 +318,7 @@ This table lists representative suites, not the full set — see `__tests__/` fo
   Yes—the backup format is device-agnostic JSON. Restore is just a decryption + re-import step, so the content is re-encrypted under the current vault's master key on the target device.
 
 - **"What if someone roots my device?"**  
-  Hardware-backed key storage (Android Keystore) makes it harder, but not impossible, for an attacker to extract keys from a rooted device. The 64 MiB Argon2id KDF also makes brute-force expensive. See `L3_CUSTODY_AUDIT.md` for the roadmap to move the raw master key out of the JS heap entirely.
+  Hardware-backed key storage (Android Keystore) makes it harder, but not impossible, for an attacker to extract keys from a rooted device. The 64 MiB Argon2id KDF also makes brute-force expensive. The raw master key has already been moved out of the JS heap entirely on the native path — see `CRYPTO_PROTOCOL_SPEC.md` §15.4-15.5 (status "Done") and `KeyCustody.ts`/`NativeKeyCustody.ts`/`.kt`; `L3_CUSTODY_AUDIT.md` is the historical Phase 0 map that scoped this work, not the current design.
 
 ---
 

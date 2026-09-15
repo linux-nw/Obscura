@@ -471,9 +471,13 @@ re-login, crash-mid-rotation resume, stale-WAL cleanup, wrong-passphrase abort.
 | `androidTest/Argon2idKatTest.kt`       | On-device: native Argon2id `crypto_pwhash` KAT (C1) |
 | `androidTest/XChaCha20BridgeTest.kt`   | On-device: native XChaCha20-Poly1305 roundtrip/tamper/AAD/determinism (FIX 2) |
 
-All JS/Jest suites pass. The three `androidTest` suites were **run on-device and passed**
-(see verification status below); re-run via `./gradlew connectedAndroidTest` before each
-release, or automatically in CI (see `.github/workflows/android-kat.yml`).
+All JS/Jest suites pass. This table lists representative suites, not the full set and not a
+suite/test count — see `__tests__/` (or `npx jest --listTests`) for the current total, since it
+changes with every new test file (B.10: three separate hardcoded counts elsewhere in this doc's
+Change Log had already drifted from each other and from the real count by the time this was
+written). The three `androidTest` suites were **run on-device and passed** (see verification
+status below); re-run via `./gradlew connectedAndroidTest` before each release, or automatically
+in CI (see `.github/workflows/android-kat.yml`).
 
 ### 13.1 Verified primitives (S4/S7)
 
@@ -794,7 +798,9 @@ read+write the guest vault in decoy mode. Regression coverage added: `__tests__/
 appears in no SecureStore key). On-device verification (SM-S906B, pinned release, four passes):
 (1) decoy note + file save with **zero** save-errors in logcat; (2) both persist across full
 swipe-kill + reopen and re-open from ciphertext; (3) the real vault is unchanged; (4) no decoy entry
-is visible in the real vault. `tsc` 0, jest 25 suites / 110 tests.
+is visible in the real vault. `tsc` 0, jest 25 suites / 110 tests at the time of this fix (suite
+count has grown since — see `RECOVERY_REPORT.md`/`AUDIT_2026-09-15-v2.md` for the current total,
+not this changelog entry).
 
 **L6 follow-up (deferred, not fixed this round).** A guest who uses only the decoy PIN bumps the crypto
 timed-lock counter A (`filevault_failed_attempts`) on every login: the parallel real-`unlock()` fails
@@ -928,13 +934,13 @@ The three 2b-new methods (`adoptRawKey`, `unwrapVaultWithKek`, `rewrapVault`) ra
 | 0x03-rename | — | Finished the honest-naming pass: the Backend-0x03 legacy read path `cryptoJSGCMEncrypt/Decrypt` → `legacyCryptoJsCbcHmacEncrypt/Decrypt` (it is AES-CBC+HMAC, never GCM). Removed dead `GCM_IV_LENGTH` and all misleading "GCM" comments in the active crypto path (only "NOT GCM"/"formerly named" notes remain). Pure refactor; 0x03 wire format byte-identical, legacy 0x03 read still works (roundtrip test green). |
 | TS-fix | — | `PanicService.triggerPanicAction` switch had unreachable `case 'decoy'`/`case 'all'` (TS2678) after `triggerAction` was narrowed to `'wipe' \| 'lock'`. Verified the narrowing was an **uncommitted working-tree change** (HEAD `4059f92` compiled clean), not pre-existing in the last commit and not from the S1 KDF edit. Removed the dead cases (load-time coercion already forced `wipe`/`lock`, so zero runtime change; decoy is reached via the decoy PIN). `tsc --noEmit` now passes with 0 errors. |
 | CI | — | `.github/workflows/android-kat.yml` runs `connectedDebugAndroidTest` on a `reactivecircus/android-emulator-runner` emulator (primes the missing debug AARs, x86_64 ABI) so the on-device proof is re-verified automatically instead of manually. |
-| Spec | — | §13/§13.1 updated: JS suite is **91 tests / 20 suites**; native verification status "on-device VERIFIED on 2026-06-24". |
+| Spec | — | §13/§13.1 updated: JS suite is **91 tests / 20 suites** at the time of this fix (grown since); native verification status "on-device VERIFIED on 2026-06-24". |
 
 ### Change Log — Round 6.1 (secure + close residual gaps)
 
 | ID | Severity | Fix |
 |----|----------|-----|
-| Secure | — | Round 6 working tree committed onto branch `feat/round6-crypto-final` as three clean Round-6 commits (native KAT+CI / honest crypto backend names / PanicService TS2678) plus two labelled sweep commits (support test+service layer, non-crypto WIP), `git status` clean. `tsc --noEmit` 0 errors and JS suite **20 suites / 91 tests** green verified *after* committing. |
+| Secure | — | Round 6 working tree committed onto branch `feat/round6-crypto-final` as three clean Round-6 commits (native KAT+CI / honest crypto backend names / PanicService TS2678) plus two labelled sweep commits (support test+service layer, non-crypto WIP), `git status` clean. `tsc --noEmit` 0 errors and JS suite **20 suites / 91 tests** green verified *after* committing (count as of that commit; grown since). |
 | Bridge | High | New `androidTest/RNFileVaultBridgeRoundtripTest.kt` drives `RNFileVaultModule.encrypt`→`decrypt` through the real bridge (`ReadableMap`/`Promise`), covering the marshalling the primitive KATs skip (Base64/hex/detached-tag-split/AAD), with empty/1-byte/>1 MiB roundtrips, a Poly1305 tamper case and an AAD-mismatch case. Verified **`tests=15, failures=0`** on x86_64 (2026-06-26) — the §13.2 "end-to-end JNI glue" gap is closed on x86_64. |
 | arm64 | High | arm64-v8a **on-device VERIFIED** on physical device Samsung SM-S906B (Galaxy S22+, arm64-v8a), Android 16, lazysodium 5.1.0, 2026-06-26: `./gradlew :app:connectedDebugAndroidTest -PreactNativeArchitectures=arm64-v8a` → `tests=15, failures=0, errors=0` (9 native KATs + 6 bridge cases), byte-identical to the published vectors and the JS constants on native arm64. Cross-impl byte-equality now established on **both** ABIs. §13.1/§13.2 set to VERIFIED. (Earlier x86_64-emulator arm64-translation attempt failed at startup — RN SoLoader resolves libs by the emulator's primary ABI x86_64; resolved by running on real arm64 hardware where the primary ABI is arm64-v8a.) |
 | CI | — | `android-kat.yml` runs the suite on an x86_64 emulator. An arm64 emulator matrix is deliberately **not** added — infeasible on GitHub-hosted runners (`ubuntu-24.04-arm` has no `/dev/kvm`; x86_64 runners hit the SoLoader/primary-ABI wall). arm64 is verified by the documented manual on-device run above. |
@@ -949,4 +955,4 @@ The three 2b-new methods (`adoptRawKey`, `unwrapVaultWithKek`, `rewrapVault`) ra
 | L3-2b | High | **`src/services/KeyCustody.ts`** rewritten: two backings chosen once at module load. `NativeBackedKeyCustodyImpl` (device): synchronous `has()` via JS-side `live: Set`; per-handle readiness promise; no `resolve()`. `JsBackedKeyCustodyImpl` (Jest/dev): 2a behaviour retained; the only place AES-CBC/0x02 write path can run. |
 | L3-2b | High | **`src/services/CryptoService.ts`** — R1/R2/R3 `resolve()` seams eliminated on the native path. `encryptDataWithHandle`/`decryptDataWithHandle`: native branch routes through `keyCustody.encryptContent/decryptContent`; non-0x01 prefix on native is a hard error, no JS fallback. `unlockKEK` → `openVaultInstall`; `loadMasterKeyForBiometric` → `unwrapVaultWithKekInstall`; `changePassphrase` → `rewrapVault`. `setMasterHandle` adopts natively-minted handles without a raw-key crossing. |
 | L3-2b | — | **Device ceremony 2026-06-30** — `L3Phase4CeremonyTest` (6 tests) on SM-S906B (Galaxy S22+, arm64-v8a): **6/6 PASS, 0.38 s**. First native execution of `adoptRawKey`, `unwrapVaultWithKek`, `rewrapVault`. §15.5 updated: L3 status → **Done** (three documented limits: plaintext-per-op bridge crossing inherent; lazysodium `byte[]` transient; one-time B1/B5/legacy master touch). |
-| L3-2b | — | `__tests__/L3_KeyZeroing.test.ts` — `resolve()` calls guarded by `JsBackedKeyCustody` cast (Jest-only seam; `NativeBackedKeyCustody` has no `resolve()`). `tsc --noEmit` exit 0; Jest 27 suites / 115 tests green. |
+| L3-2b | — | `__tests__/L3_KeyZeroing.test.ts` — `resolve()` calls guarded by `JsBackedKeyCustody` cast (Jest-only seam; `NativeBackedKeyCustody` has no `resolve()`). `tsc --noEmit` exit 0; Jest 27 suites / 115 tests green (count as of this fix; grown since). |
