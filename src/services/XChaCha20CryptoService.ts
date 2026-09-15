@@ -7,7 +7,6 @@
  * WICHTIG: AES-256-CBC ist die VERBINDLICHE Verschlüsselungsmethode!
  */
 
-import * as SecureStore from 'expo-secure-store';
 import * as CryptoModule from 'expo-crypto';
 import CryptoJS from 'crypto-js';
 
