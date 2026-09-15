@@ -9,6 +9,11 @@
  * - Secure deletion for all vault data
  *
  * WICHTIG: NUTZT AES-256-CBC statt XChaCha20
+ *
+ * The real guarantee is crypto-shredding (deleteEncryptionKey() before the overwrite pass
+ * below), not the overwrite itself — flash wear-leveling means these patterns may not reach
+ * the same physical NAND blocks the plaintext once occupied. See CRYPTO_PROTOCOL_SPEC.md §15
+ * Layer 5 / README.md's L5 row.
  */
 
 import * as FileSystem from 'expo-file-system/legacy';
