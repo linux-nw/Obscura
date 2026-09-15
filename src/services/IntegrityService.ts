@@ -3,10 +3,11 @@
  * APK/AAB Integrity Prüfung und Anti-Tamper
  *
  * Sicherheitsmerkmale:
- * - APK Signature Verification
- * - File Integrity Check
- * - Debugger Detection
- * - Self-Integrity Check
+ * - APK Signature Verification (real — see verifyAppSignature())
+ * - File Integrity Check, Debugger Detection, Self-Integrity Check: NOT_IMPLEMENTED —
+ *   unconditional-pass placeholders pending native modules, same status as
+ *   DeviceSecurityService.ts. Only 1 of the 4 checks in checkIntegrity()'s aggregate
+ *   score is real; see the per-method notes below before building anything on that score.
  */
 
 import * as SecureStore from 'expo-secure-store';
@@ -103,18 +104,12 @@ export class IntegrityService {
   }
 
   /**
-   * Prüft auf Datei-Integrität
+   * NOT_IMPLEMENTED: needs a native module for a real check (suspicious file paths like
+   * /system/bin/su, /system/app/Superuser.apk). Unconditional pass until then — matches
+   * checkSignature()'s 'unverifiable' fail-open behavior, not a regression on its own.
    */
   private static async checkAppFiles(): Promise<boolean> {
     try {
-      // In Produktion: Prüfung auf verdächtige Dateien
-      // - /system/bin/su
-      // - /system/xbin/su
-      // - /system/app/Superuser.apk
-      // - /system/bin/.ext/
-      // - /system/bin/sucu
-
-      // Fallback
       return true;
     } catch {
       return false;
@@ -122,16 +117,11 @@ export class IntegrityService {
   }
 
   /**
-   * Prüft ob Debugger angehängt ist
+   * NOT_IMPLEMENTED: needs a native module (TracerPid on Android, ptrace(PT_DENY_ATTACH)
+   * on iOS). Unconditional pass until then, same reasoning as checkAppFiles() above.
    */
   private static async checkDebugger(): Promise<boolean> {
     try {
-      // In Produktion: native Module für
-      // - Android: ActivityManager.isRunningInUserSpace()
-      // - Android: /proc/self/status TracerPid
-      // - iOS: ptrace(PT_DENY_ATTACH)
-
-      // Fallback
       return true;
     } catch {
       return false;
@@ -139,16 +129,12 @@ export class IntegrityService {
   }
 
   /**
-   * Prüft die Integritätsdienste
+   * NOT_IMPLEMENTED: never checks anything — unconditional pass, same reasoning as
+   * checkAppFiles() above.
    */
   private static async checkIntegrityService(): Promise<boolean> {
     try {
-      // Prüft ob Integritätsdienste noch existieren
-      // - DeviceSecurityService
-      // - ScreenProtectionService
-      // - MemorySafetyService
-
-      return true; // Platzhalter
+      return true;
     } catch {
       return false;
     }
