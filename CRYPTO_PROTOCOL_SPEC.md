@@ -1,8 +1,8 @@
 # Obscura FileVault — Cryptographic Protocol Specification
 
-**Version:** 1.0  
-**Date:** 2026-05-22  
-**Status:** Production-ready (after Round 3 fixes)  
+**Version:** 1.0 + L3 Phase 2b addendum  
+**Date:** 2026-05-22 (original); latest substantive addendum (§15.5, native key custody) 2026-06-30  
+**Status:** Production-ready (after Round 3 fixes); native key custody (§15.4-15.5) shipped since  
 **Audience:** Cryptographers, security auditors
 
 ---
