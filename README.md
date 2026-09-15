@@ -75,8 +75,8 @@ Obscura/
 **Encryption flow (file content):**
 ```
 User's passphrase
-    ↓ [Argon2id KDF: 64 MiB, 3 iterations]
-    ↓ (or PBKDF2-600k fallback if native unavailable)
+    ↓ [Argon2id KDF: 64 MiB, 3 iterations — native libsodium, or a pure-JS
+    ↓  @noble/hashes fallback with identical parameters if native unavailable]
 KEK (Key Encryption Key) — 32 bytes, never persisted
     ↓ [AES-256-CBC-HMAC or native unwrap]
     ↓ (from SecureStore; wrapped master key)
@@ -190,7 +190,7 @@ emulator.
 ### Cryptographic Primitives
 
 - **KDF (Primary):** Argon2id (libsodium `crypto_pwhash`, m=64 MiB, t=3, p=1)
-- **KDF (Fallback):** PBKDF2-SHA256 (CryptoJS, 600k iterations)
+- **KDF (Fallback):** Argon2id (`@noble/hashes`, pure JS, same m=64 MiB/t=3/p=1 as the native path — no PBKDF2 downgrade for the vault KEK)
 - **Symmetric (Primary):** XChaCha20-Poly1305 (libsodium, native)
 - **Symmetric (Fallback):** AES-256-CBC + Encrypt-then-MAC (HMAC-SHA256)
 - **Key Derivation:** HKDF-SHA256 (MAC key from master key)

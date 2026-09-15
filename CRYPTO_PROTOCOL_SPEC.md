@@ -20,7 +20,7 @@ Write-Ahead Log for atomic key rotation, and a Panic PIN that activates a decoy 
 ```
 Passphrase / PIN
        │
-       ▼  KDF (Argon2id primary / PBKDF2-SHA256 fallback)
+       ▼  KDF (Argon2id — native libsodium primary / @noble/hashes pure-JS fallback)
       KEK  (32 bytes, never persisted; derived on-demand, cleared after use)
        │
        ▼  AES-256-CBC-HMAC or XChaCha20-Poly1305 (backend-dependent)
@@ -55,18 +55,32 @@ Used when the Android native module (`RNFileVaultModule.kt`) is available.
 
 Salt is stored alongside the encrypted master key in SecureStore.
 
-### 3.2 Fallback KDF — PBKDF2-SHA256
+### 3.2 Fallback KDF — @noble/hashes Argon2id (pure JavaScript)
 
-Used when the native module is unavailable (e.g., emulator, integration tests).
+Used when the native module is unavailable (e.g., Expo Go, emulator without the native
+build, integration tests). **Not PBKDF2** — this section previously described a PBKDF2-
+SHA256 fallback that does not exist in the current code; corrected 2026-09-15 (see
+AUDIT_2026-09-15-v2.md, B.4). The real fallback is a second, independent Argon2id
+implementation with the *same* parameters as §3.1, chosen specifically so both paths
+derive byte-identical keys from the same passphrase/salt (verified in
+`Argon2idReal.test.ts`) — there is no downgrade path for the vault KEK.
 
-| Parameter    | Value                                     |
-|--------------|-------------------------------------------|
-| Algorithm    | PBKDF2-HMAC-SHA256                        |
-| Iterations   | 600 000                                   |
-| Output       | 32 bytes (hex-encoded)                    |
-| Salt         | 16 bytes CSPRNG (per setup)               |
-| Library      | CryptoJS 4.x                              |
-| NFC normal.  | `passphrase.normalize('NFC')` (R-03)      |
+| Parameter    | Value                                                        |
+|--------------|----------------------------------------------------------------|
+| Algorithm    | Argon2id (type=2), version 0x13 — identical to §3.1          |
+| Memory cost  | 65 536 KB (64 MiB)                                            |
+| Time cost    | 3 iterations                                                  |
+| Parallelism  | 1 lane (C1: pinned to match the native path)                 |
+| Output       | 32 bytes (hex-encoded)                                        |
+| Salt         | 16 bytes CSPRNG, fed as RAW bytes (C1) — same salt as native  |
+| Library      | `@noble/hashes/argon2.js` (RFC 9106); replaced an earlier `hash-wasm` WebAssembly implementation, which Hermes cannot run (no WASM runtime) |
+| NFC normal.  | `passphrase.normalize('NFC')` (R-03)                          |
+
+PBKDF2 does still exist elsewhere in the codebase, but not on the vault KEK path: it is a
+**read-only legacy-vault migration path** (`verifyPin`/legacy hash comparison in
+`CryptoService.ts`, for vaults created before Argon2id was adopted) and the KDF for
+**backup archives** (`BackupService.ts`, 600 000 iterations, see §14.2 A5) — a separate
+secret with its own, longer passphrase floor.
 
 ### 3.3 Panic PIN / Decoy PIN KDF — Argon2id (S1)
 
@@ -530,7 +544,7 @@ the KEK, the Panic/Decoy PINs, and backup archives.
 
 | # | Attacker | Covered? | Mechanism / residual |
 |---|----------|----------|----------------------|
-| A1 | **Lost/stolen device, locked** | **Yes** | Argon2id-64MiB KEK (m=64MiB,t=3,p=1), hardware-keystore-wrapped master key, rate-limit + auto-lock + wipe-on-N-fails, Panic PIN/decoy. Strength bounded by passphrase entropy → 12-char floor (H4). |
+| A1 | **Lost/stolen device, locked** | **Yes** | Argon2id-64MiB KEK (m=64MiB,t=3,p=1), hardware-keystore-wrapped master key, rate-limit + auto-lock + wipe-on-N-fails, Panic PIN/decoy. Strength bounded by passphrase entropy → **8-char floor** (`AuthScreen.tsx`; corrected 2026-09-15 from a previously-documented 12-char claim that didn't match the code — see AUDIT_2026-09-15-v2.md, B.4). Weaker margin than the 12-char backup-archive floor (A5) for the same class of offline attack. |
 | A2 | **Passive at-rest / disk image** | **Yes** | All content is AEAD (XChaCha20-Poly1305) or AES-256-CBC + Encrypt-then-MAC, bound to object+role via AAD (H2). Plaintext metadata fields (id/size/createdAt) are non-secret. |
 | A3 | **Filesystem tamper (swap/rollback/bit-flip)** | **Yes** | Bit-flip and cross-object/role blob swap are rejected (per-blob auth + `fileId/noteId:role` AAD, H2). Rollback to an OLDER version of the *same* id is now rejected too: a monotonic per-object version counter (SecureStore/Keystore-protected) is bound into the AAD as `id:role:vN`; a read rejects any blob whose version is below the stored floor (A3 — `BlobVersionService`). **Residual:** resurrecting a *deleted* object's old ciphertext at its original random id is out of scope (the attacker already possessed that ciphertext). |
 | A4 | **Crash / power-loss** | **Yes** | Atomic temp+rename writes (H3) + startup `.tmp` cleanup; WAL + per-blob idempotent key rotation. |
@@ -548,9 +562,13 @@ the KEK, the Panic/Decoy PINs, and backup archives.
 
 ### 14.4 Budget / timeline assumption
 A6/A7 assume an attacker willing to run an offline GPU/ASIC farm against an exfiltrated
-artifact (vault wrapper or backup). The 12-char passphrase floor (H4) + Argon2id-64MiB
-are sized so that the search space stays infeasible at realistic guess rates for such an
-attacker; a weak user passphrase voids this regardless of the KDF.
+artifact (vault wrapper or backup). Argon2id-64MiB plus the passphrase floor for whichever
+artifact was exfiltrated — **8 characters for the vault** (A1) or **12 characters for a
+backup archive** (A5) — are sized so the search space stays infeasible at realistic guess
+rates for such an attacker; a weak user passphrase voids this regardless of the KDF. The
+vault's 8-char floor gives a meaningfully smaller margin than the backup's 12-char floor
+against the same class of offline attack (corrected 2026-09-15 — this section previously
+cited a single 12-char figure for both; see AUDIT_2026-09-15-v2.md, B.4).
 
 ### 14.5 Backward-secrecy of key rotation (M1)
 Key rotation (R-02) gives **forward protection**: after rotation, a *future* compromise
