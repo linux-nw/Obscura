@@ -148,7 +148,9 @@ npm test   →   12/12 passed, 0 failed
 
 ## Remaining Weaknesses (non-blocking for security review)
 
-See `CRYPTO_PROTOCOL_SPEC.md §10` for details.
+Snapshot as of this report (2026-05-22). See `CRYPTO_PROTOCOL_SPEC.md §10` for details — as of
+that document's own current state, all five below are marked Fixed (independently re-verified
+in `AUDIT_2026-09-15-v2.md`, B.11).
 
 | ID | Severity | Summary |
 |----|----------|---------|
