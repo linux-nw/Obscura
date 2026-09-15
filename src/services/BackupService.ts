@@ -20,6 +20,7 @@ import { fastPbkdf2 } from './FastPBKDF2';
 import { FileManager } from './FileManager';
 import { NotesService } from './NotesService';
 import { SettingsService } from './SettingsService';
+import { AutoLockService } from './AutoLockService';
 
 // Legacy v2: PBKDF2 iterations (accepted on restore, never produced anymore).
 const BACKUP_PBKDF2_ITERATIONS = 600000;
@@ -88,6 +89,7 @@ export class BackupService {
     if (passphrase.normalize('NFC').length < BACKUP_MIN_PASSPHRASE) {
       throw new Error(`Backup-Passwort muss mindestens ${BACKUP_MIN_PASSPHRASE} Zeichen haben`);
     }
+    AutoLockService.beginOperation();
     try {
       await this.initialize();
 
@@ -136,6 +138,8 @@ export class BackupService {
     } catch (error) {
       console.error('Backup: create failed:', error);
       throw new Error('Backup konnte nicht erstellt werden');
+    } finally {
+      AutoLockService.endOperation();
     }
   }
 
@@ -207,16 +211,21 @@ export class BackupService {
       notes?: { title: string; content: string; category?: string; tags?: string[] }[];
       settings?: any;
     };
-    for (const f of data.files ?? []) {
-      if (!f || typeof f.content !== 'string') continue;
-      await FileManager.importFile(f.content, f.type, f.originalName, f.createdAt);
-    }
-    for (const n of data.notes ?? []) {
-      if (!n) continue;
-      await NotesService.createNote(n.title, n.content, n.category, n.tags);
-    }
-    if (data.settings) {
-      await SettingsService.save(data.settings);
+    AutoLockService.beginOperation();
+    try {
+      for (const f of data.files ?? []) {
+        if (!f || typeof f.content !== 'string') continue;
+        await FileManager.importFile(f.content, f.type, f.originalName, f.createdAt);
+      }
+      for (const n of data.notes ?? []) {
+        if (!n) continue;
+        await NotesService.createNote(n.title, n.content, n.category, n.tags);
+      }
+      if (data.settings) {
+        await SettingsService.save(data.settings);
+      }
+    } finally {
+      AutoLockService.endOperation();
     }
   }
 

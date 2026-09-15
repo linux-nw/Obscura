@@ -18,6 +18,7 @@ import { fastPbkdf2 } from './FastPBKDF2';
 import { Argon2idService, Argon2Params } from './Argon2idService';
 import * as CryptoModule from 'expo-crypto';
 import { SettingsService } from './SettingsService';
+import { AutoLockService } from './AutoLockService';
 
 export interface DecoyFile {
   id: string;
@@ -146,6 +147,7 @@ export class DecoyVaultService {
     if (!handle) {
       throw new Error('Guest content key not unlocked — set the guest PIN first');
     }
+    AutoLockService.beginOperation();
     try {
       await this.initialize();
       await this.clearEntries('file_'); // also clears file_*.meta
@@ -177,6 +179,8 @@ export class DecoyVaultService {
       console.log('GuestVault: Fake files created (encrypted)');
     } catch (error) {
       console.error('GuestVault: Failed to create fake files:', error);
+    } finally {
+      AutoLockService.endOperation();
     }
   }
 
@@ -188,6 +192,7 @@ export class DecoyVaultService {
     if (!handle) {
       throw new Error('Guest content key not unlocked — set the guest PIN first');
     }
+    AutoLockService.beginOperation();
     try {
       await this.initialize();
       await this.clearEntries('note_');
@@ -214,6 +219,8 @@ export class DecoyVaultService {
       console.log('GuestVault: Fake notes created (encrypted)');
     } catch (error) {
       console.error('GuestVault: Failed to create fake notes:', error);
+    } finally {
+      AutoLockService.endOperation();
     }
   }
 
