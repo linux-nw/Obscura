@@ -20,6 +20,7 @@ import { fastPbkdf2 } from './FastPBKDF2';
 import { FileManager } from './FileManager';
 import { NotesService } from './NotesService';
 import { SettingsService } from './SettingsService';
+import { writeFileAtomic } from './fsAtomic';
 
 // Legacy v2: PBKDF2 iterations (accepted on restore, never produced anymore).
 const BACKUP_PBKDF2_ITERATIONS = 600000;
@@ -35,6 +36,42 @@ const BACKUP_MIN_PASSPHRASE = 12;
 const BACKUP_ARGON2: Argon2Params = {
   version: 0x13, type: 2, memoryKB: 65536, iterations: 3, parallelism: 1, hashLength: 32,
 };
+
+// Untrusted-input limits for backup files (file system, shared storage, import picker).
+const MAX_BACKUP_FILE_BYTES = 512 * 1024 * 1024;
+const MAX_BACKUP_ENTRIES = 100000;
+const HEX_RE = /^[0-9a-fA-F]*$/;
+const BACKUP_ID_RE = /^[a-z0-9_]{1,64}$/;
+
+function assertBackupId(id: string): void {
+  if (typeof id !== 'string' || !BACKUP_ID_RE.test(id)) throw new Error('Ungültige Backup-ID');
+}
+
+/** Strict shape check of the (unauthenticated) envelope BEFORE any KDF/crypto work. */
+function assertEnvelope(e: any): asserts e is EncryptedBackupData {
+  if (!e || typeof e !== 'object' || (e.version !== 2 && e.version !== 3)) {
+    throw new Error('Nicht unterstütztes Backup-Format');
+  }
+  const hexLen = (v: unknown, n: number) =>
+    typeof v === 'string' && v.length === n && HEX_RE.test(v);
+  if (!hexLen(e.iv, 32) || !hexLen(e.tag, 64) || !hexLen(e.salt, e.version === 3 ? 32 : e.salt?.length)) {
+    throw new Error('Ungültiges Backup-Format');
+  }
+  if (typeof e.backup !== 'string' || e.backup.length === 0 || e.backup.length % 32 !== 0 || !HEX_RE.test(e.backup)) {
+    throw new Error('Ungültiges Backup-Format');
+  }
+  if (e.version === 2 && (e.salt.length < 32 || e.salt.length > 128 || e.salt.length % 2 !== 0)) {
+    throw new Error('Ungültiges Backup-Format');
+  }
+  if (e.version === 3) {
+    // Params are attacker-controlled: pin them to a sane window (no memory/CPU bomb, no
+    // weakened KDF). The only value ever written is BACKUP_ARGON2.
+    const p = e.kdfParams;
+    const ok = e.kdf === 'argon2id' && p && Number.isInteger(p.m) && Number.isInteger(p.t) && Number.isInteger(p.p)
+      && p.m >= BACKUP_ARGON2.memoryKB && p.m <= 262144 && p.t >= BACKUP_ARGON2.iterations && p.t <= 10 && p.p === 1;
+    if (!ok) throw new Error('Ungültige KDF-Parameter');
+  }
+}
 
 export interface BackupMetadata {
   version: string;
@@ -127,9 +164,9 @@ export class BackupService {
 
       const encrypted = await this.encryptBackup(JSON.stringify(backupData), passphrase);
 
-      const backupId = this.generateBackupId();
+      const backupId = await this.generateBackupId();
       const backupPath = `${this.BACKUP_DIR}backup_${backupId}.json`;
-      await FileSystem.writeAsStringAsync(backupPath, JSON.stringify(encrypted));
+      await writeFileAtomic(backupPath, JSON.stringify(encrypted));
       await SecureStore.setItemAsync(this.LAST_BACKUP_KEY, Date.now().toString());
 
       return backupId;
@@ -183,16 +220,11 @@ export class BackupService {
 
   static async restoreBackup(passphrase: string, backupId: string): Promise<boolean> {
     try {
+      assertBackupId(backupId);
       const backupPath = `${this.BACKUP_DIR}backup_${backupId}.json`;
-      const content = await FileSystem.readAsStringAsync(backupPath);
-      const encryptedData = JSON.parse(content);
+      const encryptedData = await this.readEnvelope(backupPath);
 
-      // Accept v3 (Argon2id, current) and v2 (PBKDF2, legacy). Reject v1/unknown.
-      if (encryptedData.version !== 2 && encryptedData.version !== 3) {
-        throw new Error('Nicht unterstütztes Backup-Format');
-      }
-
-      const plaintext = await this.decryptBackup(encryptedData as EncryptedBackupData, passphrase);
+      const plaintext = await this.decryptBackup(encryptedData, passphrase);
       await this.applyBackupData(plaintext);
       return true;
     } catch (error) {
@@ -201,26 +233,88 @@ export class BackupService {
     }
   }
 
+  /** Size-checked read + parse + shape validation of an untrusted backup file. */
+  private static async readEnvelope(path: string): Promise<EncryptedBackupData> {
+    const info = await FileSystem.getInfoAsync(path);
+    if (!info.exists || (typeof info.size === 'number' && info.size > MAX_BACKUP_FILE_BYTES)) {
+      throw new Error('Backup-Datei fehlt oder zu groß');
+    }
+    const parsed = JSON.parse(await FileSystem.readAsStringAsync(path));
+    assertEnvelope(parsed);
+    return parsed;
+  }
+
   private static async applyBackupData(plaintext: string): Promise<void> {
     const data = JSON.parse(plaintext) as {
       files?: { originalName: string; type: 'image' | 'video' | 'document'; content: string; createdAt?: string }[];
       notes?: { title: string; content: string; category?: string; tags?: string[] }[];
       settings?: any;
     };
-    for (const f of data.files ?? []) {
-      if (!f || typeof f.content !== 'string') continue;
-      await FileManager.importFile(f.content, f.type, f.originalName, f.createdAt);
+    if (!data || typeof data !== 'object') throw new Error('Ungültige Backup-Daten');
+    const files = data.files ?? [];
+    const notes = data.notes ?? [];
+    if (!Array.isArray(files) || !Array.isArray(notes) || files.length + notes.length > MAX_BACKUP_ENTRIES) {
+      throw new Error('Ungültige Backup-Daten');
     }
-    for (const n of data.notes ?? []) {
-      if (!n) continue;
-      await NotesService.createNote(n.title, n.content, n.category, n.tags);
+
+    // Validate EVERYTHING before touching the vault so a malformed entry cannot leave a
+    // half-restored state.
+    for (const f of files) {
+      if (!f || typeof f.content !== 'string' || !FileManager.isImportable(f.type, f.originalName)) {
+        throw new Error('Ungültiger Datei-Eintrag im Backup');
+      }
     }
-    if (data.settings) {
-      await SettingsService.save(data.settings);
+    for (const n of notes) {
+      if (!n || typeof n.title !== 'string' || typeof n.content !== 'string') {
+        throw new Error('Ungültiger Notiz-Eintrag im Backup');
+      }
+    }
+    const settings = data.settings !== undefined ? await this.mergeSettings(data.settings) : null;
+
+    const createdFiles: string[] = [];
+    const createdNotes: string[] = [];
+    try {
+      for (const f of files) {
+        createdFiles.push((await FileManager.importFile(f.content, f.type, f.originalName, f.createdAt)).id);
+      }
+      for (const n of notes) {
+        const tags = Array.isArray(n.tags) ? n.tags.filter((t) => typeof t === 'string') : undefined;
+        const category = typeof n.category === 'string' ? n.category : undefined;
+        createdNotes.push((await NotesService.createNote(n.title, n.content, category, tags)).id);
+      }
+    } catch (e) {
+      // Roll back what this restore added — never leave a partial import behind.
+      for (const id of createdFiles) await FileManager.deleteFile(id).catch(() => {});
+      for (const id of createdNotes) await NotesService.deleteNote(id).catch(() => {});
+      throw e;
+    }
+    if (settings) {
+      await SettingsService.save(settings);
     }
   }
 
+  /**
+   * Restored settings are untrusted data: accept known keys only and never let a backup
+   * WEAKEN a security setting (lockout threshold, PIN length, auto-lock, action, 2FA).
+   */
+  private static async mergeSettings(raw: any): Promise<Awaited<ReturnType<typeof SettingsService.get>>> {
+    const cur = await SettingsService.get();
+    if (!raw || typeof raw !== 'object') return cur;
+    const next = { ...cur };
+    const int = (v: unknown) => (typeof v === 'number' && Number.isInteger(v) ? v : null);
+    const mp = int(raw.minPinLength);
+    if (mp !== null && mp > cur.minPinLength && mp <= 128) next.minPinLength = mp;
+    const mf = int(raw.maxFailedAttempts);
+    if (mf !== null && mf >= 1 && mf < cur.maxFailedAttempts) next.maxFailedAttempts = mf;
+    const al = int(raw.autoLockTimeout);
+    const eff = (t: number) => (t < 0 ? Infinity : t);
+    if (al !== null && eff(al) < eff(cur.autoLockTimeout)) next.autoLockTimeout = al;
+    if (raw.require2FA === true) next.require2FA = true;
+    return next;
+  }
+
   static async shareBackup(backupId: string): Promise<void> {
+    assertBackupId(backupId);
     const backupPath = `${this.BACKUP_DIR}backup_${backupId}.json`;
     await Sharing.shareAsync(backupPath, {
       mimeType: 'application/json',
@@ -231,12 +325,8 @@ export class BackupService {
 
   static async importBackupFromFile(passphrase: string, fileUri: string): Promise<boolean> {
     try {
-      const content = await FileSystem.readAsStringAsync(fileUri);
-      const encryptedData = JSON.parse(content);
-      if (encryptedData.version !== 2 && encryptedData.version !== 3) {
-        throw new Error('Nicht unterstütztes Backup-Format');
-      }
-      const plaintext = await this.decryptBackup(encryptedData as EncryptedBackupData, passphrase);
+      const encryptedData = await this.readEnvelope(fileUri);
+      const plaintext = await this.decryptBackup(encryptedData, passphrase);
       await this.applyBackupData(plaintext);
       return true;
     } catch (error) {
@@ -303,7 +393,9 @@ export class BackupService {
           if (info.exists) {
             backups.push({
               id: file.replace('backup_', '').replace('.json', ''),
-              timestamp: Date.now(),
+              timestamp: typeof (info as any).modificationTime === 'number'
+                ? (info as any).modificationTime * 1000
+                : 0,
               size: info.size ?? 0,
             });
           }
@@ -319,6 +411,7 @@ export class BackupService {
   }
 
   static async deleteBackup(backupId: string): Promise<void> {
+    assertBackupId(backupId);
     const filePath = `${this.BACKUP_DIR}backup_${backupId}.json`;
     await FileSystem.deleteAsync(filePath);
   }
@@ -368,9 +461,9 @@ export class BackupService {
     }
   }
 
-  private static generateBackupId(): string {
+  private static async generateBackupId(): Promise<string> {
     const timestamp = Date.now().toString(36);
-    const random = Math.random().toString(36).substring(2, 10);
+    const random = SecureCryptoService.bufferToHex(await SecureCryptoService.generateSecureBytes(8));
     return `${timestamp}_${random}`;
   }
 }

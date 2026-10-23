@@ -17,6 +17,9 @@ import Icon from '../components/Icon';
 import { c, rs, font, radius, SAFE_TOP, SAFE_BOTTOM, useBottomInset } from '../theme';
 
 const ATTEMPTS_KEY = 'filevault_auth_attempts';
+const GUEST_KEY = 'filevault_guest_active';
+const MIN_NEW_PASSPHRASE = 12;
+const MIN_LOGIN_PASSPHRASE = 8;
 
 interface Props {
   onAuthenticate: () => void;
@@ -78,7 +81,7 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
       try {
         const security = await DeviceSecurityService.checkDeviceSecurity();
         if (security.detectedTampering) {
-          console.warn('Security: Device tampering detected');
+          showError('Sicherheitswarnung: Gerät/App-Umgebung manipuliert');
         }
       } catch {}
     })();
@@ -108,7 +111,14 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
 
   const triggerBio = async (settings?: AppSettings) => {
     const s = settings ?? appSettings;
-    if (!s?.biometricsEnabled) return;
+    if (!s?.biometricsEnabled || isHashing || unlocking) return;
+    try {
+      const lock = await SecureCryptoService.getLockStatus();
+      if (lock.locked) {
+        showError('Tresor gesperrt — Passwort-Sperre aktiv');
+        return;
+      }
+    } catch {}
     if (s?.require2FA) {
       try {
         const res = await LocalAuthentication.authenticateAsync({
@@ -129,6 +139,8 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
         }
         const success = await SecureCryptoService.loadMasterKeyForBiometric();
         if (success) {
+          // Biometric unlock always opens the REAL vault: drop any stale guest marker.
+          await SecureStore.deleteItemAsync(GUEST_KEY).catch(() => {});
           setUnlocking(true);
           setTimeout(doAuth, 500);
         } else {
@@ -138,6 +150,20 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
         showError('Biometrie fehlgeschlagen');
       }
     }
+  };
+
+  const enforceMaxAttempts = async (action: 'lock' | 'wipe', maxAttempts: number) => {
+    await SecureStore.deleteItemAsync(ATTEMPTS_KEY).catch(() => {});
+    if (action === 'lock') {
+      try { await SecureStore.setItemAsync('filevault_lock_until', String(Number.MAX_SAFE_INTEGER)); } catch {}
+      showError('Tresor dauerhaft gesperrt.');
+    } else {
+      // Wipe runs immediately; it must never depend on the user tapping a dialog button
+      // (an attacker could simply kill the app instead and keep guessing).
+      try { await onWipeVault?.(); } catch {}
+      Alert.alert('Tresor gelöscht', `${maxAttempts} falsche Passwörter — alle Daten wurden unwiderruflich gelöscht.`);
+    }
+    setPass('');
   };
 
   const checkLoginPass = async (entered: string) => {
@@ -157,6 +183,15 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
         return;
       }
 
+      // Persist the attempt BEFORE verifying: killing the app mid-KDF cannot dodge the count.
+      const liveSettings = await SettingsService.get();
+      const maxAttempts = liveSettings.maxFailedAttempts;
+      const action = liveSettings.maxFailedAttemptsAction;
+      const prior = parseInt((await SecureStore.getItemAsync(ATTEMPTS_KEY)) ?? '0', 10);
+      const pending = (Number.isFinite(prior) && prior > 0 ? prior : 0) + 1;
+      await SecureStore.setItemAsync(ATTEMPTS_KEY, String(pending));
+      setFailedAttempts(pending);
+
       // R-01: All three checks run in parallel — no timing leak between paths.
       // unlock() loads the real master key into cache if passphrase is correct.
       // verifyPanicPin() and verifyDecoyPin() are independent.
@@ -169,6 +204,7 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
       if (panicMatch) {
         // Panic PIN: clear master key, then dispatch wipe or permanent lock.
         SecureCryptoService.clearAllCaches();
+        await SecureStore.deleteItemAsync(ATTEMPTS_KEY).catch(() => {});
         const triggerAction = await PanicService.getTriggerAction();
 
         if (triggerAction === 'wipe') {
@@ -184,12 +220,21 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
       }
 
       if (realMatch) {
+        if (liveSettings.require2FA && liveSettings.biometricsEnabled && hasBio && !bioPassedFor2FA) {
+          SecureCryptoService.clearAllCaches();
+          showError('2FA: zuerst Biometrie bestätigen');
+          setPass('');
+          triggerBio(liveSettings);
+          return;
+        }
         setFailedAttempts(0);
         await SecureStore.deleteItemAsync(ATTEMPTS_KEY);
+        await SecureStore.deleteItemAsync(GUEST_KEY).catch(() => {});
+        setPass('');
         try {
           await KeyRotationService.resumeRotationIfNeeded(entered);
         } catch (e) {
-          console.error('KeyRotation: resume after unlock failed:', e);
+          
         }
         setUnlocking(true);
         setTimeout(doAuth, 300);
@@ -202,7 +247,7 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
           // L6: derive + cache the guest content key for this decoy session so the
           // guest vault's encrypted blobs are readable.
           await DecoyVaultService.unlockDecoyContent(entered);
-          await SecureStore.setItemAsync('filevault_guest_active', 'true');
+          await SecureStore.setItemAsync(GUEST_KEY, 'true');
         } catch {
           showError('Fehler beim Aktivieren des Täusch-Tresors');
           setPass('');
@@ -211,38 +256,13 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
         setUnlocking(true);
         setTimeout(doAuth, 300);
       } else {
-        const maxAttempts = appSettings?.maxFailedAttempts ?? 5;
-        const newCount = failedAttempts + 1;
-        setFailedAttempts(newCount);
-        await SecureStore.setItemAsync(ATTEMPTS_KEY, String(newCount));
-
-        if (newCount >= maxAttempts) {
-          const action = appSettings?.maxFailedAttemptsAction ?? 'wipe';
-          if (action === 'lock') {
-            await SecureStore.deleteItemAsync(ATTEMPTS_KEY);
-            try { await SecureStore.setItemAsync('filevault_lock_until', String(Number.MAX_SAFE_INTEGER)); } catch {}
-            showError('Tresor dauerhaft gesperrt.');
-            setPass('');
-          } else {
-            Alert.alert(
-              'Tresor gelöscht',
-              `${maxAttempts} falsche Passwörter — alle Daten werden unwiderruflich gelöscht.`,
-              [{
-                text: 'Löschen',
-                style: 'destructive',
-                onPress: async () => {
-                  await SecureStore.deleteItemAsync(ATTEMPTS_KEY);
-                  await onWipeVault?.();
-                },
-              }],
-              { cancelable: false },
-            );
-          }
+        setPass('');
+        if (pending >= maxAttempts) {
+          await enforceMaxAttempts(action, maxAttempts);
         } else {
-          const remaining = maxAttempts - newCount;
+          const remaining = maxAttempts - pending;
           showError(`Falsches Passwort — noch ${remaining} ${remaining === 1 ? 'Versuch' : 'Versuche'}`);
         }
-        setPass('');
       }
     } catch {
       showError('Fehler beim Prüfen des Passworts');
@@ -262,7 +282,7 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
       return;
     }
 
-    const minLen = 8;
+    const minLen = MIN_NEW_PASSPHRASE;
     if (entered.length < minLen) {
       showError(`Mindestens ${minLen} Zeichen erforderlich`);
       setConfirm('');
@@ -279,7 +299,7 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
       setUnlocking(true);
       setTimeout(doAuth, 300);
     } catch (error) {
-      console.error('Fehler beim Speichern des Passworts:', error);
+      
       showError('Konnte Passwort nicht speichern');
       setConfirm('');
     } finally {
@@ -289,7 +309,7 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
 
   const handleAdvance = () => {
     const current = phase === 'confirm' ? confirm : pass;
-    if (current.length < 8 || unlocking || isHashing) return;
+    if (current.length < (isFirstLaunch ? MIN_NEW_PASSPHRASE : MIN_LOGIN_PASSPHRASE) || unlocking || isHashing) return;
 
     if (isFirstLaunch && phase === 'enter') {
       setPhase('confirm');
@@ -310,7 +330,7 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
 
   const currentVal  = phase === 'confirm' ? confirm : pass;
   const setCurrentVal = phase === 'confirm' ? setConfirm : setPass;
-  const minLen = 8;
+  const minLen = isFirstLaunch ? MIN_NEW_PASSPHRASE : MIN_LOGIN_PASSPHRASE;
   const canAdvance  = currentVal.length >= minLen && !unlocking && !isHashing;
 
   const phaseLabel = isFirstLaunch
@@ -323,7 +343,7 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
     : bioPassedFor2FA
     ? 'Biometrie bestätigt — Passwort eingeben'
     : isFirstLaunch
-    ? (phase === 'enter' ? 'Mindestens 8 Zeichen' : 'Passwort erneut eingeben')
+    ? (phase === 'enter' ? `Mindestens ${MIN_NEW_PASSPHRASE} Zeichen` : 'Passwort erneut eingeben')
     : 'Geben Sie Ihr Passwort ein';
 
   const submitLabel = isFirstLaunch
@@ -411,7 +431,7 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
               ))}
             </View>
             <View style={s.strengthRow}>
-              <Text style={s.strHint}>min. 8 Zeichen</Text>
+              <Text style={s.strHint}>min. {MIN_NEW_PASSPHRASE} Zeichen</Text>
               {!!strength.label && <Text style={[s.strLabel, { color: strength.color }]}>{strength.label}</Text>}
             </View>
           </View>

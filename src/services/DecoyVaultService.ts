@@ -18,6 +18,17 @@ import { fastPbkdf2 } from './FastPBKDF2';
 import { Argon2idService, Argon2Params } from './Argon2idService';
 import * as CryptoModule from 'expo-crypto';
 import { SettingsService } from './SettingsService';
+import { FileManager } from './FileManager';
+
+const dev = typeof __DEV__ !== 'undefined' && __DEV__;
+// Release builds must not log anything that names the guest vault (deniability).
+const dbgErr = (...a: unknown[]) => { if (dev) console.error(...a); };
+
+const ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const MAX_GUEST_IMPORT_BASE64 = Math.ceil((100 * 1024 * 1024) / 3) * 4;
+function assertId(id: unknown): asserts id is string {
+  if (typeof id !== 'string' || !ID_RE.test(id)) throw new Error('Ungültige ID');
+}
 
 export interface DecoyFile {
   id: string;
@@ -93,9 +104,8 @@ export class DecoyVaultService {
       if (!dirInfo.exists) {
         await FileSystem.makeDirectoryAsync(this.DECOY_DIR, { intermediates: true });
       }
-      console.log('GuestVault: Service initialized with AES-256');
     } catch (error) {
-      console.error('Error initializing GuestVault:', error);
+      dbgErr('Error initializing GuestVault:', error);
     }
   }
 
@@ -106,9 +116,8 @@ export class DecoyVaultService {
     try {
       await this.initialize();
       await SecureStore.setItemAsync(this.DECOY_ENABLED_KEY, 'true');
-      console.log('GuestVault: guest vault enabled');
     } catch (error) {
-      console.error('Error enabling guest vault:', error);
+      dbgErr('Error enabling guest vault:', error);
     }
   }
 
@@ -118,9 +127,8 @@ export class DecoyVaultService {
   static async disableDecoyVault(): Promise<void> {
     try {
       await SecureStore.deleteItemAsync(this.DECOY_ENABLED_KEY);
-      console.log('GuestVault: guest vault disabled');
     } catch (error) {
-      console.error('Error disabling guest vault:', error);
+      dbgErr('Error disabling guest vault:', error);
     }
   }
 
@@ -162,21 +170,20 @@ export class DecoyVaultService {
       ];
 
       for (const f of fakeFiles) {
-        const fileId = this.generateId();
+        const fileId = await this.generateId();
         const filePath = `${this.DECOY_DIR}file_${fileId}`;
         const metaPath = `${filePath}.meta`;
 
         const content = await this.randomHex(f.bytes);
         await FileSystem.writeAsStringAsync(filePath, await this.seal(content, handle, `guest:file:${fileId}`));
 
-        const meta = { name: `file_${fileId}`, originalName: f.originalName, type: f.type, size: f.bytes };
+        const meta = { name: `file_${fileId}`, originalName: f.originalName, type: f.type, size: f.bytes, createdAt: await this.randomPastDate() };
         await FileSystem.writeAsStringAsync(metaPath, await this.seal(JSON.stringify(meta), handle, `guest:meta:${fileId}`));
       }
 
       await SecureStore.setItemAsync(this.DECOY_CREATED_KEY, Date.now().toString());
-      console.log('GuestVault: Fake files created (encrypted)');
     } catch (error) {
-      console.error('GuestVault: Failed to create fake files:', error);
+      dbgErr('GuestVault: Failed to create fake files:', error);
     }
   }
 
@@ -199,29 +206,40 @@ export class DecoyVaultService {
       ];
 
       for (const note of fakeNotes) {
-        const noteId = this.generateId();
+        const noteId = await this.generateId();
         const notePath = `${this.DECOY_DIR}note_${noteId}`;
         const payload = JSON.stringify({
           id: noteId,
           title: note.title,
           content: note.content,
-          createdAt: new Date().toISOString(),
+          createdAt: await this.randomPastDate(),
         });
         // L6: encrypted on disk (was plaintext JSON) — no readable fake notes leaking.
         await FileSystem.writeAsStringAsync(notePath, await this.seal(payload, handle, `guest:note:${noteId}`));
       }
-
-      console.log('GuestVault: Fake notes created (encrypted)');
     } catch (error) {
-      console.error('GuestVault: Failed to create fake notes:', error);
+      dbgErr('GuestVault: Failed to create fake notes:', error);
     }
   }
 
   /**
    * Generiert Decoy Datei ID
    */
-  private static generateId(): string {
-    return (Date.now().toString(36) + Math.random().toString(36).substring(2, 8));
+  private static async generateId(): Promise<string> {
+    // Same `<base36 ts>_<16 hex>` shape as the real vault's ids (a different shape would be a
+    // distinguisher), CSPRNG-backed (Math.random is predictable).
+    const rnd = Array.from(new Uint8Array(await CryptoModule.getRandomBytesAsync(8)))
+      .map(b => b.toString(16).padStart(2, '0'))
+      .join('');
+    return `${Date.now().toString(36)}_${rnd}`;
+  }
+
+  /** Plausible creation time in the past 1-18 months (a uniform "just now" is a tell). */
+  private static async randomPastDate(): Promise<string> {
+    const b = new Uint8Array(await CryptoModule.getRandomBytesAsync(4));
+    const frac = ((b[0] << 24 | b[1] << 16 | b[2] << 8 | b[3]) >>> 0) / 0x100000000;
+    const day = 24 * 60 * 60 * 1000;
+    return new Date(Date.now() - (30 + frac * 510) * day).toISOString();
   }
 
   // ─────────────────────────────── Content Encryption (L6) ───────────────────────────────
@@ -345,9 +363,8 @@ export class DecoyVaultService {
       // encrypt immediately after.
       await SecureStore.deleteItemAsync(this.DECOY_KDF_SALT);
       this.setContentKey(await this.deriveContentKey(pin));
-      console.log('GuestVault: guest PIN set (Argon2id)');
     } catch (error) {
-      console.error('Error setting guest pin:', error);
+      dbgErr('Error setting guest pin:', error);
       throw error instanceof Error ? error : new Error('Konnte PIN nicht setzen');
     }
   }
@@ -361,6 +378,9 @@ export class DecoyVaultService {
       const storedSalt = await SecureStore.getItemAsync(this.DECOY_PIN_SALT);
 
       if (!storedHash || !storedSalt) {
+        // No guest PIN configured: pay the same Argon2id cost so an unconfigured guest
+        // vault is not distinguishable by timing (§7.3 property 1).
+        await this.computePinHash(pin, '00'.repeat(16));
         return false;
       }
 
@@ -384,7 +404,7 @@ export class DecoyVaultService {
       }
       return match;
     } catch (error) {
-      console.error('GuestVault: PIN verification error:', error);
+      dbgErr('GuestVault: PIN verification error:', error);
       return false;
     }
   }
@@ -443,7 +463,7 @@ export class DecoyVaultService {
               originalName: data.originalName, // L6: now present (was never written before)
               type: data.type,
               size: data.size,
-              createdAt: new Date(),
+              createdAt: this.parseDate(data.createdAt),
             });
           } catch {
             // wrong key or tampered blob → skip
@@ -455,6 +475,11 @@ export class DecoyVaultService {
     } catch {
       return [];
     }
+  }
+
+  private static parseDate(v: unknown): Date {
+    const d = typeof v === 'string' ? new Date(v) : new Date(NaN);
+    return isNaN(d.getTime()) ? new Date() : d;
   }
 
   /**
@@ -518,7 +543,8 @@ export class DecoyVaultService {
       throw new Error('Guest content key not unlocked — set the guest PIN first');
     }
     await this.initialize();
-    const noteId = id ?? this.generateId();
+    if (id !== undefined) assertId(id);
+    const noteId = id ?? await this.generateId();
     const createdAt = new Date().toISOString();
     const payload = JSON.stringify({ id: noteId, title, content, category: category || undefined, createdAt });
     await FileSystem.writeAsStringAsync(
@@ -542,6 +568,8 @@ export class DecoyVaultService {
       throw new Error('Guest content key not unlocked — set the guest PIN first');
     }
     await this.initialize();
+    // Same filename/type rules as the real vault (the name later feeds a cache-temp path).
+    if (!FileManager.isImportable(type, originalName)) throw new Error('Ungültiger Dateiname');
 
     let base64: string;
     if (fileUri.startsWith('data:')) {
@@ -549,16 +577,18 @@ export class DecoyVaultService {
     } else {
       base64 = await FileSystem.readAsStringAsync(fileUri, { encoding: FileSystem.EncodingType.Base64 });
     }
+    if (base64.length > MAX_GUEST_IMPORT_BASE64) throw new Error('Datei zu groß');
 
-    const fileId = this.generateId();
+    const fileId = await this.generateId();
     const filePath = `${this.DECOY_DIR}file_${fileId}`;
     const size = Math.floor((base64.length * 3) / 4); // approx decoded byte length
 
     await FileSystem.writeAsStringAsync(filePath, await this.seal(base64, handle, `guest:file:${fileId}`));
-    const meta = { name: `file_${fileId}`, originalName, type, size };
+    const createdAt = new Date();
+    const meta = { name: `file_${fileId}`, originalName, type, size, createdAt: createdAt.toISOString() };
     await FileSystem.writeAsStringAsync(`${filePath}.meta`, await this.seal(JSON.stringify(meta), handle, `guest:meta:${fileId}`));
 
-    return { id: fileId, name: `file_${fileId}`, originalName, type, size, createdAt: new Date() };
+    return { id: fileId, name: `file_${fileId}`, originalName, type, size, createdAt };
   }
 
   /**
@@ -569,6 +599,7 @@ export class DecoyVaultService {
     if (!handle) {
       throw new Error('Guest content key not unlocked — set the guest PIN first');
     }
+    assertId(id);
     const envelope = await FileSystem.readAsStringAsync(`${this.DECOY_DIR}file_${id}`);
     return this.open(envelope, handle, `guest:file:${id}`);
   }
@@ -585,10 +616,17 @@ export class DecoyVaultService {
 
     const base64 = await this.getFakeFileContent(id);
     const cacheDir = FileSystem.cacheDirectory || '';
-    const dot = file.originalName.lastIndexOf('.');
-    const ext = dot >= 0 ? file.originalName.slice(dot) : '';
-    const tempUri = `${cacheDir}vault_view_${this.generateId()}${ext}`;
-    await FileSystem.writeAsStringAsync(tempUri, base64, { encoding: FileSystem.EncodingType.Base64 });
+    // Extension is whitelisted to [A-Za-z0-9]{1,8}: the name is user-supplied and must not
+    // be able to inject path segments into the cache path.
+    const m = /\.([A-Za-z0-9]{1,8})$/.exec(file.originalName);
+    const ext = m ? `.${m[1].toLowerCase()}` : '';
+    const tempUri = `${cacheDir}vault_view_${await this.generateId()}${ext}`;
+    try {
+      await FileSystem.writeAsStringAsync(tempUri, base64, { encoding: FileSystem.EncodingType.Base64 });
+    } catch (e) {
+      await FileManager.deleteTempFile(tempUri);
+      throw e;
+    }
     return tempUri;
   }
 
@@ -596,6 +634,7 @@ export class DecoyVaultService {
    * L6: delete a guest note.
    */
   static async deleteNote(id: string): Promise<void> {
+    assertId(id);
     await FileSystem.deleteAsync(`${this.DECOY_DIR}note_${id}`).catch(() => {});
   }
 
@@ -603,6 +642,7 @@ export class DecoyVaultService {
    * L6: delete a guest file (content + metadata).
    */
   static async deleteFile(id: string): Promise<void> {
+    assertId(id);
     await FileSystem.deleteAsync(`${this.DECOY_DIR}file_${id}`).catch(() => {});
     await FileSystem.deleteAsync(`${this.DECOY_DIR}file_${id}.meta`).catch(() => {});
   }
@@ -613,26 +653,19 @@ export class DecoyVaultService {
    * Zerstört den Decoy Vault bei falschem PIN
    */
   static async destroyDecoyVault(): Promise<void> {
+    // Crypto-shred FIRST (credentials + KDF salt), then the files — a missing/unreadable
+    // directory must not leave the PIN hash behind. Every step is independent.
+    this.setContentKey(null); // L6: zero + drop any cached guest content key
+    for (const key of [
+      this.DECOY_ENABLED_KEY, this.DECOY_PIN_HASH, this.DECOY_PIN_SALT, this.DECOY_PIN_ALGO,
+      this.DECOY_KDF_SALT, this.DECOY_CREATED_KEY, 'filevault_guest_active',
+    ]) {
+      try { await SecureStore.deleteItemAsync(key); } catch (error) { dbgErr('GuestVault: key delete failed:', error); }
+    }
     try {
-      console.log('GuestVault: Destroying vault...');
-
-      // Lösche alle Dateien
-      const files = await FileSystem.readDirectoryAsync(this.DECOY_DIR);
-      for (const file of files) {
-        await FileSystem.deleteAsync(`${this.DECOY_DIR}${file}`);
-      }
-
-      // Disable vault
-      await SecureStore.deleteItemAsync(this.DECOY_ENABLED_KEY);
-      await SecureStore.deleteItemAsync(this.DECOY_PIN_HASH);
-      await SecureStore.deleteItemAsync(this.DECOY_PIN_SALT);
-      await SecureStore.deleteItemAsync(this.DECOY_PIN_ALGO);
-      await SecureStore.deleteItemAsync(this.DECOY_KDF_SALT); // L6: content-KDF salt
-      this.setContentKey(null); // L6: zero + drop any cached guest content key
-
-      console.log('GuestVault: Vault destroyed');
+      await FileSystem.deleteAsync(this.DECOY_DIR, { idempotent: true });
     } catch (error) {
-      console.error('GuestVault: Destroy failed:', error);
+      dbgErr('GuestVault: Destroy failed:', error);
     }
   }
 
@@ -644,9 +677,8 @@ export class DecoyVaultService {
       await this.destroyDecoyVault();
       await this.createFakeFiles();
       await this.createFakeNotes();
-      console.log('GuestVault: Vault reset complete');
     } catch (error) {
-      console.error('GuestVault: Reset failed:', error);
+      dbgErr('GuestVault: Reset failed:', error);
     }
   }
 

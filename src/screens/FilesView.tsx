@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import {
   View, Text, TouchableOpacity, StyleSheet,
-  FlatList, Alert, ActivityIndicator, Modal,
+  FlatList, Alert, ActivityIndicator,
   TouchableWithoutFeedback, Image,
 } from 'react-native';
 import * as DocumentPicker from 'expo-document-picker';
@@ -13,6 +13,7 @@ import { AutoLockService } from '../services/AutoLockService';
 import FileIcon from '../components/FileIcon';
 import FileViewer from '../components/FileViewer';
 import Icon from '../components/Icon';
+import SecureModal from '../components/SecureModal';
 import { c, rs, font, radius, TAB_BAR_HEIGHT, useBottomInset, fileColor } from '../theme';
 
 const FREE_LIMIT = 10;
@@ -118,11 +119,7 @@ export default function FilesView({ isDecoy = false }: { isDecoy?: boolean }) {
     setShowPicker(false);
     AutoLockService.beginPickerSession();
     try {
-      const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (!perm.granted) {
-        Alert.alert('Berechtigung benötigt', 'Bitte Zugriff auf Fotos erlauben.');
-        return;
-      }
+      // System photo picker: no storage permission is requested or declared.
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ImagePicker.MediaTypeOptions.ImagesAndVideos,
         allowsEditing: false,
@@ -381,7 +378,7 @@ export default function FilesView({ isDecoy = false }: { isDecoy?: boolean }) {
       )}
 
       {/* ── Import source picker (bottom sheet) ── */}
-      <Modal
+      <SecureModal
         visible={showPicker}
         transparent
         animationType="slide"
@@ -423,7 +420,7 @@ export default function FilesView({ isDecoy = false }: { isDecoy?: boolean }) {
             </TouchableWithoutFeedback>
           </View>
         </TouchableWithoutFeedback>
-      </Modal>
+      </SecureModal>
 
       {/* ── In-App File Viewer (alle Typen) ── */}
       <FileViewer file={viewerFile} isDecoy={isDecoy} onClose={() => setViewerFile(null)} />

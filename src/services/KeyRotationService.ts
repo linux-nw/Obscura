@@ -40,6 +40,30 @@ interface RotationWAL {
   startedAt: number;
 }
 
+const HEX = /^[0-9a-fA-F]+$/;
+
+function parseWal(raw: string): RotationWAL | null {
+  try {
+    const w = JSON.parse(raw);
+    const n = w?.newMasterWrapped;
+    if (
+      n && typeof n === 'object' &&
+      typeof n.encryptedKey === 'string' && HEX.test(n.encryptedKey) &&
+      typeof n.iv === 'string' && HEX.test(n.iv) &&
+      typeof n.mac === 'string' && HEX.test(n.mac) &&
+      typeof w.startedAt === 'number' && Number.isFinite(w.startedAt)
+    ) {
+      return w as RotationWAL;
+    }
+  } catch { /* malformed */ }
+  return null;
+}
+
+function isTagMismatch(e: unknown): boolean {
+  const m = String((e as any)?.message ?? e);
+  return /Integritätsprüfung|tag mismatch/i.test(m);
+}
+
 export class KeyRotationService {
   private static readonly LAST_ROTATION_KEY  = 'filevault_last_rotation';
   private static readonly NEXT_ROTATION_KEY  = 'filevault_next_rotation';
@@ -91,6 +115,13 @@ export class KeyRotationService {
     const unlocked = await SecureCryptoService.unlock(currentPassphrase);
     if (!unlocked) throw new Error('Falsches Passwort — Rotation abgebrochen');
 
+    if (await this.hasPendingRotation()) {
+      await this.resumeRotationIfNeeded(currentPassphrase);
+      if (await this.hasPendingRotation()) {
+        throw new Error('Eine unterbrochene Rotation ist noch offen — Rotation abgebrochen');
+      }
+    }
+
     // L3 Phase 2: the master key is addressed by a custody handle, never a raw value.
     const oldHandle = SecureCryptoService.currentMasterHandle();
 
@@ -105,7 +136,12 @@ export class KeyRotationService {
     const wal: RotationWAL = { newMasterWrapped, startedAt: Date.now() };
     await SecureStore.setItemAsync(WAL_KEY, JSON.stringify(wal));
 
-    await this.migrateContent(oldHandle, newHandle);
+    try {
+      await this.migrateContent(oldHandle, newHandle);
+    } catch (e) {
+      SecureCryptoService.closeKeyHandle(newHandle);
+      throw e;
+    }
 
     // Commit: install the new master key (wrap with passphrase, register the live master
     // handle — this also closes the old handle). Then drop our migration handle + the WAL.
@@ -127,7 +163,11 @@ export class KeyRotationService {
     if (!walStr) return;
 
     try {
-      const wal = JSON.parse(walStr) as RotationWAL;
+      const wal = parseWal(walStr);
+      if (!wal) {
+        console.error('KeyRotation: WAL is malformed — keeping it, rotation blocked until resolved');
+        return;
+      }
       let currentHandle: string;
       try {
         currentHandle = SecureCryptoService.currentMasterHandle();
@@ -147,16 +187,29 @@ export class KeyRotationService {
       try {
         // Succeeds iff currentHandle is the OLD master (the WAL was wrapped with it).
         newMasterKeyHex = await SecureCryptoService.decryptFileKeyWith(wal.newMasterWrapped, currentHandle);
-      } catch {
+      } catch (e) {
+        if (!isTagMismatch(e)) {
+          console.error('KeyRotation: WAL unwrap failed for a non-integrity reason — keeping WAL');
+          return;
+        }
         // currentHandle is NOT the old master → commit already happened (content fully
         // migrated, master already installed). Just clear the stale WAL.
         await SecureStore.deleteItemAsync(WAL_KEY);
         return;
       }
+      if (!/^[0-9a-fA-F]{64}$/.test(newMasterKeyHex)) {
+        console.error('KeyRotation: WAL carries an invalid master key — keeping WAL');
+        return;
+      }
 
       // currentHandle == old master: finish the migration idempotently, then commit.
       const newHandle = SecureCryptoService.registerKeyHandle(newMasterKeyHex);
-      await this.migrateContent(currentHandle, newHandle);
+      try {
+        await this.migrateContent(currentHandle, newHandle);
+      } catch (e) {
+        SecureCryptoService.closeKeyHandle(newHandle);
+        throw e;
+      }
       await SecureCryptoService.installMasterKey(newMasterKeyHex, currentPassphrase);
       SecureCryptoService.closeKeyHandle(newHandle);
       SecureCryptoService.closeKeyHandle(currentHandle);
@@ -215,6 +268,9 @@ export class KeyRotationService {
   // ─────────────────────────────── Settings Management ───────────────────────────────
 
   static async enableRotation(intervalDays: number = 90): Promise<void> {
+    if (!Number.isInteger(intervalDays) || intervalDays < 1 || intervalDays > 3650) {
+      throw new Error('Ungültiges Rotationsintervall');
+    }
     await SecureStore.setItemAsync(this.ROTATION_ENABLED_KEY, 'true');
     await SecureStore.setItemAsync(this.ROTATION_INTERVAL_KEY, intervalDays.toString());
     await this.scheduleNextRotation();
@@ -232,7 +288,8 @@ export class KeyRotationService {
 
   private static async getRotationInterval(): Promise<number> {
     const value = await SecureStore.getItemAsync(this.ROTATION_INTERVAL_KEY);
-    return value ? parseInt(value, 10) : this.DEFAULT_ROTATION_INTERVAL;
+    const n = value ? parseInt(value, 10) : NaN;
+    return Number.isInteger(n) && n >= 1 && n <= 3650 ? n : this.DEFAULT_ROTATION_INTERVAL;
   }
 
   private static async getRotationCount(): Promise<number> {

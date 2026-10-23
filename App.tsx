@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, StyleSheet, AppState, AppStateStatus, NativeModules } from 'react-native';
+import { View, Text, StyleSheet, AppState, AppStateStatus, NativeModules } from 'react-native';
 import * as SecureStore from 'expo-secure-store';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import AuthScreen from './src/screens/AuthScreen';
@@ -18,10 +18,9 @@ try {
 } catch {
   (global as any).__argon2_native_available = false;
 }
-console.log(
-  `[KDF] Argon2id native available: ${(global as any).__argon2_native_available} ` +
-  `(RNFileVault module ${(NativeModules as any).RNFileVault ? 'LOADED' : 'MISSING'})`
-);
+if (__DEV__) {
+  console.log(`[KDF] Argon2id native available: ${(global as any).__argon2_native_available}`);
+}
 
 // S3: explicit, logged opt-in for the pure-JS crypto fallback. Content writes refuse the
 // JS AES-256-CBC+HMAC backend unless this flag is set (see CryptoService jsCryptoWriteAllowed).
@@ -51,6 +50,7 @@ import { DecoyVaultService } from './src/services/DecoyVaultService';
 import { BackupService } from './src/services/BackupService';
 import { KeyRotationService } from './src/services/KeyRotationService';
 import { HardwareBackedStorage } from './src/services/HardwareKeystoreService';
+import { IntegrityService } from './src/services/IntegrityService';
 
 export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -63,6 +63,7 @@ export default function App() {
   // instead of vault content. FLAG_SECURE (MainActivity) is the primary Recents-snapshot
   // defense; this overlay is additional cover for the in-app transition frame.
   const [obscured, setObscured]               = useState(false);
+  const [tampered, setTampered]               = useState(false);
 
   const isAuthRef = useRef(false);
   isAuthRef.current = isAuthenticated;
@@ -72,6 +73,9 @@ export default function App() {
     // AutoLock-Callback: sperrt UI wenn Timer abläuft oder App in Background geht
     AutoLockService.setLockCallback(() => {
       CryptoService.clearAllCaches();
+      DecoyVaultService.clearDecoyCache();
+      SecureStore.deleteItemAsync('filevault_guest_active').catch(() => {});
+      setIsDecoy(false);
       // Layer 5: drop any decrypted view-temp plaintext from the cache on lock.
       FileManager.cleanupViewTemps().catch(() => {});
       setIsAuthenticated(false);
@@ -89,6 +93,7 @@ export default function App() {
         }
         // Nur In-Memory Caches löschen — KEINE SecureStore-Keys löschen!
         CryptoService.clearAllCaches();
+        DecoyVaultService.clearDecoyCache();
         AutoLockService.triggerLock();
       } else if (nextAppState === 'active') {
         // Returning from a picker: do not lock — let the save flow finish.
@@ -113,6 +118,16 @@ export default function App() {
       appStateSubscription.remove();
     };
   }, []);
+
+  const lastTouchRef = useRef(0);
+  const onUserActivity = () => {
+    const now = Date.now();
+    if (isAuthRef.current && now - lastTouchRef.current > 1000) {
+      lastTouchRef.current = now;
+      AutoLockService.resetTimer();
+    }
+    return false;
+  };
 
   const initializeApp = async () => {
     try {
@@ -206,10 +221,22 @@ export default function App() {
       setIsFirstLaunch(true);
     }
 
-    // Sicherheitscheck durchführen
+    // Pinned APK signature: a positive mismatch (repackaged/re-signed build) blocks unlock.
+    // 'unverifiable' (debug build / module absent) never blocks.
+    try {
+      if ((await IntegrityService.verifyAppSignature()) === 'invalid') {
+        CryptoService.clearAllCaches();
+        setTampered(true);
+        return;
+      }
+    } catch {}
+
     try {
       const security = await DeviceSecurityService.checkDeviceSecurity();
-      setSecurityStatus(security.securityLevel);
+      let level = security.securityLevel;
+      const integrity = await IntegrityService.checkIntegrity();
+      if (!integrity.isIntact) level = 'critical';
+      setSecurityStatus(level);
     } catch {
       // security check failure is non-fatal
     }
@@ -226,7 +253,7 @@ export default function App() {
       setIsDecoy(false);
     }
     setIsAuthenticated(true);
-    AutoLockService.resetTimer();
+    AutoLockService.unlock();
   };
 
   /**
@@ -258,29 +285,36 @@ export default function App() {
    * Löscht den gesamten Tresor unwiderruflich.
    */
   const handleWipeVault = async (): Promise<void> => {
-    try {
-      await FileManager.clearVault();
+    // Crypto-shred FIRST and unconditionally: destroying the master key makes every blob
+    // undecryptable even if the (best-effort) deletions below fail. Failures are reported
+    // only after the key is gone.
+    let failed = false;
+    const attempt = async (fn: () => Promise<unknown>) => {
+      try { await fn(); } catch { failed = true; }
+    };
 
+    await attempt(async () => {
       const notes = await NotesService.getNotes();
       for (const note of notes) {
         await NotesService.deleteNote(note.id);
       }
+    });
+    await attempt(() => FileManager.clearVault());
 
-      // Layer 5 crypto-shred: destroying the master key renders every remaining blob
-      // permanently undecryptable, regardless of whether the ciphertext bytes still linger
-      // on flash (wear-leveling makes overwrite unreliable; key destruction does not).
-      // deleteEncryptionKey + deletePinData read-back-verify the secrets are gone.
-      await CryptoService.deletePinData();
-      await CryptoService.deleteEncryptionKey();
-      CryptoService.clearAllCaches();
-      await FileManager.cleanupViewTemps();
-      await CryptoService.setAppInitialized(false);
+    await CryptoService.deletePinData();
+    await CryptoService.deleteEncryptionKey();
+    CryptoService.clearAllCaches();
+    await attempt(() => DecoyVaultService.destroyDecoyVault());
+    DecoyVaultService.clearDecoyCache();
+    await attempt(() => PanicService.clearPanicPin());
+    await attempt(() => SecureStore.deleteItemAsync('filevault_auth_attempts'));
+    await attempt(() => SecureStore.deleteItemAsync('filevault_guest_active'));
+    await attempt(() => FileManager.cleanupViewTemps());
+    await CryptoService.setAppInitialized(false);
 
-      setIsFirstLaunch(true);
-    } catch (error) {
-      console.error('Wipe-Fehler:', error);
-      throw new Error('Tresor konnte nicht geleert werden');
-    }
+    setIsDecoy(false);
+    setIsFirstLaunch(true);
+    if (failed) throw new Error('Tresor konnte nicht vollständig geleert werden');
   };
 
   if (isFirstLaunch === null || !isCryptoReady) {
@@ -293,8 +327,15 @@ export default function App() {
 
   return (
     <SafeAreaProvider>
-    <View style={styles.root}>
-      {isAuthenticated ? (
+    <View style={styles.root} onStartShouldSetResponderCapture={onUserActivity}>
+      {tampered ? (
+        <View style={styles.splash}>
+          <Text style={styles.tamperTxt}>
+            Diese App-Installation ist nicht vertrauenswürdig (Signatur ungültig). Entsperren
+            deaktiviert. Bitte nur aus der offiziellen Quelle neu installieren.
+          </Text>
+        </View>
+      ) : isAuthenticated ? (
         <MainScreen
           onLogout={handleLogout}
           onChangePin={handleChangePin}
@@ -322,6 +363,7 @@ export default function App() {
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#0A0A0C' },
   splash: { flex: 1, backgroundColor: '#0A0A0C', alignItems: 'center', justifyContent: 'center' },
+  tamperTxt: { color: '#ff6b6b', textAlign: 'center', paddingHorizontal: 32, fontSize: 15, lineHeight: 22 },
   privacyOverlay: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: '#0A0A0C',

@@ -2,7 +2,7 @@ import * as FileSystem from 'expo-file-system/legacy';
 import * as Crypto from 'expo-crypto';
 import { SecureCryptoService as CryptoService } from './CryptoService';
 import { writeFileAtomic, cleanupTempFiles } from './fsAtomic';
-import { BlobVersionService } from './BlobVersionService';
+import { BlobVersionService, isValidObjectId, parseBlobVersion } from './BlobVersionService';
 
 /**
  * Notiz-Service mit sicherer Speicherung
@@ -28,6 +28,17 @@ export interface Note {
 class SecureNotesService {
   private static readonly NOTES_DIR = (FileSystem.documentDirectory || '') + 'notes/';
   private static readonly IV_LENGTH = 12;
+  private static readonly MAX_FIELD_CHARS = 8 * 1024 * 1024;
+  private static startupSweepDone = false;
+
+  /** Ids are interpolated into file paths: accept only the generated shape. */
+  private static assertId(noteId: string): void {
+    if (!isValidObjectId(noteId) || !noteId.startsWith('note_')) throw new Error('Ungültige Notiz-ID');
+  }
+
+  private static isNoteFile(name: string): boolean {
+    return name.startsWith('note_') && !name.endsWith('.tmp');
+  }
 
   static async initialize(): Promise<void> {
     try {
@@ -35,8 +46,11 @@ class SecureNotesService {
       if (!dirInfo.exists) {
         await FileSystem.makeDirectoryAsync(this.NOTES_DIR, { intermediates: true });
       }
-      // H3: drop any leftover .tmp from an interrupted atomic write.
-      await cleanupTempFiles(this.NOTES_DIR);
+      if (!this.startupSweepDone) {
+        this.startupSweepDone = true;
+        // H3: drop any leftover .tmp from an interrupted atomic write.
+        await cleanupTempFiles(this.NOTES_DIR);
+      }
     } catch (error) {
       console.error('Error initializing notes directory:', error);
       throw new Error('Konnte Notizen-Verzeichnis nicht initialisieren');
@@ -54,6 +68,9 @@ class SecureNotesService {
     tags?: string[]
   ): Promise<Note> {
     try {
+      if (title.length > this.MAX_FIELD_CHARS || content.length > this.MAX_FIELD_CHARS) {
+        throw new Error('Notiz zu groß');
+      }
       await this.initialize();
 
       const noteId = await this.generateSecureNoteId();
@@ -109,7 +126,7 @@ class SecureNotesService {
       await this.initialize();
 
       const files = await FileSystem.readDirectoryAsync(this.NOTES_DIR);
-      const noteFiles = files.filter(file => file.startsWith('note_'));
+      const noteFiles = files.filter(file => this.isNoteFile(file));
 
       const notes: Note[] = [];
 
@@ -121,7 +138,12 @@ class SecureNotesService {
           const encryptedNoteData = JSON.parse(noteContent);
 
           const nid = encryptedNoteData.id;
-          const version: number = encryptedNoteData.version ?? 1;
+          // Bind the (plaintext) id to the filename and validate the version's shape.
+          if (!isValidObjectId(nid) || noteFile !== `note_${nid}`) {
+            console.warn('[Sec] note id/filename mismatch — skipping');
+            continue;
+          }
+          const version = parseBlobVersion(encryptedNoteData.version);
 
           // A3: reject rolled-back notes (version below the monotonic floor).
           const floor = await BlobVersionService.getFloor(nid);
@@ -134,7 +156,8 @@ class SecureNotesService {
           const content = await this.decryptContent(encryptedNoteData.content, `${nid}:content:v${version}`);
           const category = await this.decryptMetadata(encryptedNoteData.category, `${nid}:category:v${version}`);
           const tagsRaw = await this.decryptMetadata(encryptedNoteData.tags, `${nid}:tags:v${version}`);
-          const tags = JSON.parse(tagsRaw || '[]');
+          const parsedTags = JSON.parse(tagsRaw || '[]');
+          const tags: string[] = Array.isArray(parsedTags) ? parsedTags.filter((t) => typeof t === 'string') : [];
 
           notes.push({
             id: encryptedNoteData.id,
@@ -181,6 +204,7 @@ class SecureNotesService {
     updates: Partial<Omit<Note, 'id' | 'createdAt' | 'isEncrypted'>>
   ): Promise<Note | null> {
     try {
+      this.assertId(noteId);
       await this.initialize();
 
       const notes = await this.getNotes();
@@ -239,6 +263,7 @@ class SecureNotesService {
    */
   static async deleteNote(noteId: string): Promise<boolean> {
     try {
+      this.assertId(noteId);
       await this.initialize();
       await FileSystem.deleteAsync(`${this.NOTES_DIR}note_${noteId}`);
       await BlobVersionService.remove(noteId); // A3
@@ -277,13 +302,14 @@ class SecureNotesService {
   static async reencryptAll(oldHandle: string, newHandle: string): Promise<void> {
     await this.initialize();
     const files = await FileSystem.readDirectoryAsync(this.NOTES_DIR);
-    const noteFiles = files.filter(file => file.startsWith('note_'));
+    const noteFiles = files.filter(file => this.isNoteFile(file));
 
     for (const noteFile of noteFiles) {
       const path = `${this.NOTES_DIR}${noteFile}`;
       const note = JSON.parse(await FileSystem.readAsStringAsync(path));
       const nid = note.id;
-      const v = note.version ?? 1; // A3: preserve the same version in old+new AAD
+      if (!isValidObjectId(nid) || noteFile !== `note_${nid}`) continue;
+      const v = parseBlobVersion(note.version); // A3: preserve the same version in old+new AAD
       note.title = await CryptoService.recryptBlob(note.title, oldHandle, newHandle, `${nid}:title:v${v}`);
       note.content = await CryptoService.recryptBlob(note.content, oldHandle, newHandle, `${nid}:content:v${v}`);
       note.category = await CryptoService.recryptBlob(note.category, oldHandle, newHandle, `${nid}:category:v${v}`);
@@ -295,6 +321,7 @@ class SecureNotesService {
   // ─────────────────────────────── Hilfsfunktionen ───────────────────────────────
 
   private static async loadEncryptedNoteData(noteId: string): Promise<any> {
+    this.assertId(noteId);
     try {
       const content = await FileSystem.readAsStringAsync(
         `${this.NOTES_DIR}note_${noteId}`

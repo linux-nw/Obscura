@@ -10,6 +10,7 @@
  */
 
 import * as SecureStore from 'expo-secure-store';
+import { NativeModules } from 'react-native';
 import { verifyPinnedSignature, type SignatureVerdict } from '../native/IntegrityNative';
 
 export interface IntegrityStatus {
@@ -59,8 +60,6 @@ export class IntegrityService {
       );
       await SecureStore.setItemAsync(this.STORAGE_LAST_CHECK, Date.now().toString());
 
-      console.log(`Integrity: Check complete - Passed: ${passed}/${results.length}`);
-
       return {
         isIntact,
         lastCheck: Date.now(),
@@ -92,7 +91,6 @@ export class IntegrityService {
     try {
       const verdict = await this.verifyAppSignature();
       if (verdict === 'invalid') {
-        console.warn('Integrity: APK signing cert does not match the pinned hash');
         return false;
       }
       return true;
@@ -102,55 +100,39 @@ export class IntegrityService {
     }
   }
 
-  /**
-   * Prüft auf Datei-Integrität
-   */
+  /** Root indicators (su binary / root-manager packages) via the native DeviceSecurity module. */
   private static async checkAppFiles(): Promise<boolean> {
     try {
-      // In Produktion: Prüfung auf verdächtige Dateien
-      // - /system/bin/su
-      // - /system/xbin/su
-      // - /system/app/Superuser.apk
-      // - /system/bin/.ext/
-      // - /system/bin/sucu
-
-      // Fallback
-      return true;
+      const ds = (NativeModules as any).DeviceSecurity;
+      if (!ds) return true;
+      const su = ds.checkSuBinary ? await ds.checkSuBinary() : false;
+      const pkg = ds.checkRootKeysInPackage ? await ds.checkRootKeysInPackage() : false;
+      return !(su || pkg);
     } catch {
-      return false;
+      return true;
     }
   }
 
-  /**
-   * Prüft ob Debugger angehängt ist
-   */
+  /** Attached debugger / TracerPid via the native IntegrityNative module. Absent module = pass. */
   private static async checkDebugger(): Promise<boolean> {
     try {
-      // In Produktion: native Module für
-      // - Android: ActivityManager.isRunningInUserSpace()
-      // - Android: /proc/self/status TracerPid
-      // - iOS: ptrace(PT_DENY_ATTACH)
-
-      // Fallback
-      return true;
+      const n = (NativeModules as any).IntegrityNative;
+      if (!n?.checkDebugger) return true;
+      return !(await n.checkDebugger());
     } catch {
-      return false;
+      return true;
     }
   }
 
-  /**
-   * Prüft die Integritätsdienste
-   */
+  /** Frida artefacts via the native DeviceSecurity module. Absent module = pass. */
   private static async checkIntegrityService(): Promise<boolean> {
     try {
-      // Prüft ob Integritätsdienste noch existieren
-      // - DeviceSecurityService
-      // - ScreenProtectionService
-      // - MemorySafetyService
-
-      return true; // Platzhalter
+      const ds = (NativeModules as any).DeviceSecurity;
+      if (!ds?.checkFridaModules) return true;
+      const found = await ds.checkFridaModules();
+      return !(Array.isArray(found) && found.length > 0);
     } catch {
-      return false;
+      return true;
     }
   }
 
@@ -176,26 +158,14 @@ export class IntegrityService {
    */
   static async triggerTamperResponse(): Promise<void> {
     try {
-      console.warn('SECURITY: App integrity compromised! Triggering response...');
-
-      // 1. Sensitive Daten löschen
-      await SecureStore.deleteItemAsync('filevault_encryption_key');
-      await SecureStore.deleteItemAsync('filevault_pin_hash');
-      await SecureStore.deleteItemAsync('filevault_pin_salt');
-      await SecureStore.deleteItemAsync('filevault_pin_iv');
-      await SecureStore.deleteItemAsync('filevault_pin_key');
-
-      // 2. App sperren
-      const lockUntil = Date.now() + 365 * 24 * 60 * 60 * 1000; // 1 Jahr
-      await SecureStore.setItemAsync('filevault_lock_until', lockUntil.toString());
-
-      // 3. App als nicht initialisiert markieren
-      await SecureStore.setItemAsync('filevault_app_initialized', 'false');
-
-      console.log('SECURITY: Tamper response complete');
-    } catch (error) {
-      console.error('Security: Tamper response failed:', error);
-    }
+      // Lazy import: CryptoService owns the real key/lock storage names.
+      const { SecureCryptoService } = require('./CryptoService');
+      SecureCryptoService.clearAllCaches();
+      await SecureCryptoService.deleteEncryptionKey();
+      await SecureCryptoService.deletePinData();
+      await SecureStore.setItemAsync('filevault_lock_until', String(Number.MAX_SAFE_INTEGER));
+      await SecureCryptoService.setAppInitialized(false);
+    } catch {}
   }
 
   // ─────────────────────────────── Settings ───────────────────────────────
@@ -206,7 +176,6 @@ export class IntegrityService {
   static async enableIntegrityCheck(): Promise<void> {
     try {
       await SecureStore.setItemAsync(this.INTEGRITY_ENABLED_KEY, 'true');
-      console.log('Integrity: Check enabled');
     } catch (error) {
       console.error('Error enabling integrity check:', error);
     }
@@ -218,7 +187,6 @@ export class IntegrityService {
   static async disableIntegrityCheck(): Promise<void> {
     try {
       await SecureStore.setItemAsync(this.INTEGRITY_ENABLED_KEY, 'false');
-      console.log('Integrity: Check disabled');
     } catch (error) {
       console.error('Error disabling integrity check:', error);
     }
@@ -230,7 +198,7 @@ export class IntegrityService {
   static async isIntegrityCheckEnabled(): Promise<boolean> {
     try {
       const value = await SecureStore.getItemAsync(this.INTEGRITY_ENABLED_KEY);
-      return value === 'true';
+      return value !== 'false';
     } catch {
       return true; // Default: enabled
     }

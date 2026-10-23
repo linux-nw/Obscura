@@ -34,6 +34,15 @@ class HardwareKeystoreModule(reactContext: ReactApplicationContext) :
 
     override fun getName() = "HardwareKeystore"
 
+    private fun aliasFor(keyId: String): String {
+        require(KEY_ID_RE.matches(keyId) && keyId != "attest_probe") { "invalid keyId" }
+        return "filevault_$keyId"
+    }
+
+    private companion object {
+        val KEY_ID_RE = Regex("^[A-Za-z0-9_.-]{1,64}$")
+    }
+
     // ─── Key-Generierung ──────────────────────────────────────────────────────
 
     @ReactMethod
@@ -48,7 +57,7 @@ class HardwareKeystoreModule(reactContext: ReactApplicationContext) :
             // back to the software keystore, generateAesKey still succeeds but the key is
             // SOFTWARE; the previous hardcoded `true` (and the "device has StrongBox feature"
             // guess for isStrongBoxEnabled) would have falsely claimed hardware backing.
-            val keystoreAlias = "filevault_$keyId"
+            val keystoreAlias = aliasFor(keyId)
             val key = keyStore.getKey(keystoreAlias, null) as SecretKey
             val keyInfo = SecretKeyFactory.getInstance(key.algorithm, "AndroidKeyStore")
                 .getKeySpec(key, KeyInfo::class.java) as KeyInfo
@@ -75,7 +84,7 @@ class HardwareKeystoreModule(reactContext: ReactApplicationContext) :
     }
 
     private fun generateAesKey(keyId: String, preferStrongBox: Boolean) {
-        val keystoreAlias = "filevault_$keyId"
+        val keystoreAlias = aliasFor(keyId)
 
         val useStrongBox = preferStrongBox && isStrongBoxAvailableInternal()
         // Only require unlocked-device if a secure lock screen exists, else keygen would
@@ -128,7 +137,7 @@ class HardwareKeystoreModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun storeData(keyId: String, data: String, promise: Promise) {
         try {
-            val keystoreAlias = "filevault_$keyId"
+            val keystoreAlias = aliasFor(keyId)
             if (!keyStore.containsAlias(keystoreAlias)) {
                 generateAesKey(keyId, true)
             }
@@ -164,7 +173,7 @@ class HardwareKeystoreModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun retrieveData(keyId: String, promise: Promise) {
         try {
-            val keystoreAlias = "filevault_$keyId"
+            val keystoreAlias = aliasFor(keyId)
             if (!keyStore.containsAlias(keystoreAlias)) {
                 val result = Arguments.createMap()
                 result.putBoolean("success", false)
@@ -212,7 +221,7 @@ class HardwareKeystoreModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun deleteKey(keyId: String, promise: Promise) {
         try {
-            val keystoreAlias = "filevault_$keyId"
+            val keystoreAlias = aliasFor(keyId)
             if (keyStore.containsAlias(keystoreAlias)) {
                 keyStore.deleteEntry(keystoreAlias)
             }
@@ -234,7 +243,7 @@ class HardwareKeystoreModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun keyExists(keyId: String, promise: Promise) {
         try {
-            val keystoreAlias = "filevault_$keyId"
+            val keystoreAlias = aliasFor(keyId)
             val exists = keyStore.containsAlias(keystoreAlias)
             val result = Arguments.createMap()
             result.putBoolean("success", true)
@@ -255,7 +264,7 @@ class HardwareKeystoreModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun getAttestation(keyId: String, promise: Promise) {
         try {
-            val keystoreAlias = "filevault_$keyId"
+            val keystoreAlias = aliasFor(keyId)
             val attestation = Arguments.createMap()
             attestation.putString("algorithm", "AES")
             attestation.putInt("keySize", 256)

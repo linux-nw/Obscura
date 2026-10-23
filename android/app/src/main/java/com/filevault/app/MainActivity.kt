@@ -30,6 +30,11 @@ class MainActivity : ReactActivity() {
       WindowManager.LayoutParams.FLAG_SECURE
     )
     super.onCreate(null)
+    // Tapjacking: drop touches while another app's window overlays ours (passphrase entry).
+    window.decorView.filterTouchesWhenObscured = true
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      setRecentsScreenshotEnabled(false)
+    }
   }
 
   /**

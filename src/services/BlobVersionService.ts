@@ -22,6 +22,20 @@ import * as SecureStore from 'expo-secure-store';
 
 const PREFIX = 'filevault_blobver_';
 
+/** Object ids are `<base36>_<hex>` (optionally `note_` prefixed); anything else is rejected. */
+export function isValidObjectId(id: unknown): id is string {
+  return typeof id === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(id);
+}
+
+/** Blob versions come from plaintext metadata: accept only positive safe integers. */
+export function parseBlobVersion(v: unknown): number {
+  if (v === undefined) return 1; // pre-A3 blobs carry no version
+  if (typeof v !== 'number' || !Number.isSafeInteger(v) || v < 1) {
+    throw new Error('Ungültige Blob-Version');
+  }
+  return v;
+}
+
 export const BlobVersionService = {
   /** Current floor for an object id (0 if none stored yet). */
   async getFloor(id: string): Promise<number> {

@@ -34,12 +34,17 @@ object NativeKeyCustodyCrypto {
 
     // ── AES-256-CBC / PKCS7 ──────────────────────────────────────────────────────
     fun aesCbcEncrypt(key: ByteArray, iv: ByteArray, plaintext: ByteArray): ByteArray {
+        require(key.size == 32) { "AES key must be 32 bytes" }
+        require(iv.size == 16) { "AES IV must be 16 bytes" }
         val c = Cipher.getInstance("AES/CBC/PKCS5Padding") // PKCS5 == PKCS7 for 16-byte blocks
         c.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
         return c.doFinal(plaintext)
     }
 
     fun aesCbcDecrypt(key: ByteArray, iv: ByteArray, ciphertext: ByteArray): ByteArray {
+        require(key.size == 32) { "AES key must be 32 bytes" }
+        require(iv.size == 16) { "AES IV must be 16 bytes" }
+        require(ciphertext.isNotEmpty() && ciphertext.size % 16 == 0) { "ciphertext must be a non-empty multiple of 16 bytes" }
         val c = Cipher.getInstance("AES/CBC/PKCS5Padding")
         c.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
         return c.doFinal(ciphertext)
@@ -55,10 +60,15 @@ object NativeKeyCustodyCrypto {
     // ── HKDF-SHA256 (RFC 5869), salt = 32 zero bytes, single Expand round (len <= 32) ──
     // Mirrors FastPBKDF2.ts hkdfSha256: PRK = HMAC(0x00*32, IKM); T1 = HMAC(PRK, info || 0x01).
     fun hkdfSha256(ikm: ByteArray, info: ByteArray, length: Int): ByteArray {
+        require(length in 1..32) { "HKDF length must be 1..32" }
         val salt = ByteArray(32)
         val prk = hmacSha256(salt, ikm)
         val t1in = info + byteArrayOf(0x01)
-        return hmacSha256(prk, t1in).copyOf(length)
+        val t1 = hmacSha256(prk, t1in)
+        prk.fill(0)
+        val out = t1.copyOf(length)
+        t1.fill(0)
+        return out
     }
 
     /** MAC subkey from the master key, exactly as CryptoService.deriveMacKey. */
@@ -74,8 +84,13 @@ object NativeKeyCustodyCrypto {
         val ct = aesCbcEncrypt(key, iv, plaintext)
         val ctHex = toHex(ct)
         val ivHex = toHex(iv)
-        val mac = hmacSha256(deriveMacKey(key), (ivHex + ctHex).toByteArray(StandardCharsets.UTF_8))
-        return Wrapped(ctHex, toHex(mac))
+        val macKey = deriveMacKey(key)
+        try {
+            val mac = hmacSha256(macKey, (ivHex + ctHex).toByteArray(StandardCharsets.UTF_8))
+            return Wrapped(ctHex, toHex(mac))
+        } finally {
+            macKey.fill(0)
+        }
     }
 
     /**
@@ -84,11 +99,22 @@ object NativeKeyCustodyCrypto {
      * master-blob KEK-unwrap (caller passes the KEK as `key`).
      */
     fun unwrapEtm(key: ByteArray, ivHex: String, ctHex: String, macHex: String): ByteArray {
-        val expected = hmacSha256(deriveMacKey(key), (ivHex + ctHex).toByteArray(StandardCharsets.UTF_8))
-        if (!MessageDigest.isEqual(expected, fromHex(macHex))) {
+        require(ivHex.length == 32) { "IV must be 16 bytes" }
+        require(macHex.length == 64) { "MAC must be 32 bytes" }
+        require(ctHex.isNotEmpty() && ctHex.length % 32 == 0) { "ciphertext must be a non-empty multiple of 16 bytes" }
+        val iv = fromHex(ivHex)
+        val ct = fromHex(ctHex)
+        val given = fromHex(macHex)
+        val macKey = deriveMacKey(key)
+        val expected = try {
+            hmacSha256(macKey, (ivHex + ctHex).toByteArray(StandardCharsets.UTF_8))
+        } finally {
+            macKey.fill(0)
+        }
+        if (!MessageDigest.isEqual(expected, given)) {
             throw SecurityException("EtM tag mismatch")
         }
-        return aesCbcDecrypt(key, fromHex(ivHex), fromHex(ctHex))
+        return aesCbcDecrypt(key, iv, ct)
     }
 
     // ── hex (lowercase, matching JS bufferToHex / CryptoJS) ───────────────────────
@@ -104,7 +130,10 @@ object NativeKeyCustodyCrypto {
     fun fromHex(s: String): ByteArray {
         require(s.length % 2 == 0) { "hex length must be even" }
         return ByteArray(s.length / 2) { i ->
-            s.substring(i * 2, i * 2 + 2).toInt(16).toByte()
+            val hi = Character.digit(s[i * 2], 16)
+            val lo = Character.digit(s[i * 2 + 1], 16)
+            require(hi >= 0 && lo >= 0 && s[i * 2].code < 128 && s[i * 2 + 1].code < 128) { "invalid hex character" }
+            ((hi shl 4) or lo).toByte()
         }
     }
 }

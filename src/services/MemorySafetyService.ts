@@ -10,6 +10,7 @@
  */
 
 import * as SecureStore from 'expo-secure-store';
+import { ALL_SECURE_KEYS } from './SecureDeleteService';
 
 /**
  * SafeBuffer - Eine Buffer-Implementierung mit automatischer Zeroization
@@ -36,7 +37,9 @@ export class SafeBuffer {
       const encoder = new TextEncoder();
       const encoded = encoder.encode(data);
       this.buffer.set(encoded, offset);
-      return encoded.length;
+      const n = encoded.length;
+      encoded.fill(0); // don't leave a second plaintext copy behind
+      return n;
     } else {
       this.buffer.set(data, offset);
       return data.length;
@@ -76,10 +79,8 @@ export class SafeBuffer {
       this.buffer[i] = 0;
     }
 
-    // Pattern 4: Zufällig (simuliert mit XOR)
-    for (let i = 0; i < this.size; i++) {
-      this.buffer[i] ^= 0xFF;
-    }
+    // Final state MUST be all-zero (the former XOR-0xFF step left the buffer filled with 0xFF).
+    this.buffer.fill(0);
 
     this.zeroized = true;
   }
@@ -148,12 +149,13 @@ export class ZeroingArrayBuffer {
   /**
    * Liest Daten aus dem ArrayBuffer
    */
-  read(offset: number = 0, length: number): Uint8Array {
+  read(offset: number = 0, length: number = this.arrayBuffer.byteLength - offset): Uint8Array {
     if (this.zeroized) {
       return new Uint8Array(length);
     }
-    const view = new Uint8Array(this.arrayBuffer);
-    return new Uint8Array(view.buffer, offset, length);
+    // Copy, not a live view: a view would alias memory that zeroize() later wipes (and a
+    // caller could mutate the secret in place).
+    return new Uint8Array(this.arrayBuffer).slice(offset, offset + length);
   }
 
   /**
@@ -203,7 +205,8 @@ export class MemoryProtection {
    * aber wir können Variablen auf null setzen
    */
   static zeroizeString(value: string): string {
-    // In Produktion mit native Module: echtes Memory zeroize
+    // NOTE: JS strings are immutable — the original value is NOT wiped, only the caller's
+    // reference can be dropped. Use SafeBuffer/Uint8Array for secrets that must be wiped.
     return '';
   }
 
@@ -236,17 +239,7 @@ export class MemoryProtection {
    */
   static async zeroizeSecureStore(): Promise<void> {
     try {
-      const sensitiveKeys = [
-        'filevault_encryption_key',
-        'filevault_pbkdf2_salt',
-        'filevault_pin_hash',
-        'filevault_pin_salt',
-        'filevault_pin_iv',
-        'filevault_pin_key',
-        'filevault_app_initialized',
-        'filevault_failed_attempts',
-        'filevault_lock_until',
-      ];
+      const sensitiveKeys = ALL_SECURE_KEYS;
 
       for (const key of sensitiveKeys) {
         try {
@@ -275,17 +268,7 @@ export class MemoryProtection {
       // 1. SecureStore löschen
       await this.zeroizeSecureStore();
 
-      // 2. App-Status zurücksetzen
-      await SecureStore.setItemAsync('filevault_app_initialized', 'false');
-
-      // 3. PIN-Daten löschen
-      await SecureStore.deleteItemAsync('filevault_pin_hash');
-      await SecureStore.deleteItemAsync('filevault_pin_salt');
-      await SecureStore.deleteItemAsync('filevault_pin_iv');
-      await SecureStore.deleteItemAsync('filevault_pin_key');
-      await SecureStore.deleteItemAsync('filevault_failed_attempts');
-      await SecureStore.deleteItemAsync('filevault_lock_until');
-
+      // App-initialized flag is part of ALL_SECURE_KEYS (absent = not initialized).
       console.log('MemoryProtection: Aggressive Zeroization complete');
     } catch (error) {
       console.error('Error during aggressive zeroization:', error);

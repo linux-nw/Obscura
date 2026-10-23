@@ -32,8 +32,8 @@ import * as Native from '../native/NativeKeyCustody';
  */
 
 function validateHex(keyHex: string): void {
-  if (keyHex.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(keyHex)) {
-    throw new Error('KeyCustody: keyHex must be even-length hex');
+  if (typeof keyHex !== 'string' || keyHex.length !== 64 || !/^[0-9a-fA-F]+$/.test(keyHex)) {
+    throw new Error('KeyCustody: keyHex must be 64 hex chars (32 bytes)');
   }
 }
 
@@ -163,6 +163,7 @@ class NativeBackedKeyCustodyImpl implements NativeBackedKeyCustody {
       this.ready.delete(handle);
       throw e;
     });
+    guarded.catch(() => undefined);
     this.ready.set(handle, guarded);
   }
 

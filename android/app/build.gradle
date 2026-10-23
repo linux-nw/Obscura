@@ -66,7 +66,7 @@ react {
 /**
  * Set this to true in release builds to optimize the app using [R8](https://developer.android.com/topic/performance/app-optimization/enable-app-optimization).
  */
-def enableMinifyInReleaseBuilds = (findProperty('android.enableMinifyInReleaseBuilds') ?: true).toBoolean()
+def enableMinifyInReleaseBuilds = true // release is always minified/obfuscated; not overridable via gradle.properties
 
 /**
  * The preferred build flavor of JavaScriptCore (JSC)
@@ -130,13 +130,17 @@ android {
         }
         release {
             signingConfig signingConfigs.release
-            def enableShrinkResources = findProperty('android.enableShrinkResourcesInReleaseBuilds') ?: 'false'
-            shrinkResources enableShrinkResources.toBoolean()
+            debuggable false
+            shrinkResources true
             minifyEnabled enableMinifyInReleaseBuilds
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
             def enablePngCrunchInRelease = findProperty('android.enablePngCrunchInReleaseBuilds') ?: 'true'
             crunchPngs enablePngCrunchInRelease.toBoolean()
         }
+    }
+    dependenciesInfo {
+        includeInApk = false
+        includeInBundle = false
     }
     packagingOptions {
         jniLibs {
@@ -248,5 +252,19 @@ tasks.register("prePackageReleaseCleanup") {
 tasks.configureEach { task ->
     if (task.name == "packageRelease") {
         task.dependsOn("prePackageReleaseCleanup")
+    }
+}
+
+// Release hardening gate: refuse to produce a release artifact that cannot self-verify its
+// signature or that is not signed with a real release key. Escape hatch for local test
+// builds only: -PFILEVAULT_ALLOW_UNPINNED=true
+gradle.taskGraph.whenReady { graph ->
+    def releaseRequested = graph.allTasks.any { it.project == project && it.name ==~ /(assemble|bundle|package)Release/ }
+    if (!releaseRequested || findProperty('FILEVAULT_ALLOW_UNPINNED') == 'true') return
+    if (!(findProperty('FILEVAULT_SIGNING_CERT_SHA256') ?: '').toString().trim()) {
+        throw new GradleException("Release build requires -PFILEVAULT_SIGNING_CERT_SHA256 (L7 pinned signing cert); otherwise the runtime signature check is 'unverifiable'.")
+    }
+    if (!(findProperty('RELEASE_STORE_PASSWORD') ?: '').toString() || !(findProperty('RELEASE_KEY_PASSWORD') ?: '').toString()) {
+        throw new GradleException("Release build requires RELEASE_STORE_PASSWORD / RELEASE_KEY_PASSWORD (never commit them).")
     }
 }

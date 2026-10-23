@@ -59,7 +59,9 @@ function isAudioExt(ext: string): boolean {
 }
 
 function base64ToUtf8(b64: string): string {
-  const bin = atob(b64);
+  // Decode only the displayed prefix (multiple of 4 chars) — never inflate a huge file in full.
+  const maxChars = Math.ceil((MAX_TEXT_BYTES * 4) / 3 / 4) * 4;
+  const bin = atob(b64.length > maxChars ? b64.slice(0, maxChars) : b64);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   return new TextDecoder().decode(bytes);
@@ -161,6 +163,8 @@ export default function FileViewer({ file, isDecoy = false, onClose }: Props) {
       cancelled = true;
       const t = tempRef.current;
       if (t) FileManager.deleteTempFile(t);
+      // Drop decrypted content held in component state when the viewer closes/switches.
+      setImageUri(null); setText(null);
     };
   }, [file?.id]);
 

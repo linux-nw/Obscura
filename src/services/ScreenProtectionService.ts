@@ -20,7 +20,6 @@
  */
 
 import { Platform, NativeModules } from 'react-native';
-import * as SecureStore from 'expo-secure-store';
 
 interface ScreenSecurityNative {
   enable(): Promise<boolean>;
@@ -38,7 +37,6 @@ export enum SecurityFlag {
 }
 
 export class ScreenProtectionService {
-  private static readonly SETTINGS_KEY = 'filevault_screen_protection_settings';
   private static isProtectionEnabled: boolean = false;
 
   /**
@@ -59,25 +57,18 @@ export class ScreenProtectionService {
       }
       await ScreenSecurity.enable();
       this.isProtectionEnabled = true;
-      await this.saveSettings(true);
     } catch (error) {
-      console.error('[ScreenProtection] enable failed:', error);
+      void error;
     }
   }
 
   /**
-   * Clears FLAG_SECURE on the current activity. The MainActivity baseline is re-applied on
-   * the next Activity (re)creation, so this only affects the current foreground window.
+   * Intentionally a no-op: FLAG_SECURE is mandatory and cannot be switched off from JS
+   * (a compromised JS layer must not be able to re-enable screenshots / Recents snapshots).
+   * Kept so existing callers keep compiling.
    */
   static async disableScreenCaptureBlocking(): Promise<void> {
-    try {
-      if (Platform.OS !== 'android' || !ScreenSecurity) return;
-      await ScreenSecurity.disable();
-      this.isProtectionEnabled = false;
-      await this.saveSettings(false);
-    } catch (error) {
-      console.error('[ScreenProtection] disable failed:', error);
-    }
+    return;
   }
 
   /**
@@ -106,19 +97,6 @@ export class ScreenProtectionService {
   /** Not supported on Android userspace; FLAG_SECURE makes a recording see black. */
   static async checkScreenRecording(): Promise<boolean> {
     return false;
-  }
-
-  // ─────────────────────────────── Settings ───────────────────────────────
-
-  private static async saveSettings(enabled: boolean): Promise<void> {
-    try {
-      await SecureStore.setItemAsync(
-        this.SETTINGS_KEY,
-        JSON.stringify({ enabled, timestamp: Date.now() }),
-      );
-    } catch (error) {
-      console.error('[ScreenProtection] save settings failed:', error);
-    }
   }
 
   /**

@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import {
   View, Text, TouchableOpacity, StyleSheet, ScrollView,
   Switch, Alert, TextInput, ActivityIndicator,
-  StatusBar, Modal,
+  StatusBar, 
 } from 'react-native';
 import * as LocalAuthentication from 'expo-local-authentication';
 import * as DocumentPicker from 'expo-document-picker';
@@ -15,6 +15,7 @@ import { DecoyVaultService } from '../services/DecoyVaultService';
 import { AutoLockService } from '../services/AutoLockService';
 import { SecureCryptoService } from '../services/CryptoService';
 import Icon from '../components/Icon';
+import SecureModal from '../components/SecureModal';
 import { c, rs, font, radius, SAFE_TOP, SAFE_BOTTOM, useBottomInset } from '../theme';
 
 interface PassPrompt {
@@ -35,6 +36,8 @@ interface Props {
   appVersion?: string;
   /** When true, render inline (as a tab) instead of wrapping in a fullscreen Modal. */
   embedded?: boolean;
+  /** Guest (decoy) session: hide every control that touches real-vault security state. */
+  isDecoy?: boolean;
 }
 
 const AUTO_LOCK_OPTIONS: { label: string; value: AutoLockTimeout }[] = [
@@ -50,7 +53,7 @@ type Screen = 'main' | 'pin_current' | 'pin_new' | 'pin_confirm';
 
 export default function SettingsScreen({
   visible, onClose, onChangePin, onWipeVault, onLogout,
-  securityStatus, appVersion = '1.0.0', embedded = false,
+  securityStatus, appVersion = '1.0.0', embedded = false, isDecoy = false,
 }: Props) {
   const [settings, setSettings] = useState<AppSettings>({
     biometricsEnabled: false,
@@ -159,9 +162,9 @@ export default function SettingsScreen({
   };
 
   const handlePinNext = async () => {
-    const minLen = 8;
+    const minLen = 12;
     if (screen === 'pin_current') {
-      if (currentPin.length < minLen) { setPinError(`Mindestens ${minLen} Zeichen`); return; }
+      if (currentPin.length < 8) { setPinError('Mindestens 8 Zeichen'); return; }
       setPinError(''); setShowPinPass(false); setScreen('pin_new');
     } else if (screen === 'pin_new') {
       if (newPin.length < minLen) { setPinError(`Mindestens ${minLen} Zeichen`); return; }
@@ -253,7 +256,7 @@ export default function SettingsScreen({
     title: 'Backup erstellen',
     sub: 'Backup-Passwort wählen. Du brauchst es zum Wiederherstellen — es ist NICHT dein Tresor-Passwort.',
     cta: 'Erstellen',
-    minLen: 8,
+    minLen: 12,
     run: async (pass) => {
       const id = await BackupService.createBackup(pass, includeSettingsCb);
       await BackupService.shareBackup(id);
@@ -326,7 +329,7 @@ export default function SettingsScreen({
 
   const submitSetPin = async () => {
     if (!spModal) return;
-    const minLen = 8;
+    const minLen = 12;
     if (spNew.length < minLen) { setSpErr(`Mindestens ${minLen} Zeichen`); return; }
     if (spNew !== spConfirm) { setSpErr('PINs stimmen nicht überein'); setSpConfirm(''); return; }
     setSpBusy(true); setSpErr('');
@@ -525,9 +528,9 @@ export default function SettingsScreen({
                 <Text style={s.pinCancelTxt}>Abbrechen</Text>
               </TouchableOpacity>
               <TouchableOpacity
-                style={[s.pinNextBtn, (pinValue.length < 8 || pinSaving) && s.pinNextDisabled]}
+                style={[s.pinNextBtn, (pinValue.length < (screen === 'pin_current' ? 8 : 12) || pinSaving) && s.pinNextDisabled]}
                 onPress={handlePinNext}
-                disabled={pinValue.length < 8 || pinSaving}
+                disabled={pinValue.length < (screen === 'pin_current' ? 8 : 12) || pinSaving}
                 activeOpacity={0.7}
               >
                 {pinSaving
@@ -551,6 +554,7 @@ export default function SettingsScreen({
             <Text style={s.sectionLabel}>KONTO</Text>
             <View style={s.card}>
 
+              {!isDecoy && (<>
               <TouchableOpacity style={s.row} onPress={startPinChange} activeOpacity={0.7}>
                 <View style={s.rowIcon}><Icon name="key" size={rs(17)} color={c.textSec} /></View>
                 <View style={s.rowInfo}>
@@ -560,6 +564,8 @@ export default function SettingsScreen({
               </TouchableOpacity>
 
               <View style={s.sep} />
+
+              </>)}
 
               <TouchableOpacity
                 style={s.row}
@@ -574,6 +580,7 @@ export default function SettingsScreen({
               </TouchableOpacity>
             </View>
 
+            {!isDecoy && (<>
             {/* ─── SICHERHEIT ─── */}
             <Text style={s.sectionLabel}>SICHERHEIT</Text>
             <View style={s.card}>
@@ -888,6 +895,8 @@ export default function SettingsScreen({
               )}
             </View>
 
+            </>)}
+
             {/* ─── SPEICHER ─── */}
             <Text style={s.sectionLabel}>SPEICHER</Text>
             <View style={s.card}>
@@ -902,6 +911,7 @@ export default function SettingsScreen({
                 </View>
               </View>
 
+              {!isDecoy && (<>
               <View style={s.sep} />
 
               <TouchableOpacity style={s.row} onPress={handleWipe} activeOpacity={0.7} disabled={loading}>
@@ -915,6 +925,7 @@ export default function SettingsScreen({
                   : <Icon name="chevron-right" size={rs(17)} color={c.danger} />
                 }
               </TouchableOpacity>
+              </>)}
             </View>
 
             {/* ─── APP ─── */}
@@ -968,7 +979,7 @@ export default function SettingsScreen({
         )}
 
         {/* ── Backup restore picker ── */}
-        <Modal visible={backups !== null} transparent animationType="fade" onRequestClose={() => setBackups(null)}>
+        <SecureModal visible={backups !== null} transparent animationType="fade" onRequestClose={() => setBackups(null)}>
           <View style={s.promptOverlay}>
             <View style={s.promptBox}>
               <Text style={s.promptTitle}>Backup wählen</Text>
@@ -985,10 +996,10 @@ export default function SettingsScreen({
               </TouchableOpacity>
             </View>
           </View>
-        </Modal>
+        </SecureModal>
 
         {/* ── Set-secret-PIN modal (panic PIN / decoy PIN) — two-field confirm ── */}
-        <Modal visible={spModal !== null} transparent animationType="fade" onRequestClose={() => !spBusy && setSpModal(null)}>
+        <SecureModal visible={spModal !== null} transparent animationType="fade" onRequestClose={() => !spBusy && setSpModal(null)}>
           <View style={s.promptOverlay}>
             <View style={s.promptBox}>
               <Text style={s.promptTitle}>{spModal?.title}</Text>
@@ -1005,7 +1016,7 @@ export default function SettingsScreen({
                   textContentType="none"
                   importantForAutofill="no"
                   spellCheck={false}
-                  placeholder="Neue PIN (min. 8 Zeichen)"
+                  placeholder="Neue PIN (min. 12 Zeichen)"
                   placeholderTextColor={c.textTer}
                   autoFocus
                   autoCapitalize="none"
@@ -1069,10 +1080,10 @@ export default function SettingsScreen({
               </View>
             </View>
           </View>
-        </Modal>
+        </SecureModal>
 
         {/* ── Generic passphrase prompt ── */}
-        <Modal visible={pp !== null} transparent animationType="fade" onRequestClose={() => !ppBusy && setPp(null)}>
+        <SecureModal visible={pp !== null} transparent animationType="fade" onRequestClose={() => !ppBusy && setPp(null)}>
           <View style={s.promptOverlay}>
             <View style={s.promptBox}>
               <Text style={s.promptTitle}>{pp?.title}</Text>
@@ -1124,20 +1135,20 @@ export default function SettingsScreen({
               </View>
             </View>
           </View>
-        </Modal>
+        </SecureModal>
       </View>
   );
 
   if (embedded) return body;
   return (
-    <Modal
+    <SecureModal
       visible={visible}
       animationType="slide"
       presentationStyle="fullScreen"
       onRequestClose={() => screen === 'main' ? onClose() : setScreen('main')}
     >
       {body}
-    </Modal>
+    </SecureModal>
   );
 }
 

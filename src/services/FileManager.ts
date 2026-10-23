@@ -2,7 +2,7 @@ import * as FileSystem from 'expo-file-system/legacy';
 import * as Crypto from 'expo-crypto';
 import { SecureCryptoService as CryptoService } from './CryptoService';
 import { writeFileAtomic, cleanupTempFiles } from './fsAtomic';
-import { BlobVersionService } from './BlobVersionService';
+import { BlobVersionService, isValidObjectId, parseBlobVersion } from './BlobVersionService';
 
 /**
  * Interface für die Key-Rotation: Re-Verschlüsselung aller Dateien nach PIN-Änderung
@@ -61,6 +61,11 @@ export interface FileMetadata {
 class SecureFileManager {
   private static readonly VAULT_DIR = (FileSystem.documentDirectory || '') + 'vault/';
   private static readonly METADATA_SUFFIX = '.meta.enc';
+  // Cap on a single imported file (matches the 100 MB storage quota; also bounds JS-heap use).
+  private static readonly MAX_IMPORT_BYTES = 100 * 1024 * 1024;
+  // Startup-only sweeps: running them from every initialize() would delete live plaintext
+  // view-temps of an open viewer and in-flight atomic temps.
+  private static startupSweepDone = false;
 
   /**
    * Initialisiert den Vault-Ordner
@@ -71,10 +76,13 @@ class SecureFileManager {
       if (!dirInfo.exists) {
         await FileSystem.makeDirectoryAsync(this.VAULT_DIR, { intermediates: true });
       }
-      // H3: drop any leftover .tmp from an interrupted atomic write.
-      await cleanupTempFiles(this.VAULT_DIR);
-      // Layer 5: sweep any plaintext view-temp left in cache by a previous crash/kill.
-      await this.cleanupViewTemps();
+      if (!this.startupSweepDone) {
+        this.startupSweepDone = true;
+        // H3: drop any leftover .tmp from an interrupted atomic write.
+        await cleanupTempFiles(this.VAULT_DIR);
+        // Layer 5: sweep any plaintext view-temp left in cache by a previous crash/kill.
+        await this.cleanupViewTemps();
+      }
     } catch (error) {
       console.error('Error initializing vault:', error);
       throw new Error('Konnte Tresor nicht initialisieren');
@@ -96,7 +104,7 @@ class SecureFileManager {
       await this.initialize();
 
       // Prüft Originalname auf Directory Traversal
-      if (this.containsPathTraversal(originalName)) {
+      if (this.containsPathTraversal(originalName) || !this.isValidType(type)) {
         throw new Error('Ungültiger Dateiname');
       }
 
@@ -106,9 +114,16 @@ class SecureFileManager {
         const base64Data = fileUri.split(',')[1];
         fileContent = base64Data;
       } else {
+        const info = await FileSystem.getInfoAsync(fileUri);
+        if (info.exists && typeof info.size === 'number' && info.size > this.MAX_IMPORT_BYTES) {
+          throw new Error('Datei zu groß');
+        }
         fileContent = await FileSystem.readAsStringAsync(fileUri, {
           encoding: FileSystem.EncodingType.Base64,
         });
+      }
+      if (typeof fileContent !== 'string' || fileContent.length > Math.ceil(this.MAX_IMPORT_BYTES / 3) * 4) {
+        throw new Error('Datei zu groß');
       }
 
       // Generiert sichere File-ID zuerst — wird als AAD-Kontext gebunden (H2)
@@ -177,13 +192,17 @@ class SecureFileManager {
   ): Promise<FileMetadata> {
     await this.initialize();
 
-    if (this.containsPathTraversal(originalName)) {
+    if (this.containsPathTraversal(originalName) || !this.isValidType(type)) {
       throw new Error('Ungültiger Dateiname');
+    }
+    if (typeof base64Content !== 'string' || base64Content.length > Math.ceil(this.MAX_IMPORT_BYTES / 3) * 4) {
+      throw new Error('Datei zu groß');
     }
 
     const fileId = await this.generateSecureFileId();
     const fileName = `file_${fileId}`;
-    const createdAt = createdAtIso ? new Date(createdAtIso) : new Date();
+    let createdAt = createdAtIso ? new Date(createdAtIso) : new Date();
+    if (isNaN(createdAt.getTime())) createdAt = new Date();
     const version = await BlobVersionService.nextVersion(fileId);
 
     const { encryptedData, iv, mac } = await CryptoService.encryptFile(base64Content, `${fileId}:content:v${version}`);
@@ -236,7 +255,7 @@ class SecureFileManager {
     try {
       if (!fileUri || fileUri.startsWith('data:')) return;
       const cacheDir = FileSystem.cacheDirectory || '';
-      if (cacheDir && fileUri.startsWith(cacheDir)) {
+      if (cacheDir && fileUri.startsWith(cacheDir) && !fileUri.includes('..')) {
         await FileSystem.deleteAsync(fileUri, { idempotent: true });
       }
     } catch {
@@ -262,7 +281,13 @@ class SecureFileManager {
             `${this.VAULT_DIR}${metaFile}`
           );
           const encryptedMeta = JSON.parse(metaContent);
-          const version: number = encryptedMeta.version ?? 1;
+          // The id and version come from plaintext JSON: validate shape, and bind the id to
+          // the on-disk filename so a copied/renamed meta cannot masquerade as another entry.
+          if (!isValidObjectId(encryptedMeta.id) || metaFile !== `file_${encryptedMeta.id}${this.METADATA_SUFFIX}`) {
+            console.warn('[Sec] meta id/filename mismatch — skipping');
+            continue;
+          }
+          const version = parseBlobVersion(encryptedMeta.version);
 
           // A3: rollback check — a blob whose version is below the monotonic floor
           // was rolled back to a stale state. Skip it (do not surface stale content).
@@ -276,8 +301,9 @@ class SecureFileManager {
           const originalName = await CryptoService.decryptMetadata(encryptedMeta.originalName, `${encryptedMeta.id}:name:v${version}`);
           const type = await CryptoService.decryptMetadata(encryptedMeta.type, `${encryptedMeta.id}:type:v${version}`);
 
-          // Fallback für ältere Metadaten ohne name-Feld: aus Metadatei-Name ableiten
-          const fileName = encryptedMeta.name ?? metaFile.replace('.meta.enc', '');
+          // The stored `name` is unauthenticated plaintext (path-injection vector): always
+          // derive the content path from the validated id.
+          const fileName = `file_${encryptedMeta.id}`;
           loadedFiles.push({
             id: encryptedMeta.id,
             name: fileName,
@@ -355,9 +381,14 @@ class SecureFileManager {
     const rand = await this.generateSecureFileId();
     const tempUri = `${cacheDir}vault_view_${rand}${ext}`;
 
-    await FileSystem.writeAsStringAsync(tempUri, base64, {
-      encoding: FileSystem.EncodingType.Base64,
-    });
+    try {
+      await FileSystem.writeAsStringAsync(tempUri, base64, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+    } catch (e) {
+      await this.overwriteThenDelete(tempUri).catch(() => {}); // no partial plaintext left behind
+      throw e;
+    }
     return tempUri;
   }
 
@@ -368,7 +399,8 @@ class SecureFileManager {
   static async deleteTempFile(uri: string): Promise<void> {
     try {
       const cacheDir = FileSystem.cacheDirectory || '';
-      if (uri && cacheDir && uri.startsWith(cacheDir)) {
+      // Prefix match alone is bypassable with `..` segments; require a plain leaf name.
+      if (uri && cacheDir && uri.startsWith(`${cacheDir}vault_view_`) && !/[\\/]|\.\./.test(uri.slice(cacheDir.length))) {
         await this.overwriteThenDelete(uri);
       }
     } catch {
@@ -439,14 +471,14 @@ class SecureFileManager {
     for (const metaFile of metaFiles) {
       const metaPath = `${this.VAULT_DIR}${metaFile}`;
       const meta = JSON.parse(await FileSystem.readAsStringAsync(metaPath));
-      const fileName = meta.name ?? metaFile.replace('.meta.enc', '');
-      const contentPath = `${this.VAULT_DIR}${fileName}`;
+      if (!isValidObjectId(meta.id) || metaFile !== `file_${meta.id}${this.METADATA_SUFFIX}`) continue;
+      const contentPath = `${this.VAULT_DIR}file_${meta.id}`;
 
       // Datei-Inhalt (Ciphertext separat, iv/mac in der Metadatei).
       // A3: dieselbe Version in alter+neuer AAD bewahren (recryptBlob ändert sie nicht).
       const contentData = await FileSystem.readAsStringAsync(contentPath);
       const fid = meta.id;
-      const v = meta.version ?? 1;
+      const v = parseBlobVersion(meta.version);
       const newContent = await CryptoService.recryptBlob(
         { data: contentData, iv: meta.iv, mac: meta.mac },
         oldHandle,
@@ -480,8 +512,9 @@ class SecureFileManager {
         throw new Error('Datei nicht gefunden');
       }
 
-      await FileSystem.deleteAsync(`${this.VAULT_DIR}${file.name}`);
-      await FileSystem.deleteAsync(`${this.VAULT_DIR}${file.name}.meta.enc`);
+      // Meta first: a half-finished delete must not leave a listable entry without content.
+      await FileSystem.deleteAsync(`${this.VAULT_DIR}${file.name}.meta.enc`, { idempotent: true });
+      await FileSystem.deleteAsync(`${this.VAULT_DIR}${file.name}`, { idempotent: true });
       await BlobVersionService.remove(fileId); // A3: random fileIds are never reused
     } catch (error) {
       console.error('Error deleting file:', error);
@@ -515,7 +548,15 @@ class SecureFileManager {
       const files = await FileSystem.readDirectoryAsync(this.VAULT_DIR);
 
       for (const file of files) {
-        await FileSystem.deleteAsync(`${this.VAULT_DIR}${file}`);
+        if (file.endsWith(this.METADATA_SUFFIX)) {
+          try {
+            const id = JSON.parse(await FileSystem.readAsStringAsync(`${this.VAULT_DIR}${file}`)).id;
+            if (isValidObjectId(id)) await BlobVersionService.remove(id);
+          } catch {
+            // unreadable meta — nothing to clean
+          }
+        }
+        await FileSystem.deleteAsync(`${this.VAULT_DIR}${file}`, { idempotent: true });
       }
     } catch (error) {
       console.error('Error clearing vault:', error);
@@ -548,8 +589,18 @@ class SecureFileManager {
    * Prüft ob der Dateiname Directory Traversal enthält
    */
   private static containsPathTraversal(filename: string): boolean {
-    // Prüft auf .../ oder ..\ und andere potenziell gefährliche Muster
-    return filename.includes('..') || filename.includes('//');
+    if (typeof filename !== 'string' || filename.length === 0 || filename.length > 255) return true;
+    // Separators, '..', NUL/control chars and bidi overrides (display spoofing) are rejected.
+    return /\.\.|[\/\\\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/.test(filename);
+  }
+
+  /** Pre-flight check used by BackupService to validate a whole restore before importing. */
+  static isImportable(type: unknown, originalName: unknown): boolean {
+    return this.isValidType(type) && typeof originalName === 'string' && !this.containsPathTraversal(originalName);
+  }
+
+  private static isValidType(type: unknown): boolean {
+    return type === 'image' || type === 'video' || type === 'document';
   }
 }
 

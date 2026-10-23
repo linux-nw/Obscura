@@ -15,6 +15,10 @@ import { SecureDeleteService } from './SecureDeleteService';
 import { fastPbkdf2 } from './FastPBKDF2';
 import { Argon2idService, Argon2Params } from './Argon2idService';
 
+const dev = typeof __DEV__ !== 'undefined' && __DEV__;
+// Release builds must not write panic/decoy-related text to logcat (deniability, no PIN-adjacent data).
+const dbgErr = (...a: unknown[]) => { if (dev) console.error(...a); };
+
 export interface PanicSettings {
   panicPinHash: string | null;
   panicPinSalt: string | null;
@@ -49,10 +53,9 @@ export class PanicService {
    */
   static async initialize(): Promise<void> {
     try {
-      const settings = await this.loadSettings();
-      console.log('Panic: Service initialized');
+      await this.loadSettings();
     } catch (error) {
-      console.error('Error initializing Panic:', error);
+      dbgErr('Error initializing Panic:', error);
     }
   }
 
@@ -69,10 +72,8 @@ export class PanicService {
       await SecureStore.setItemAsync(this.STORAGE_PANIC_PIN_HASH, hash);
       await SecureStore.setItemAsync(this.STORAGE_PANIC_PIN_SALT, salt);
       await SecureStore.setItemAsync(this.STORAGE_PANIC_PIN_ALGO, 'argon2id');
-
-      console.log('Panic: Panic PIN set (Argon2id)');
     } catch (error) {
-      console.error('Error setting panic pin:', error);
+      dbgErr('Error setting panic pin:', error);
       throw new Error('Konnte Panic PIN nicht setzen');
     }
   }
@@ -100,6 +101,9 @@ export class PanicService {
       const storedSalt = await SecureStore.getItemAsync(this.STORAGE_PANIC_PIN_SALT);
 
       if (!storedHash || !storedSalt) {
+        // No panic PIN configured: still pay the Argon2id cost so "unset" is not faster than
+        // "set and wrong" (§7.3 property 1).
+        await this.computePinHash(pin, '00'.repeat(16));
         return false;
       }
 
@@ -125,7 +129,7 @@ export class PanicService {
       }
       return match;
     } catch (error) {
-      console.error('Panic: PIN verification error:', error);
+      dbgErr('Panic: PIN verification error:', error);
       return false;
     }
   }
@@ -174,7 +178,7 @@ export class PanicService {
    */
   static async triggerPanicAction(): Promise<void> {
     try {
-      console.warn('PANIC TRIGGERED!');
+      dbgErr('PANIC TRIGGERED!');
 
       // Lade Einstellungen
       const settings = await this.loadSettings();
@@ -191,7 +195,7 @@ export class PanicService {
           break;
       }
     } catch (error) {
-      console.error('Panic: Trigger action failed:', error);
+      dbgErr('Panic: Trigger action failed:', error);
     }
   }
 
@@ -199,23 +203,20 @@ export class PanicService {
    * Löscht alle Daten
    */
   private static async wipeAllData(): Promise<void> {
-    try {
-      console.log('Panic: Wiping all data...');
-
-      // Crypto Schlüssel löschen
-      await SecureCryptoService.deleteEncryptionKey();
-      await SecureCryptoService.deletePinData();
-
-      // Vault löschen
-      await SecureDeleteService.secureWipeAll();
-
-      // App als nicht initialisiert markieren
-      await SecureCryptoService.setAppInitialized(false);
-
-      console.log('Panic: All data wiped');
-    } catch (error) {
-      console.error('Panic: Data wipe failed:', error);
+    // Crypto-shred first. Every step runs even if an earlier one failed — a half-failed
+    // wipe must still destroy as much as possible (secureWipeAll is itself step-isolated
+    // and also clears panic/guest keys, guest dir, backups and view temps).
+    const steps: Array<() => Promise<unknown>> = [
+      () => SecureCryptoService.deleteEncryptionKey(),
+      () => SecureCryptoService.deletePinData(),
+      () => SecureDeleteService.secureWipeAll(),
+      () => SecureCryptoService.setAppInitialized(false),
+    ];
+    let failed = 0;
+    for (const step of steps) {
+      try { await step(); } catch (error) { failed++; dbgErr('Panic: wipe step failed:', error); }
     }
+    if (failed > 0) throw new Error('Panic wipe incomplete');
   }
 
   /**
@@ -223,16 +224,13 @@ export class PanicService {
    */
   private static async lockAppPermanently(): Promise<void> {
     try {
-      console.log('Panic: Locking app permanently...');
-
+      // Lock first, then drop PIN data: an interrupted run must never leave the vault unlocked.
       await SecureStore.setItemAsync('filevault_lock_until', String(Number.MAX_SAFE_INTEGER));
-
-      // PIN Daten löschen
       await SecureCryptoService.deletePinData();
-
-      console.log('Panic: App locked permanently');
+      // deletePinData also clears lock_until — re-assert it.
+      await SecureStore.setItemAsync('filevault_lock_until', String(Number.MAX_SAFE_INTEGER));
     } catch (error) {
-      console.error('Panic: Lock failed:', error);
+      dbgErr('Panic: Lock failed:', error);
     }
   }
 
@@ -250,6 +248,11 @@ export class PanicService {
         if (parsed.triggerAction !== 'wipe' && parsed.triggerAction !== 'lock') {
           parsed.triggerAction = 'lock';
         }
+        // Counters are security state: sanitize instead of trusting stored JSON.
+        const max = parsed.maxFailedAttempts;
+        parsed.maxFailedAttempts = Number.isInteger(max) && max >= 1 && max <= 20 ? max : this.MAX_FAILED_ATTEMPTS;
+        const fa = parsed.failedAttempts;
+        parsed.failedAttempts = Number.isInteger(fa) && fa >= 0 ? fa : 0;
         return parsed;
       }
       return {
@@ -260,11 +263,13 @@ export class PanicService {
         maxFailedAttempts: this.MAX_FAILED_ATTEMPTS,
       };
     } catch {
+      // Unreadable/corrupt settings: fail CLOSED on the counter (one attempt from the limit)
+      // rather than silently resetting it to 0.
       return {
         panicPinHash: null,
         panicPinSalt: null,
         triggerAction: 'lock' as const,
-        failedAttempts: 0,
+        failedAttempts: this.MAX_FAILED_ATTEMPTS - 1,
         maxFailedAttempts: this.MAX_FAILED_ATTEMPTS,
       };
     }
@@ -274,14 +279,11 @@ export class PanicService {
    * Speichert Panic Einstellungen
    */
   private static async saveSettings(settings: PanicSettings): Promise<void> {
-    try {
-      await SecureStore.setItemAsync(
-        this.STORAGE_PANIC_SETTINGS,
-        JSON.stringify(settings)
-      );
-    } catch (error) {
-      console.error('Error saving panic settings:', error);
-    }
+    // Propagate failures: a swallowed write would silently drop a counter increment.
+    await SecureStore.setItemAsync(
+      this.STORAGE_PANIC_SETTINGS,
+      JSON.stringify(settings)
+    );
   }
 
   /**
@@ -292,30 +294,37 @@ export class PanicService {
       const settings = await this.loadSettings();
       settings.triggerAction = action;
       await this.saveSettings(settings);
-      console.log(`Panic: Trigger action set to ${action}`);
     } catch (error) {
-      console.error('Error setting trigger action:', error);
+      dbgErr('Error setting trigger action:', error);
     }
   }
 
   /**
    * Zählt fehlgeschlagene Versuche hoch
    */
-  static async incrementFailedAttempts(): Promise<void> {
+  static incrementFailedAttempts(): Promise<void> {
+    // Serialized: concurrent read-modify-write would lose increments (lockout bypass).
+    const run = this.counterLock.then(() => this.incrementFailedAttemptsLocked());
+    this.counterLock = run.catch(() => {});
+    return run;
+  }
+
+  private static counterLock: Promise<void> = Promise.resolve();
+
+  private static async incrementFailedAttemptsLocked(): Promise<void> {
     try {
       const settings = await this.loadSettings();
       settings.failedAttempts = (settings.failedAttempts || 0) + 1;
 
       if (settings.failedAttempts >= settings.maxFailedAttempts) {
         await this.triggerPanicAction();
-        await this.resetFailedAttempts();
+        // After a wipe nothing may be written back (it would resurrect a SecureStore entry).
+        if (settings.triggerAction !== 'wipe') await this.resetFailedAttempts();
       } else {
         await this.saveSettings(settings);
       }
-
-      console.log(`Panic: Failed attempts: ${settings.failedAttempts}/${settings.maxFailedAttempts}`);
     } catch (error) {
-      console.error('Error incrementing failed attempts:', error);
+      dbgErr('Error incrementing failed attempts:', error);
     }
   }
 
@@ -328,7 +337,7 @@ export class PanicService {
       settings.failedAttempts = 0;
       await this.saveSettings(settings);
     } catch (error) {
-      console.error('Error resetting failed attempts:', error);
+      dbgErr('Error resetting failed attempts:', error);
     }
   }
 
@@ -360,9 +369,8 @@ export class PanicService {
       await SecureStore.deleteItemAsync(this.STORAGE_PANIC_PIN_HASH);
       await SecureStore.deleteItemAsync(this.STORAGE_PANIC_PIN_SALT);
       await SecureStore.deleteItemAsync(this.STORAGE_PANIC_PIN_ALGO);
-      console.log('Panic: Panic PIN cleared');
     } catch (error) {
-      console.error('Error clearing panic pin:', error);
+      dbgErr('Error clearing panic pin:', error);
     }
   }
 }

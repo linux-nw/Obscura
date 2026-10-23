@@ -128,6 +128,7 @@ export default function MainScreen({ onLogout, onChangePin, onWipeVault, securit
               onWipeVault={onWipeVault ?? (() => Promise.resolve())}
               onLogout={onLogout}
               securityStatus={securityStatus}
+              isDecoy={isDecoy}
             />
           </View>
         )}

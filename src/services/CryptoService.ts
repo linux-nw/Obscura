@@ -36,28 +36,6 @@ const BACKEND_AESCBCHMAC = 0x02; // AES-256-CBC + HMAC-SHA256 (pure-JS fallback,
 const BACKEND_CRYPTOJS = 0x03; // CryptoJS (last resort, not recommended)
 
 /**
- * Extracts backend identifier from ciphertext header
- * First byte of decrypted data is the backend ID
- */
-const extractBackendFromHeader = (encryptedData: string): 'xchacha' | 'aescbchmac' | 'cryptojs' => {
-  try {
-    const header = parseInt(encryptedData.substring(0, 2), 16);
-    switch (header) {
-      case BACKEND_XCHACHA:
-        return 'xchacha';
-      case BACKEND_AESCBCHMAC:
-        return 'aescbchmac';
-      case BACKEND_CRYPTOJS:
-        return 'cryptojs';
-      default:
-        return 'cryptojs'; // Default to CryptoJS for unknown headers
-    }
-  } catch {
-    return 'cryptojs'; // Default fallback
-  }
-};
-
-/**
  * Versucht XChaCha20-Poly1305 mit native Module
  * Dies ist die PRIMARY encryption path (erstes, was verwendet wird)
  *
@@ -157,6 +135,7 @@ export class SecureCryptoService {
   private static readonly STORAGE_MASTER_IV = 'filevault_master_iv';
   private static readonly STORAGE_MASTER_MAC = 'filevault_master_mac';
   private static readonly STORAGE_BIO_KEK = 'filevault_bio_kek';
+  private static readonly STORAGE_MASTER_TXN = 'filevault_master_txn';
   private static readonly LOCK_DURATION_MS = 300000; // 5 Minuten
 
   // ─────────────────────────────── Encoding Utility Functions ───────────────────────────────
@@ -179,11 +158,47 @@ export class SecureCryptoService {
    * Konvertiert Hex-String zu ArrayBuffer
    */
   static hexToBuffer(hex: string): ArrayBuffer {
+    if (typeof hex !== 'string' || hex.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(hex)) {
+      throw new Error('Ungültiger Hex-String');
+    }
     const bytes = new Uint8Array(hex.length / 2);
     for (let i = 0; i < hex.length; i += 2) {
       bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
     }
     return bytes.buffer;
+  }
+
+  private static isMasterHex(v: unknown): v is string {
+    return typeof v === 'string' && /^[0-9a-fA-F]{64}$/.test(v);
+  }
+
+  private static isHexOfLength(v: unknown, chars: number): v is string {
+    return typeof v === 'string' && v.length === chars && /^[0-9a-fA-F]+$/.test(v);
+  }
+
+  private static isBlockHex(v: unknown): v is string {
+    return typeof v === 'string' && v.length > 0 && v.length % 32 === 0 && /^[0-9a-fA-F]+$/.test(v);
+  }
+
+  private static assertCbcMacInputs(ctHex: unknown, ivHex: unknown, tag: unknown, keyHex: unknown): void {
+    if (
+      !this.isBlockHex(ctHex) ||
+      !this.isHexOfLength(ivHex, 32) ||
+      !this.isHexOfLength(tag, 64) ||
+      !this.isHexOfLength(keyHex, 64)
+    ) {
+      throw new Error('Ungültiges Ciphertext-Format');
+    }
+  }
+
+  private static assertXChaChaInputs(ctHex: unknown, nonceHex: unknown, tag: unknown): void {
+    if (
+      typeof ctHex !== 'string' || ctHex.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(ctHex) ||
+      !this.isHexOfLength(nonceHex, 48) ||
+      !this.isHexOfLength(tag, 32)
+    ) {
+      throw new Error('Ungültiges Ciphertext-Format');
+    }
   }
 
   /**
@@ -239,6 +254,14 @@ export class SecureCryptoService {
    */
   static async generateSecureBytes(length: number): Promise<ArrayBuffer> {
     const result = await CryptoModule.getRandomBytesAsync(length);
+    if (!result || result.byteLength !== length) {
+      throw new Error('CSPRNG lieferte unerwartete Länge');
+    }
+    if (length >= 16) {
+      let acc = 0;
+      for (let i = 0; i < result.length; i++) acc |= result[i];
+      if (acc === 0) throw new Error('CSPRNG lieferte ausschließlich Nullbytes');
+    }
     // Slice to exact bytes: on Hermes, result.buffer may be a pooled ArrayBuffer
     // larger than result.byteLength, causing bufferToHex to produce an oversized
     // hex string and aes-js to throw "invalid initialization vector size".
@@ -294,6 +317,7 @@ export class SecureCryptoService {
     aadHex: string = ''
   ): Promise<string> {
     try {
+      this.assertCbcMacInputs(encryptedData, ivHex, tag, keyHex);
       const keyBytes = CryptoJS.enc.Hex.parse(keyHex);
       const ivBytes = CryptoJS.enc.Hex.parse(ivHex);
 
@@ -376,6 +400,7 @@ export class SecureCryptoService {
     if (!canUseAesCbcHmac()) {
       throw new Error('AES-CBC+HMAC nicht verfügbar');
     }
+    this.assertCbcMacInputs(encryptedData, ivHex, tag, keyHex);
     const macKey = await this.deriveMacKey(keyHex);
     const expectedMac = await this.computeMac(macKey, ivHex + encryptedData);
     if (!await this.constantsTimeEquals(expectedMac, tag)) {
@@ -442,6 +467,7 @@ export class SecureCryptoService {
     if (!canUseXChaCha20()) {
       throw new Error('XChaCha20 nicht verfügbar');
     }
+    this.assertXChaChaInputs(encryptedData, ivHex, tag);
     const result = await xchachaDecrypt(encryptedData, ivHex, tag, keyHex, aadHex || undefined);
     return this.base64ToUtf8(result);
   }
@@ -472,6 +498,7 @@ export class SecureCryptoService {
     tag: string,
     keyHex: string
   ): Promise<string> {
+    this.assertCbcMacInputs(encryptedData, ivHex, tag, keyHex);
     const keyBytes = CryptoJS.enc.Hex.parse(keyHex);
     const ivBytes = CryptoJS.enc.Hex.parse(ivHex);
     const macKey = await this.deriveMacKey(keyHex);
@@ -546,6 +573,7 @@ export class SecureCryptoService {
     }
 
     try {
+      this.assertCbcMacInputs(encryptedData, ivHex, tag, keyHex);
       // Verifiziere HMAC BEFORE decryption. W-03: aadHex (backend prefix) is part of
       // the MAC input — a flipped prefix produces a different tag and is rejected.
       const macKey = await this.deriveMacKey(keyHex);
@@ -611,6 +639,7 @@ export class SecureCryptoService {
     }
 
     try {
+      this.assertXChaChaInputs(encryptedData, nonceHex, tag);
       const result = await xchachaDecrypt(encryptedData, nonceHex, tag, keyHex, aadHex || undefined);
 
       return this.base64ToUtf8(result);
@@ -742,6 +771,7 @@ export class SecureCryptoService {
   static async loadMasterKeyForBiometric(): Promise<boolean> {
     if (this.__masterHandle && keyCustody.has(this.__masterHandle)) return true;
     try {
+      await this.recoverMasterTxn();
       const kek = await SecureStore.getItemAsync(this.STORAGE_BIO_KEK, {
         requireAuthentication: true,
         authenticationPrompt: 'Tresor entsperren',
@@ -775,7 +805,7 @@ export class SecureCryptoService {
         padding: CryptoJS.pad.Pkcs7,
       });
       const masterKeyHex = decrypted.toString(CryptoJS.enc.Utf8);
-      if (masterKeyHex && masterKeyHex.length === 64) {
+      if (this.isMasterHex(masterKeyHex)) {
         this._masterKeyCache = masterKeyHex;
         return true;
       }
@@ -808,8 +838,21 @@ export class SecureCryptoService {
    * Handles legacy format migration transparently.
    * Returns false if passphrase is wrong or vault is locked.
    */
+  private static authChain: Promise<unknown> = Promise.resolve();
+
+  private static serialized<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.authChain.then(fn, fn);
+    this.authChain = run.catch(() => undefined);
+    return run;
+  }
+
   static async unlock(passphrase: string): Promise<boolean> {
+    return this.serialized(() => this.unlockImpl(passphrase));
+  }
+
+  private static async unlockImpl(passphrase: string): Promise<boolean> {
     try {
+      await this.recoverMasterTxn();
       const isLocked = await this.isAccountLocked();
       if (isLocked) return false;
 
@@ -889,7 +932,7 @@ export class SecureCryptoService {
         padding: CryptoJS.pad.Pkcs7,
       });
       const masterKeyHex = decrypted.toString(CryptoJS.enc.Utf8);
-      if (!masterKeyHex || masterKeyHex.length !== 64) {
+      if (!this.isMasterHex(masterKeyHex)) {
         await this.incrementFailedAttempts();
         return false;
       }
@@ -905,8 +948,9 @@ export class SecureCryptoService {
 
   private static async migrateLegacy(passphrase: string, legacyKey: string): Promise<boolean> {
     // verifyPin() handles the old hash comparison and increments failed attempts on failure
-    const isValid = await this.verifyPin(passphrase);
+    const isValid = await this.verifyPinImpl(passphrase);
     if (!isValid) return false;
+    if (!this.isMasterHex(legacyKey)) return false;
 
     await this.wrapAndStoreMasterKey(passphrase, legacyKey);
     await this.deleteItemSecure(this.STORAGE_KEY);
@@ -972,11 +1016,41 @@ export class SecureCryptoService {
   private static async storeWrappedMaster(
     kekSaltHex: string, ivHex: string, ctHex: string, macHex: string
   ): Promise<void> {
+    await this.setItemSecure(this.STORAGE_MASTER_TXN, JSON.stringify({ kekSaltHex, ivHex, ctHex, macHex }));
+    await this.applyMasterTxn(kekSaltHex, ivHex, ctHex, macHex);
+    await this.deleteItemSecure(this.STORAGE_MASTER_TXN);
+  }
+
+  private static async applyMasterTxn(
+    kekSaltHex: string, ivHex: string, ctHex: string, macHex: string
+  ): Promise<void> {
     await this.setItemSecure(this.STORAGE_KEK_SALT, kekSaltHex);
     await this.setItemSecure(this.STORAGE_KDF_META, this.KDF_META_CURRENT); // C1
     await this.setItemSecure(this.STORAGE_MASTER_ENC, ctHex);
     await this.setItemSecure(this.STORAGE_MASTER_IV, ivHex);
     await this.setItemSecure(this.STORAGE_MASTER_MAC, macHex);
+  }
+
+  /** Roll-forward of an interrupted wrapped-master write so a crash mid-write cannot brick the vault. */
+  private static async recoverMasterTxn(): Promise<void> {
+    const raw = await this.getItemSecure(this.STORAGE_MASTER_TXN);
+    if (!raw) return;
+    let t: { kekSaltHex?: unknown; ivHex?: unknown; ctHex?: unknown; macHex?: unknown };
+    try {
+      t = JSON.parse(raw);
+    } catch {
+      await this.deleteItemSecure(this.STORAGE_MASTER_TXN);
+      return;
+    }
+    if (
+      this.isHexOfLength(t.kekSaltHex, 32) &&
+      this.isHexOfLength(t.ivHex, 32) &&
+      this.isBlockHex(t.ctHex) &&
+      this.isHexOfLength(t.macHex, 64)
+    ) {
+      await this.applyMasterTxn(t.kekSaltHex, t.ivHex, t.ctHex, t.macHex);
+    }
+    await this.deleteItemSecure(this.STORAGE_MASTER_TXN);
   }
 
   /**
@@ -1188,12 +1262,13 @@ export class SecureCryptoService {
         throw new Error('Entschlüsselung fehlgeschlagen');
       }
       const prefix = encryptedData.substring(0, 2);
-      if (parseInt(prefix, 16) !== BACKEND_XCHACHA) {
+      if (prefix !== '01') {
         throw new Error('Native Key-Custody liest nur XChaCha20-Inhalte (0x01); Legacy-0x02/0x03-Inhalte sind auf dem Gerät nicht lesbar.');
       }
       const rawCiphertext = encryptedData.substring(2);
       const aadHex = prefix + this.utf8ToHex(aadContext);
       try {
+        this.assertXChaChaInputs(rawCiphertext, iv, mac);
         const b64 = await keyCustody.decryptContent(handle, rawCiphertext, iv, mac, aadHex);
         return this.base64ToUtf8(b64);
       } catch {
@@ -1210,7 +1285,7 @@ export class SecureCryptoService {
         throw new Error('Ungültiges ciphertext format - zu kurz für Backend-Header');
       }
       const backendPrefix = encryptedData.substring(0, 2);
-      const backendCode = parseInt(backendPrefix, 16);
+      const backendCode = /^[0-9a-fA-F]{2}$/.test(backendPrefix) ? parseInt(backendPrefix, 16) : -1;
       let backend: 'xchacha' | 'aescbchmac' | 'cryptojs';
 
       switch (backendCode) {
@@ -1342,11 +1417,11 @@ export class SecureCryptoService {
    */
   static async computeMac(macKey: string, data: string): Promise<string> {
     try {
+      const keyBytes = new Uint8Array(this.hexToBuffer(macKey));
       // Fast path: @noble/hashes HMAC-SHA256 (~4x faster than CryptoJS for large data)
       try {
         const { hmac } = require('@noble/hashes/hmac.js');
         const { sha256 } = require('@noble/hashes/sha2.js');
-        const keyBytes = this.hexToBuffer(macKey);
         // Data is ASCII hex string → encode as UTF-8 (identical to CryptoJS for ASCII)
         const dataBytes = new TextEncoder().encode(data);
         const result: Uint8Array = hmac(sha256, keyBytes, dataBytes);
@@ -1399,7 +1474,10 @@ export class SecureCryptoService {
     // Documented one-time raw-key touch (audit B1/B5): vault creation / migration / rotation hand a
     // freshly generated or just-decrypted master to custody. On the native backing this is the only
     // place a raw key crosses the bridge; in steady state the key never re-enters JS.
-    if (hex) this.__masterHandle = keyCustody.registerRawKey(hex);
+    if (hex) {
+      if (!this.isMasterHex(hex)) throw new Error('Master-Key muss 64 Hex-Zeichen haben');
+      this.__masterHandle = keyCustody.registerRawKey(hex);
+    }
   }
 
   /**
@@ -1427,12 +1505,7 @@ export class SecureCryptoService {
    * Cached: deterministic, same key → same MAC key.
    */
   static async deriveMacKey(keyHex: string): Promise<string> {
-    const cached = this.macKeyCache.get(keyHex);
-    if (cached) return cached;
-
-    const result = hkdfSha256(keyHex, 'filevault-mac-v1', 32);
-    this.macKeyCache.set(keyHex, result);
-    return result;
+    return hkdfSha256(keyHex, 'filevault-mac-v1', 32);
   }
 
   // M4: one-shot flag so the non-constant-time warning is logged at most once.
@@ -1598,6 +1671,8 @@ export class SecureCryptoService {
     await this.deleteItemSecure(this.STORAGE_MASTER_IV);
     await this.deleteItemSecure(this.STORAGE_MASTER_MAC);
     await this.deleteItemSecure(this.STORAGE_BIO_KEK);
+    await this.deleteItemSecure(this.STORAGE_MASTER_TXN);
+    await this.deleteItemSecure(this.STORAGE_KDF_META);
   }
 
   /**
@@ -1605,46 +1680,8 @@ export class SecureCryptoService {
    * Rotiert den Master-Schlüssel und verschlüsselt alle bestehenden
    * Dateien und Notizen mit dem neuen Schlüssel neu.
    */
-  static async rotateEncryptionKey(newPassphrase: string): Promise<void> {
-    try {
-      // Alten Schlüssel abrufen
-      const oldKeyHex = await this.getItemSecure(this.STORAGE_KEY);
-      if (!oldKeyHex) {
-        throw new Error('Kein alter Schlüssel vorhanden');
-      }
-
-      // Alte PIN-Daten laden (verschlüsselt mit altem Master-Key)
-      const oldPinData = await this.getStoredPin();
-      if (!oldPinData) {
-        throw new Error('Keine PIN-Daten vorhanden');
-      }
-
-      // Neuen Master-Schlüssel generieren (nicht aus PIN ableiten!)
-      const newKeyHex = await this.generateSecureKey();
-      const newMacKey = await this.deriveMacKey(newKeyHex);
-
-      // Speichert den neuen Schlüssel
-      await this.setItemSecure(this.STORAGE_KEY, newKeyHex);
-
-      // PIN-Daten mit neuem Schlüssel neu verschlüsseln (AES-CBC, 16-byte IV)
-      const pinData = JSON.stringify(oldPinData);
-      const iv = await this.generateSecureBytes(this.CBC_IV_LENGTH);
-
-      const cipher = CryptoJS.AES.encrypt(pinData, CryptoJS.enc.Hex.parse(newKeyHex), {
-        iv: CryptoJS.enc.Hex.parse(this.bufferToHex(iv)),
-        mode: CryptoJS.mode.CBC,
-        padding: CryptoJS.pad.Pkcs7,
-      });
-
-      await this.setItemSecure(this.STORAGE_PIN_HASH, cipher.ciphertext.toString(CryptoJS.enc.Hex));
-      await this.setItemSecure(this.STORAGE_PIN_IV, this.bufferToHex(iv));
-      await this.setItemSecure(this.STORAGE_PIN_KEY, newKeyHex);
-
-      // HMAC-MacKey neu ableiten - alter MacKey wird ignoriert, neuer wird immer erzeugt
-      // (Der neue MacKey wird dynamisch aus dem neuen Master-Key abgeleitet)
-    } catch {
-      throw new Error('Konnte Schlüssel nicht rotieren - Daten könnten unzugänglich sein');
-    }
+  static async rotateEncryptionKey(_newPassphrase: string): Promise<void> {
+    throw new Error('rotateEncryptionKey entfernt — nutze KeyRotationService.performSecureRotation');
   }
 
   /**
@@ -1672,6 +1709,10 @@ export class SecureCryptoService {
    * @returns true wenn PIN korrekt
    */
   static async verifyPin(passphrase: string): Promise<boolean> {
+    return this.serialized(() => this.verifyPinImpl(passphrase));
+  }
+
+  private static async verifyPinImpl(passphrase: string): Promise<boolean> {
     try {
       // Prüfe ob Account gesperrt ist
       const isLocked = await this.isAccountLocked();
@@ -1690,7 +1731,10 @@ export class SecureCryptoService {
       let derivedHash: string;
 
       if (isLegacy) {
-        // Verwende PBKDF2 für Legacy-Hashes
+        if (!Number.isInteger(iterationCount) || iterationCount < 1000 || iterationCount > 10_000_000) {
+          await this.incrementFailedAttempts();
+          return false;
+        }
         derivedHash = await this.derivePBKDF2Hash(passphrase, storedSalt, iterationCount);
       } else {
         // Verwende Argon2id für neue Hashes
@@ -1753,7 +1797,12 @@ export class SecureCryptoService {
       const lockUntilStr = await this.getItemSecure(this.STORAGE_LOCK_UNTIL);
       if (!lockUntilStr) return { locked: false, unlockAt: 0 };
       const lockUntil = parseInt(lockUntilStr, 10);
-      if (isNaN(lockUntil) || Date.now() >= lockUntil) {
+      if (isNaN(lockUntil)) {
+        const until = Date.now() + this.LOCK_DURATION_MS;
+        await this.setItemSecure(this.STORAGE_LOCK_UNTIL, until.toString());
+        return { locked: true, unlockAt: until };
+      }
+      if (Date.now() >= lockUntil) {
         await this.deleteItemSecure(this.STORAGE_LOCK_UNTIL);
         return { locked: false, unlockAt: 0 };
       }
@@ -1777,7 +1826,10 @@ export class SecureCryptoService {
       if (!lockUntilStr) return false;
 
       const lockUntil = parseInt(lockUntilStr, 10);
-      if (isNaN(lockUntil)) return false;
+      if (isNaN(lockUntil)) {
+        await this.setItemSecure(this.STORAGE_LOCK_UNTIL, (Date.now() + this.LOCK_DURATION_MS).toString());
+        return true;
+      }
 
       const now = Date.now();
       if (now < lockUntil) {
@@ -1799,6 +1851,7 @@ export class SecureCryptoService {
     try {
       let attemptsStr = await this.getItemSecure(this.STORAGE_FAILED_ATTEMPTS);
       let attempts = attemptsStr ? parseInt(attemptsStr, 10) : 0;
+      if (!Number.isFinite(attempts) || attempts < 0) attempts = this.MAX_FAILED_ATTEMPTS - 1;
 
       attempts++;
       await this.setItemSecure(this.STORAGE_FAILED_ATTEMPTS, attempts.toString());
@@ -1828,34 +1881,8 @@ export class SecureCryptoService {
    * Aktualisiert den PIN-Hash
    * @param newPassphrase Die neue PIN
    */
-  static async updatePinHash(newPassphrase: string): Promise<void> {
-    try {
-      const { hash, salt, iterationCount, algorithm } = await this.computePinHash(newPassphrase);
-
-      // Lade den existierenden Master-Key aus dem Hardware Keystore
-      const masterKeyHex = await this.getItemSecure(this.STORAGE_KEY);
-      if (!masterKeyHex) {
-        throw new Error('Kein Master-Key vorhanden');
-      }
-      const masterKeyBuffer = this.hexToBuffer(masterKeyHex);
-
-      const pinData = JSON.stringify({ hash, salt, iterationCount, algorithm });
-
-      // Verschlüsselt PIN-Daten mit Master-Key (AES-CBC, 16-byte IV)
-      const iv = await this.generateSecureBytes(this.CBC_IV_LENGTH);
-
-      const cipher = CryptoJS.AES.encrypt(pinData, CryptoJS.enc.Hex.parse(masterKeyHex), {
-        iv: CryptoJS.enc.Hex.parse(this.bufferToHex(iv)),
-        mode: CryptoJS.mode.CBC,
-        padding: CryptoJS.pad.Pkcs7,
-      });
-
-      await this.setItemSecure(this.STORAGE_PIN_HASH, cipher.ciphertext.toString(CryptoJS.enc.Hex));
-      await this.setItemSecure(this.STORAGE_PIN_IV, this.bufferToHex(iv));
-      await this.setItemSecure(this.STORAGE_PIN_KEY, masterKeyHex);
-    } catch {
-      throw new Error('Konnte PIN-Hash nicht aktualisieren');
-    }
+  static async updatePinHash(_newPassphrase: string): Promise<void> {
+    throw new Error('updatePinHash entfernt — legt keinen Master-Key mehr im Klartext ab');
   }
 
   /**

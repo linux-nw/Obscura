@@ -28,6 +28,21 @@ class NativeKeyCustodyModule(reactContext: ReactApplicationContext) :
 
     override fun getName() = "NativeKeyCustody"
 
+    private fun requireKdfFloor(opslimit: Long, memlimitKB: Long) {
+        require(opslimit >= MIN_OPSLIMIT) { "opslimit below policy floor" }
+        require(memlimitKB >= MIN_MEMLIMIT_KB) { "memlimit below policy floor" }
+    }
+
+    private fun requireHandle(handle: String) {
+        require(HANDLE_RE.matches(handle)) { "invalid handle" }
+    }
+
+    companion object {
+        private const val MIN_OPSLIMIT = 2L
+        private const val MIN_MEMLIMIT_KB = 19456L
+        private val HANDLE_RE = Regex("^[0-9a-f]{32}$")
+    }
+
     // ── install channel ──────────────────────────────────────────────────────────────────────
 
     /**
@@ -39,6 +54,8 @@ class NativeKeyCustodyModule(reactContext: ReactApplicationContext) :
         try {
             val handle = params.getString("handle") ?: throw IllegalArgumentException("handle required")
             val keyHex = params.getString("keyHex") ?: throw IllegalArgumentException("keyHex required")
+            requireHandle(handle)
+            require(keyHex.length == 64) { "keyHex must be 32 bytes" }
             val raw = NativeKeyCustodyCrypto.fromHex(keyHex)
             try {
                 NativeKeyCustody.adoptRawKey(handle, raw)
@@ -68,9 +85,10 @@ class NativeKeyCustodyModule(reactContext: ReactApplicationContext) :
             val macHex      = params.getString("macHex") ?: throw IllegalArgumentException("macHex required")
             val opslimit    = readLong(params, "opslimit", 3L)
             val memlimitKB  = readLong(params, "memlimitKB", 65536L)
+            requireKdfFloor(opslimit, memlimitKB)
 
-            val password = Normalizer.normalize(passwordRaw, Normalizer.Form.NFC).toByteArray(StandardCharsets.UTF_8)
             val kekSalt  = NativeKeyCustodyCrypto.fromHex(kekSaltHex)
+            val password = Normalizer.normalize(passwordRaw, Normalizer.Form.NFC).toByteArray(StandardCharsets.UTF_8)
             try {
                 val handle = NativeKeyCustody.openVault(password, kekSalt, opslimit, memlimitKB, ivHex, ctHex, macHex)
                 promise.resolve(handle)
@@ -114,10 +132,12 @@ class NativeKeyCustodyModule(reactContext: ReactApplicationContext) :
             val newIvHex    = params.getString("newIvHex") ?: throw IllegalArgumentException("newIvHex required")
             val opslimit    = readLong(params, "opslimit", 3L)
             val memlimitKB  = readLong(params, "memlimitKB", 65536L)
+            requireKdfFloor(opslimit, memlimitKB)
+            requireHandle(handle)
 
-            val newPassword = Normalizer.normalize(newPassRaw, Normalizer.Form.NFC).toByteArray(StandardCharsets.UTF_8)
             val newSalt = NativeKeyCustodyCrypto.fromHex(newSaltHex)
             val newIv   = NativeKeyCustodyCrypto.fromHex(newIvHex)
+            val newPassword = Normalizer.normalize(newPassRaw, Normalizer.Form.NFC).toByteArray(StandardCharsets.UTF_8)
             try {
                 val w = NativeKeyCustody.rewrapVault(handle, newPassword, newSalt, opslimit, memlimitKB, newIv)
                 val out = Arguments.createMap()
@@ -147,9 +167,9 @@ class NativeKeyCustodyModule(reactContext: ReactApplicationContext) :
             val nonceHex = params.getString("nonceHex") ?: throw IllegalArgumentException("nonceHex required")
             val aadHex   = params.getString("aadHex")
 
-            val plain = Base64.decode(dataB64, Base64.DEFAULT)
             val nonce = NativeKeyCustodyCrypto.fromHex(nonceHex)
             val aad   = if (aadHex.isNullOrEmpty()) null else NativeKeyCustodyCrypto.fromHex(aadHex)
+            val plain = Base64.decode(dataB64, Base64.DEFAULT)
             try {
                 val aead = NativeKeyCustody.encryptWithHandle(handle, plain, nonce, aad)
                 val out = Arguments.createMap()
@@ -183,7 +203,7 @@ class NativeKeyCustodyModule(reactContext: ReactApplicationContext) :
             plain.fill(0)
             promise.resolve(out)
         } catch (e: Exception) {
-            promise.reject("CUSTODY_DECRYPT_ERROR", e.message, e)
+            promise.reject("CUSTODY_DECRYPT_ERROR", "decryption failed")
         }
     }
 
@@ -235,7 +255,7 @@ class NativeKeyCustodyModule(reactContext: ReactApplicationContext) :
             plain.fill(0)
             promise.resolve(out)
         } catch (e: Exception) {
-            promise.reject("CUSTODY_UNWRAP_ERROR", e.message, e)
+            promise.reject("CUSTODY_UNWRAP_ERROR", e.message ?: "unwrap failed")
         }
     }
 

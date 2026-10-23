@@ -10,11 +10,33 @@
 import * as FileSystem from 'expo-file-system/legacy';
 
 /** Write `data` to `targetPath` atomically via temp file + rename. */
-export async function writeFileAtomic(targetPath: string, data: string): Promise<void> {
+// Temp paths of writes currently in flight. cleanupTempFiles() skips them so a concurrent
+// initialize()/getFiles() cannot delete a live temp between write and rename.
+const inFlight = new Set<string>();
+// Per-target queue: two concurrent writers to the same target would share `<target>.tmp`
+// and could rename each other's half-written data.
+const queues = new Map<string, Promise<void>>();
+
+export function writeFileAtomic(targetPath: string, data: string): Promise<void> {
   const tmpPath = `${targetPath}.tmp`;
-  await FileSystem.writeAsStringAsync(tmpPath, data);
-  // moveAsync overwrites an existing destination (rename semantics).
-  await FileSystem.moveAsync({ from: tmpPath, to: targetPath });
+  const prev = queues.get(targetPath) ?? Promise.resolve();
+  const run = prev.then(async () => {
+    inFlight.add(tmpPath);
+    try {
+      await FileSystem.writeAsStringAsync(tmpPath, data);
+      // moveAsync overwrites an existing destination (rename semantics).
+      await FileSystem.moveAsync({ from: tmpPath, to: targetPath });
+    } catch (e) {
+      await FileSystem.deleteAsync(tmpPath, { idempotent: true }).catch(() => {});
+      throw e;
+    } finally {
+      inFlight.delete(tmpPath);
+    }
+  });
+  const tail = run.catch(() => {});
+  queues.set(targetPath, tail);
+  tail.then(() => { if (queues.get(targetPath) === tail) queues.delete(targetPath); });
+  return run;
 }
 
 /**
@@ -31,6 +53,7 @@ export async function cleanupTempFiles(dir: string): Promise<void> {
     const entries = await FileSystem.readDirectoryAsync(dir);
     for (const name of entries) {
       if (!name.endsWith('.tmp')) continue;
+      if (inFlight.has(`${dir}${name}`)) continue;
       await FileSystem.deleteAsync(`${dir}${name}`, { idempotent: true });
     }
   } catch {

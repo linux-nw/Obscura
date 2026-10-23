@@ -25,31 +25,47 @@ const defaults: AppSettings = {
   minPinLength: 8,
 };
 
+const ALLOWED_TIMEOUTS = [-1, 0, 15, 30, 60, 300, 600, 900, 1800];
+
+/** Clamp every field to a known-good value so a tampered/corrupt store cannot weaken protections. */
+export function sanitizeSettings(raw: unknown): AppSettings {
+  const r = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  const bool = (v: unknown, d: boolean) => (typeof v === 'boolean' ? v : d);
+  const t = r.autoLockTimeout;
+  const m = r.maxFailedAttempts;
+  return {
+    biometricsEnabled: bool(r.biometricsEnabled, defaults.biometricsEnabled),
+    bioAutoTrigger: bool(r.bioAutoTrigger, defaults.bioAutoTrigger),
+    require2FA: bool(r.require2FA, defaults.require2FA),
+    autoLockTimeout: typeof t === 'number' && ALLOWED_TIMEOUTS.includes(t) ? t : defaults.autoLockTimeout,
+    maxFailedAttempts:
+      typeof m === 'number' && Number.isInteger(m) && m >= 3 && m <= 10 ? m : defaults.maxFailedAttempts,
+    maxFailedAttemptsAction: r.maxFailedAttemptsAction === 'lock' ? 'lock' : 'wipe',
+    minPinLength: defaults.minPinLength,
+  };
+}
+
 export class SettingsService {
+  /**
+   * SecureStore only (Keystore-bound). The former plaintext AsyncStorage mirror let anyone
+   * with file access edit settings whenever the SecureStore entry was absent; it is purged.
+   */
   static async get(): Promise<AppSettings> {
-    // Try SecureStore first (primary), fall back to AsyncStorage (secondary).
     try {
       const raw = await SecureStore.getItemAsync(STORAGE_KEY);
-      if (raw) return { ...defaults, ...(JSON.parse(raw) as Partial<AppSettings>) };
+      if (raw) return sanitizeSettings(JSON.parse(raw));
     } catch {}
-
-    try {
-      const raw = await AsyncStorage.getItem(STORAGE_KEY);
-      if (raw) return { ...defaults, ...(JSON.parse(raw) as Partial<AppSettings>) };
-    } catch {}
-
+    AsyncStorage.removeItem(STORAGE_KEY).catch(() => {});
     return { ...defaults };
   }
 
   static async save(settings: AppSettings): Promise<void> {
-    const json = JSON.stringify(settings);
-    const results = await Promise.allSettled([
-      SecureStore.setItemAsync(STORAGE_KEY, json),
-      AsyncStorage.setItem(STORAGE_KEY, json),
-    ]);
-    // Fail only if both stores failed.
-    if (results.every(r => r.status === 'rejected')) {
-      throw new Error('Einstellungen konnten nicht gespeichert werden');
-    }
+    const clean = sanitizeSettings(settings);
+    await SecureStore.setItemAsync(STORAGE_KEY, JSON.stringify(clean));
+    AsyncStorage.removeItem(STORAGE_KEY).catch(() => {});
+    try {
+      const { AutoLockService } = require('./AutoLockService');
+      await AutoLockService.applySettings();
+    } catch {}
   }
 }

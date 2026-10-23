@@ -9,7 +9,7 @@
  * - Haptic feedback on lock
  */
 
-import { Platform, Vibration, AppState } from 'react-native';
+import { Platform, Vibration } from 'react-native';
 import * as SecureStore from 'expo-secure-store';
 import { SettingsService } from './SettingsService';
 
@@ -32,6 +32,9 @@ export class AutoLockService {
   // controlled window so the master key survives until the picked file is saved.
   // Set ONLY around an explicit in-app picker launch; always cleared in finally.
   private static pickerActive = false;
+  private static pickerDeadline = 0;
+  private static lastPersist = 0;
+  private static readonly PICKER_MAX_MS = 5 * 60 * 1000;
 
   private static settings: AutoLockSettings = {
     enabled: true,
@@ -41,17 +44,22 @@ export class AutoLockService {
 
   /** True while a system picker launched from within the app is in progress. */
   static isPickerActive(): boolean {
+    if (this.pickerActive && Date.now() > this.pickerDeadline) {
+      this.pickerActive = false;
+    }
     return this.pickerActive;
   }
 
   /** Call immediately BEFORE launching a system picker (document/image). */
   static beginPickerSession(): void {
     this.pickerActive = true;
+    this.pickerDeadline = Date.now() + this.PICKER_MAX_MS;
   }
 
   /** Call in a finally AFTER the picker flow (incl. save) completes or cancels. */
   static endPickerSession(): void {
     this.pickerActive = false;
+    this.pickerDeadline = 0;
     // Reset the inactivity timer: the picker round-trip counts as activity.
     this.resetTimer();
   }
@@ -70,9 +78,7 @@ export class AutoLockService {
   static async initialize(): Promise<void> {
     try {
       await this.loadSettings();
-      await this.setupAppStateListener();
       await this.checkAndLock();
-      console.log('AutoLock: Service initialized');
     } catch (error) {
       console.error('Error initializing AutoLock:', error);
     }
@@ -92,9 +98,12 @@ export class AutoLockService {
       } else if (t === 0) {
         // "Sofort" — no inactivity timer; background locking via App.tsx AppState listener
         this.settings.enabled = false;
+      } else if (Number.isFinite(t) && t > 0) {
+        this.settings.enabled = true;
+        this.settings.timeoutSeconds = Math.min(t, 3600);
       } else {
         this.settings.enabled = true;
-        this.settings.timeoutSeconds = t;
+        this.settings.timeoutSeconds = 300;
       }
 
       const lastActivity = await SecureStore.getItemAsync(this.LAST_ACTIVITY_KEY);
@@ -104,6 +113,12 @@ export class AutoLockService {
     } catch (error) {
       console.error('Error loading auto lock settings:', error);
     }
+  }
+
+  /** Re-read the user's timeout setting and re-arm the timer (call after settings change). */
+  static async applySettings(): Promise<void> {
+    await this.loadSettings();
+    this.resetTimer();
   }
 
   /**
@@ -124,21 +139,6 @@ export class AutoLockService {
     }
   }
 
-  /**
-   * Setup AppState Listener für Background/Foreground
-   */
-  private static async setupAppStateListener(): Promise<void> {
-    AppState.addEventListener('change', (state) => {
-      if (state === 'background') {
-        this.triggerLock();
-      } else if (state === 'active') {
-        this.resetTimer();
-      }
-    });
-
-    console.log('AutoLock: AppState listener set up');
-  }
-
   // ─────────────────────────────── Timer Management ───────────────────────────────
 
   /**
@@ -152,8 +152,12 @@ export class AutoLockService {
     }
 
     // Activityzeit aktualisieren
-    this.settings.lastActivity = Date.now();
-    this.saveSettings();
+    const now = Date.now();
+    this.settings.lastActivity = now;
+    if (now - this.lastPersist > 5000) {
+      this.lastPersist = now;
+      this.saveSettings();
+    }
 
     // Neue Timer starten
     this.startTimer();
@@ -172,8 +176,6 @@ export class AutoLockService {
     this.timeoutId = setTimeout(() => {
       this.triggerLock();
     }, timeoutMs);
-
-    console.log(`AutoLock: Timer started (${this.settings.timeoutSeconds}s)`);
   }
 
   /**
@@ -204,25 +206,27 @@ export class AutoLockService {
    * Löst sofortigen Lock aus und benachrichtigt App via Callback.
    */
   static async triggerLock(): Promise<void> {
+    if (this.isPickerActive()) {
+      return;
+    }
+    if (this.timeoutId) {
+      clearTimeout(this.timeoutId);
+      this.timeoutId = null;
+    }
+    // Lock the UI first: nothing below may delay or prevent it.
     try {
-      // F2/Picker: do not lock while a system picker launched from within the
-      // app is in progress — that backgrounding is expected and controlled.
-      if (this.pickerActive) {
-        return;
-      }
-      if (Platform.OS === 'android') {
-        Vibration.vibrate(100);
-      }
-
-      await SecureStore.setItemAsync(this.LOCKED_KEY, 'true');
-
-      // Benachrichtige App.tsx (setzt isAuthenticated = false)
       if (this.lockCallback) {
         this.lockCallback();
       }
-    } catch (error) {
-      console.error('Error triggering lock:', error);
-    }
+    } catch {}
+    try {
+      if (Platform.OS === 'android') {
+        Vibration.vibrate(100);
+      }
+    } catch {}
+    try {
+      await SecureStore.setItemAsync(this.LOCKED_KEY, 'true');
+    } catch {}
   }
 
   /**
@@ -232,7 +236,6 @@ export class AutoLockService {
     try {
       await SecureStore.deleteItemAsync(this.LOCKED_KEY);
       this.resetTimer();
-      console.log('AutoLock: Vault unlocked');
     } catch (error) {
       console.error('Error unlocking:', error);
     }

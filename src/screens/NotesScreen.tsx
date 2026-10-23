@@ -1,13 +1,14 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
   View, Text, TouchableOpacity, StyleSheet,
-  FlatList, TextInput, Modal, Alert,
+  FlatList, TextInput, Alert,
 } from 'react-native';
 import { NotesService, Note } from '../services/NotesService';
 import { DecoyVaultService } from '../services/DecoyVaultService';
 import { SecureCryptoService } from '../services/CryptoService';
 import NoteEditor from './NoteEditor';
 import Icon from '../components/Icon';
+import SecureModal from '../components/SecureModal';
 import { c, rs, font, radius, TAB_BAR_HEIGHT, useBottomInset } from '../theme';
 
 export default function NotesScreen({ isDecoy = false }: { isDecoy?: boolean }) {
@@ -195,7 +196,7 @@ export default function NotesScreen({ isDecoy = false }: { isDecoy?: boolean }) 
       </TouchableOpacity>
 
       {/* ── Full-screen note editor ── */}
-      <Modal
+      <SecureModal
         visible={editorVisible}
         animationType="fade"
         statusBarTranslucent
@@ -209,7 +210,7 @@ export default function NotesScreen({ isDecoy = false }: { isDecoy?: boolean }) 
             onSaved={onSaved}
           />
         )}
-      </Modal>
+      </SecureModal>
     </View>
   );
 }

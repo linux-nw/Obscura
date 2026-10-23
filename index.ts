@@ -8,6 +8,16 @@ if (typeof global !== 'undefined' && !global.performance) {
   (global as any).performance = { ...global.performance, now: () => Date.now() };
 }
 
+// Release builds: no console output (logcat is readable by anyone with adb / READ_LOGS devices).
+if (typeof __DEV__ !== 'undefined' && !__DEV__) {
+  const noop = () => {};
+  (console as any).log = noop;
+  (console as any).info = noop;
+  (console as any).debug = noop;
+  (console as any).warn = noop;
+  (console as any).error = noop;
+}
+
 import { registerRootComponent } from 'expo';
 
 import App from './App';

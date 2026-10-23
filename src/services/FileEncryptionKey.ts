@@ -49,6 +49,24 @@ export interface FileKey {
  */
 const KEY_WRAPPED_PREFIX = 'filevault_filekey_';
 
+const FILE_KEY_HEX = /^[0-9a-fA-F]{64}$/;
+const SAFE_FILE_ID = /^[A-Za-z0-9._-]{1,128}$/;
+
+function assertFileId(fileId: string): void {
+  if (typeof fileId !== 'string' || !SAFE_FILE_ID.test(fileId)) {
+    throw new Error('Ungültige fileId');
+  }
+}
+
+function isEncryptedFileKey(v: any): v is EncryptedFileKey {
+  return !!v && typeof v === 'object' &&
+    typeof v.encryptedKey === 'string' && /^[0-9a-fA-F]+$/.test(v.encryptedKey) &&
+    typeof v.iv === 'string' && /^[0-9a-fA-F]{32}$/.test(v.iv) &&
+    typeof v.mac === 'string' && /^[0-9a-fA-F]{64}$/.test(v.mac) &&
+    typeof v.createdAt === 'string' &&
+    (v.fileId === undefined || typeof v.fileId === 'string');
+}
+
 /**
  * Generate a unique 256-bit encryption key for a file
  * @returns 64-character hex string (256 bits)
@@ -73,6 +91,7 @@ export async function generateFileKey(): Promise<string> {
  * @returns EncryptedFileKey with iv, mac, and encryptedKey
  */
 export async function wrapFileKey(fileKey: string): Promise<EncryptedFileKey> {
+  if (!FILE_KEY_HEX.test(fileKey)) throw new Error('Dateischlüssel muss 64 Hex-Zeichen haben');
   return SecureCryptoService.encryptFileKey(fileKey);
 }
 
@@ -84,7 +103,10 @@ export async function wrapFileKey(fileKey: string): Promise<EncryptedFileKey> {
  * @returns 64 hex char file key
  */
 export async function unwrapFileKey(encryptedKey: EncryptedFileKey): Promise<string> {
-  return SecureCryptoService.decryptFileKey(encryptedKey);
+  if (!isEncryptedFileKey(encryptedKey)) throw new Error('Ungültiges File-Key-Format');
+  const key = await SecureCryptoService.decryptFileKey(encryptedKey);
+  if (!FILE_KEY_HEX.test(key)) throw new Error('Entschlüsselter Dateischlüssel hat ungültiges Format');
+  return key;
 }
 
 /**
@@ -96,6 +118,8 @@ export async function storeEncryptedFileKey(
   fileId: string,
   encryptedKey: EncryptedFileKey
 ): Promise<void> {
+  assertFileId(fileId);
+  if (!isEncryptedFileKey(encryptedKey)) throw new Error('Ungültiges File-Key-Format');
   try {
     const keyStorageName = `${KEY_WRAPPED_PREFIX}${fileId}`;
     await SecureStore.setItemAsync(keyStorageName, JSON.stringify(encryptedKey));
@@ -111,6 +135,7 @@ export async function storeEncryptedFileKey(
  * @returns EncryptedFileKey or null if not found
  */
 export async function loadEncryptedFileKey(fileId: string): Promise<EncryptedFileKey | null> {
+  assertFileId(fileId);
   try {
     const keyStorageName = `${KEY_WRAPPED_PREFIX}${fileId}`;
     const storedData = await SecureStore.getItemAsync(keyStorageName);
@@ -119,7 +144,9 @@ export async function loadEncryptedFileKey(fileId: string): Promise<EncryptedFil
       return null;
     }
 
-    return JSON.parse(storedData) as EncryptedFileKey;
+    const parsed = JSON.parse(storedData);
+    if (!isEncryptedFileKey(parsed)) throw new Error('Ungültiges File-Key-Format');
+    return parsed;
   } catch (error) {
     console.error('Error loading encrypted file key:', error);
     throw new Error('Konnte verschlüsselten Dateischlüssel nicht laden');
@@ -131,6 +158,7 @@ export async function loadEncryptedFileKey(fileId: string): Promise<EncryptedFil
  * @param fileId - ID of the file
  */
 export async function deleteEncryptedFileKey(fileId: string): Promise<void> {
+  assertFileId(fileId);
   try {
     const keyStorageName = `${KEY_WRAPPED_PREFIX}${fileId}`;
     await SecureStore.deleteItemAsync(keyStorageName);
@@ -174,5 +202,6 @@ export async function rewrapFileKey(
  * @returns Storage key name
  */
 export function getFileKeyStorageName(fileId: string): string {
+  assertFileId(fileId);
   return `${KEY_WRAPPED_PREFIX}${fileId}`;
 }

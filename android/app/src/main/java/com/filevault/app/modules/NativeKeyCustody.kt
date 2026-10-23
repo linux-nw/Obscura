@@ -6,6 +6,9 @@ import com.sun.jna.NativeLong
 import com.sun.jna.Pointer
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.locks.ReentrantReadWriteLock
+import kotlin.concurrent.read
+import kotlin.concurrent.write
 
 /**
  * NativeKeyCustody — libsodium secure-memory custody core (L3 Phase 1b).
@@ -42,7 +45,27 @@ object NativeKeyCustody {
 
     private val sessions = ConcurrentHashMap<String, Session>()
 
+    private val lock = ReentrantReadWriteLock()
+
+    private val HANDLE_RE = Regex("^[0-9a-f]{32}$")
+
+    private const val MIN_MEMLIMIT_KB = 8192L
+    private const val MAX_MEMLIMIT_KB = 1048576L
+    private const val MIN_OPSLIMIT = 1L
+    private const val MAX_OPSLIMIT = 64L
+
     @Volatile private var lockProbe: Boolean? = null
+
+    private fun checkKdf(salt: ByteArray, opslimit: Long, memlimitKB: Long) {
+        require(salt.size == 16) { "KDF salt must be 16 bytes" }
+        require(opslimit in MIN_OPSLIMIT..MAX_OPSLIMIT) { "opslimit out of range" }
+        require(memlimitKB in MIN_MEMLIMIT_KB..MAX_MEMLIMIT_KB) { "memlimit out of range" }
+    }
+
+    private fun masterFromAscii(masterAscii: ByteArray): ByteArray {
+        require(masterAscii.size == 64) { "master must be 64 hex chars" }
+        return NativeKeyCustodyCrypto.fromHex(String(masterAscii, StandardCharsets.UTF_8))
+    }
 
     /** One-time sodium_init plus an explicit, return-checked mlock capability probe. */
     @Synchronized
@@ -70,11 +93,19 @@ object NativeKeyCustody {
 
     // ── store a raw key into a guarded secure-memory region ─────────────────────────
     private fun storeUnder(handle: String, rawKey: ByteArray): String {
+        require(HANDLE_RE.matches(handle)) { "invalid handle format" }
+        require(rawKey.size == 32) { "key must be 32 bytes" }
         val mlocked = ensureInit()
         val ptr = ls.sodium.sodium_malloc(rawKey.size)
             ?: throw IllegalStateException("sodium_malloc returned null")
         ptr.write(0, rawKey, 0, rawKey.size)
-        sessions[handle] = Session(ptr, rawKey.size, mlocked)
+        val previous = lock.write {
+            sessions.put(handle, Session(ptr, rawKey.size, mlocked))
+        }
+        if (previous != null) {
+            ls.sodium.sodium_mprotect_readwrite(previous.keyPtr)
+            ls.sodium.sodium_free(previous.keyPtr)
+        }
         return handle
     }
 
@@ -116,27 +147,31 @@ object NativeKeyCustody {
         macHex: String
     ): String {
         ensureInit()
+        checkKdf(kekSalt, opslimit, memlimitKB)
         val kek = ByteArray(32) // Argon2id output == raw 32-byte KEK (matches deriveKEK)
-        val rc = ls.sodium.crypto_pwhash(
-            kek, kek.size.toLong(),
-            password, password.size.toLong(),
-            kekSalt,
-            opslimit,
-            NativeLong(memlimitKB * 1024L),
-            2 // crypto_pwhash_ALG_ARGON2ID13
-        )
-        if (rc != 0) {
+        try {
+            val rc = ls.sodium.crypto_pwhash(
+                kek, kek.size.toLong(),
+                password, password.size.toLong(),
+                kekSalt,
+                opslimit,
+                NativeLong(memlimitKB * 1024L),
+                2 // crypto_pwhash_ALG_ARGON2ID13
+            )
+            if (rc != 0) throw SecurityException("KEK derivation failed (rc=$rc)")
+            // Master blob plaintext is the 64-ASCII-hex master-key string, EtM-wrapped under the KEK.
+            val masterAscii = NativeKeyCustodyCrypto.unwrapEtm(kek, ivHex, encMasterCtHex, macHex)
+            var masterRaw: ByteArray? = null
+            try {
+                masterRaw = masterFromAscii(masterAscii)
+                return store(masterRaw)
+            } finally {
+                ls.sodium.sodium_memzero(masterAscii, masterAscii.size)
+                masterRaw?.let { ls.sodium.sodium_memzero(it, it.size) }
+            }
+        } finally {
             ls.sodium.sodium_memzero(kek, kek.size)
-            throw SecurityException("KEK derivation failed (rc=$rc)")
         }
-        // Master blob plaintext is the 64-ASCII-hex master-key string, EtM-wrapped under the KEK.
-        val masterAscii = NativeKeyCustodyCrypto.unwrapEtm(kek, ivHex, encMasterCtHex, macHex)
-        ls.sodium.sodium_memzero(kek, kek.size)
-        val masterRaw = NativeKeyCustodyCrypto.fromHex(String(masterAscii, StandardCharsets.UTF_8))
-        ls.sodium.sodium_memzero(masterAscii, masterAscii.size)
-        val handle = store(masterRaw)
-        ls.sodium.sodium_memzero(masterRaw, masterRaw.size)
-        return handle
     }
 
     /**
@@ -149,14 +184,18 @@ object NativeKeyCustody {
      */
     fun unwrapVaultWithKek(kekHex: String, ivHex: String, encMasterCtHex: String, macHex: String): String {
         ensureInit()
+        require(kekHex.length == 64) { "KEK must be 32 bytes" }
         val kek = NativeKeyCustodyCrypto.fromHex(kekHex)
         try {
             val masterAscii = NativeKeyCustodyCrypto.unwrapEtm(kek, ivHex, encMasterCtHex, macHex)
-            val masterRaw = NativeKeyCustodyCrypto.fromHex(String(masterAscii, StandardCharsets.UTF_8))
-            ls.sodium.sodium_memzero(masterAscii, masterAscii.size)
-            val handle = store(masterRaw)
-            ls.sodium.sodium_memzero(masterRaw, masterRaw.size)
-            return handle
+            var masterRaw: ByteArray? = null
+            try {
+                masterRaw = masterFromAscii(masterAscii)
+                return store(masterRaw)
+            } finally {
+                ls.sodium.sodium_memzero(masterAscii, masterAscii.size)
+                masterRaw?.let { ls.sodium.sodium_memzero(it, it.size) }
+            }
         } finally {
             ls.sodium.sodium_memzero(kek, kek.size)
         }
@@ -179,6 +218,8 @@ object NativeKeyCustody {
         newIv: ByteArray
     ): NativeKeyCustodyCrypto.Wrapped {
         ensureInit()
+        checkKdf(newSalt, opslimit, memlimitKB)
+        require(newIv.size == 16) { "IV must be 16 bytes" }
         val newKek = ByteArray(32)
         val rc = ls.sodium.crypto_pwhash(
             newKek, newKek.size.toLong(),
@@ -212,9 +253,12 @@ object NativeKeyCustody {
 
     /** Read the key out of the guarded region into a transient that is zeroed after use. */
     private fun <T> withKey(handle: String, block: (ByteArray) -> T): T {
-        val s = session(handle)
-        val k = ByteArray(s.len)
-        s.keyPtr.read(0, k, 0, s.len)
+        val k = lock.read {
+            val s = session(handle)
+            val buf = ByteArray(s.len)
+            s.keyPtr.read(0, buf, 0, s.len)
+            buf
+        }
         try {
             return block(k)
         } finally {
@@ -227,6 +271,7 @@ object NativeKeyCustody {
 
     fun encryptWithHandle(handle: String, plaintext: ByteArray, nonce: ByteArray, aad: ByteArray?): Aead =
         withKey(handle) { key ->
+            require(nonce.size == 24) { "nonce must be 24 bytes" }
             val ct = ByteArray(plaintext.size)
             val mac = ByteArray(16)
             val macLen = LongArray(1)
@@ -249,6 +294,8 @@ object NativeKeyCustody {
             val nonce = NativeKeyCustodyCrypto.fromHex(nonceHex)
             val mac = NativeKeyCustodyCrypto.fromHex(tagHex)
             val aad = if (aadHex.isNullOrEmpty()) null else NativeKeyCustodyCrypto.fromHex(aadHex)
+            require(nonce.size == 24) { "nonce must be 24 bytes" }
+            require(mac.size == 16) { "tag must be 16 bytes" }
             val pt = ByteArray(ct.size)
             val r = ls.sodium.crypto_aead_xchacha20poly1305_ietf_decrypt_detached(
                 pt, null,
@@ -257,7 +304,10 @@ object NativeKeyCustody {
                 aad, (aad?.size ?: 0).toLong(),
                 nonce, key
             )
-            if (r != 0) throw SecurityException("decryptWithHandle failed — integrity check")
+            if (r != 0) {
+                pt.fill(0)
+                throw SecurityException("decryptWithHandle failed — integrity check")
+            }
             pt
         }
 
@@ -275,7 +325,7 @@ object NativeKeyCustody {
 
     /** memzero + sodium_free (canary-checked) + invalidate. Subsequent ops on the handle throw. */
     fun closeVault(handle: String): Boolean {
-        val s = sessions.remove(handle) ?: return false
+        val s = lock.write { sessions.remove(handle) } ?: return false
         ls.sodium.sodium_mprotect_readwrite(s.keyPtr)
         ls.sodium.sodium_free(s.keyPtr) // zeroes the guarded region + verifies the canary
         return true

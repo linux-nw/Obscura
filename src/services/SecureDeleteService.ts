@@ -1,20 +1,58 @@
 /**
  * Secure Delete Service
- * Sicheres Löschen von Dateien durch überschreiben mit Mustern
+ * Überschreiben + Löschen von Vault-Dateien, vollständiger Wipe.
  *
- * Sicherheitsmerkmale:
- * - Guttman Wipe (7-Pass)
- * - DoD 5220.22-M (3-Pass)
- * - Quick Wipe (1-Pass)
- * - Secure deletion for all vault data
- *
- * WICHTIG: NUTZT AES-256-CBC statt XChaCha20
+ * WICHTIG: Auf Flash/F2FS (Android) schreibt ein Überschreiben in neue Blöcke (Wear-Leveling,
+ * Copy-on-Write) — Mehrfach-Pässe (DoD/Guttman) sind dort KEINE Garantie. Der verlässliche
+ * Schutz ist der Crypto-Shred: der Master-Key wird ZUERST vernichtet, die Blobs sind danach
+ * ohne Schlüssel wertlos. Die Überschreib-Pässe sind Defense-in-Depth.
  */
 
 import * as FileSystem from 'expo-file-system/legacy';
 import * as SecureStore from 'expo-secure-store';
 import { SecureCryptoService } from './CryptoService';
-import { HardwareBackedStorage } from './HardwareKeystoreService';
+import { BlobVersionService, isValidObjectId } from './BlobVersionService';
+
+const dev = typeof __DEV__ !== 'undefined' && __DEV__;
+const dbgErr = (...a: unknown[]) => { if (dev) console.error(...a); };
+
+/** Every SecureStore secret/state key that must not survive a full wipe. */
+export const ALL_SECURE_KEYS: readonly string[] = [
+  'filevault_encryption_key',
+  'filevault_pbkdf2_salt',
+  'filevault_argon2id_salt',
+  'filevault_kek_salt',
+  'filevault_kdf_meta',
+  'filevault_master_enc',
+  'filevault_master_iv',
+  'filevault_master_mac',
+  'filevault_bio_kek',
+  'filevault_pin_hash',
+  'filevault_pin_salt',
+  'filevault_pin_iv',
+  'filevault_pin_key',
+  'filevault_failed_attempts',
+  'filevault_lock_until',
+  'filevault_app_initialized',
+  'filevault_auth_attempts',
+  'filevault_keyrotation_wal',
+  'filevault_last_backup',
+  'filevault_panic_pin_hash',
+  'filevault_panic_pin_salt',
+  'filevault_panic_pin_algo',
+  'filevault_panic_settings',
+  'filevault_panic_failed_attempts',
+  'filevault_guest_pin_hash',
+  'filevault_guest_pin_salt',
+  'filevault_guest_pin_algo',
+  'filevault_guest_enabled',
+  'filevault_guest_created',
+  'filevault_guest_kdf_salt',
+  'filevault_guest_active',
+];
+
+// Overwrite work per pass is bounded; larger blobs rely on the crypto-shred.
+const MAX_OVERWRITE_BYTES = 32 * 1024 * 1024;
 
 export type SecureDeleteMethod = 'quick' | 'dod' | 'guttman';
 
@@ -28,6 +66,53 @@ export interface DeleteProgress {
 export class SecureDeleteService {
   private static readonly VAULT_DIR = (FileSystem.documentDirectory || '') + 'vault/';
   private static readonly NOTES_DIR = (FileSystem.documentDirectory || '') + 'notes/';
+  private static readonly GUEST_DIR = (FileSystem.documentDirectory || '') + 'guest/';
+  private static readonly BACKUP_DIR = (FileSystem.documentDirectory || '') + 'backups/';
+
+  private static passesFor(method: SecureDeleteMethod): number {
+    return method === 'guttman' ? 7 : method === 'dod' ? 3 : 1;
+  }
+
+  /**
+   * Überschreibt + löscht alle Einträge eines Verzeichnisses und das Verzeichnis selbst.
+   * Fehlendes Verzeichnis = nichts zu tun (kein Abbruch). Gibt die Anzahl nicht
+   * löschbarer Einträge zurück statt den Rest des Wipes abzubrechen.
+   */
+  private static async secureDeleteDir(dir: string, method: SecureDeleteMethod): Promise<number> {
+    let failures = 0;
+    const info = await FileSystem.getInfoAsync(dir);
+    if (!info.exists) return 0;
+    const entries = await FileSystem.readDirectoryAsync(dir);
+    for (const name of entries) {
+      try {
+        await this.secureDeleteFile(`${dir}${name}`, method);
+      } catch {
+        failures++;
+      }
+    }
+    await FileSystem.deleteAsync(dir, { idempotent: true });
+    return failures;
+  }
+
+  /** Sammelt gültige Objekt-IDs aus Meta-/Notiz-Dateien (für Blob-Version-Floors). */
+  private static async collectIds(dir: string, kind: 'vault' | 'notes'): Promise<string[]> {
+    const ids: string[] = [];
+    try {
+      for (const name of await FileSystem.readDirectoryAsync(dir)) {
+        const isTarget = kind === 'vault' ? name.endsWith('.meta.enc') : name.startsWith('note_') && !name.endsWith('.tmp');
+        if (!isTarget) continue;
+        try {
+          const id = JSON.parse(await FileSystem.readAsStringAsync(`${dir}${name}`)).id;
+          if (isValidObjectId(id)) ids.push(id);
+        } catch {
+          // unreadable → no id to clean
+        }
+      }
+    } catch {
+      // dir missing
+    }
+    return ids;
+  }
 
   /**
    * Sichert den Vault Ordner und löscht ihn sicher
@@ -36,22 +121,10 @@ export class SecureDeleteService {
     method: SecureDeleteMethod = 'guttman'
   ): Promise<void> {
     try {
-      console.log(`SecureDelete: Starting vault deletion with ${method} method`);
-
-      // Liste aller Dateien im Vault
-      const files = await FileSystem.readDirectoryAsync(this.VAULT_DIR);
-
-      for (const file of files) {
-        const filePath = `${this.VAULT_DIR}${file}`;
-        await this.secureDeleteFile(filePath, method);
-      }
-
-      // Vault Ordner löschen
-      await FileSystem.deleteAsync(this.VAULT_DIR, { idempotent: true });
-
-      console.log('SecureDelete: Vault deleted');
+      const failed = await this.secureDeleteDir(this.VAULT_DIR, method);
+      if (failed > 0) throw new Error(`${failed} Einträge nicht gelöscht`);
     } catch (error) {
-      console.error('SecureDelete: Vault deletion failed:', error);
+      dbgErr('SecureDelete: Vault deletion failed:', error);
       throw new Error('Tresor konnte nicht sicher gelöscht werden');
     }
   }
@@ -63,90 +136,55 @@ export class SecureDeleteService {
     method: SecureDeleteMethod = 'guttman'
   ): Promise<void> {
     try {
-      console.log(`SecureDelete: Starting notes deletion with ${method} method`);
-
-      const files = await FileSystem.readDirectoryAsync(this.NOTES_DIR);
-
-      for (const file of files) {
-        const filePath = `${this.NOTES_DIR}${file}`;
-        await this.secureDeleteFile(filePath, method);
-      }
-
-      // Notes Ordner löschen
-      await FileSystem.deleteAsync(this.NOTES_DIR, { idempotent: true });
-
-      console.log('SecureDelete: Notes deleted');
+      const failed = await this.secureDeleteDir(this.NOTES_DIR, method);
+      if (failed > 0) throw new Error(`${failed} Einträge nicht gelöscht`);
     } catch (error) {
-      console.error('SecureDelete: Notes deletion failed:', error);
+      dbgErr('SecureDelete: Notes deletion failed:', error);
       throw new Error('Notizen konnten nicht sicher gelöscht werden');
     }
   }
 
   /**
-   * Sichert eine einzelne Datei und löscht sie
+   * Überschreibt eine einzelne Datei und löscht sie. Ein fehlgeschlagenes Überschreiben
+   * verhindert das Löschen NICHT; schlägt das Löschen selbst fehl, wird geworfen.
    */
   private static async secureDeleteFile(
     filePath: string,
     method: SecureDeleteMethod
   ): Promise<void> {
-    try {
-      const fileInfo = await FileSystem.getInfoAsync(filePath);
-      if (!fileInfo.exists) return;
+    const fileInfo = await FileSystem.getInfoAsync(filePath);
+    if (!fileInfo.exists) return;
 
-      const fileSize = fileInfo.size;
-
-      // Verschiedene Überschreibungs-Muster basierend auf Methode
-      switch (method) {
-        case 'quick':
-          await this.overwriteWithPattern(filePath, 1, fileSize);
-          break;
-        case 'dod':
-          await this.overwriteWithPattern(filePath, 3, fileSize);
-          break;
-        case 'guttman':
-          await this.overwriteWithPattern(filePath, 7, fileSize);
-          break;
-      }
-
-      // Datei endgültig löschen
-      await FileSystem.deleteAsync(filePath, { idempotent: true });
-    } catch (error) {
-      console.error(`SecureDelete: Failed to delete ${filePath}:`, error);
+    if (!fileInfo.isDirectory) {
+      await this.overwriteWithPattern(filePath, this.passesFor(method), fileInfo.size ?? 0);
     }
+    await FileSystem.deleteAsync(filePath, { idempotent: true });
   }
 
   /**
-   * Überschreibt Datei mit Mustern
+   * Überschreibt Datei mit Mustern (best effort, siehe Datei-Header zu Flash).
+   * Liest den bisherigen Inhalt NICHT ein — nur die Größe zählt.
    */
   private static async overwriteWithPattern(
     filePath: string,
     passes: number,
     fileSize: number
   ): Promise<void> {
+    const size = Math.min(Math.max(0, Math.floor(fileSize)), MAX_OVERWRITE_BYTES);
+    if (size === 0) return;
     try {
-      // Lese Dateiinhalt
-      const content = await FileSystem.readAsStringAsync(filePath, {
-        encoding: FileSystem.EncodingType.Base64,
-      });
-
-      // Überschreiben mit Mustern
       for (let pass = 0; pass < passes; pass++) {
-        const pattern = this.getPatternForPass(pass);
-        const overwrittenContent = this.applyPattern(content, pattern, pass, passes);
-
-        // Schreibe überschriebene Daten zurück
-        await FileSystem.writeAsStringAsync(filePath, overwrittenContent, {
+        const byte = parseInt(this.getPatternForPass(pass), 16);
+        await FileSystem.writeAsStringAsync(filePath, this.bytesToBase64(new Uint8Array(size).fill(byte)), {
           encoding: FileSystem.EncodingType.Base64,
         });
       }
-
       // Letzte Überschreibung mit Zufallsdaten
-      const randomPattern = await this.generateRandomPattern(fileSize);
-      await FileSystem.writeAsStringAsync(filePath, randomPattern, {
+      await FileSystem.writeAsStringAsync(filePath, await this.generateRandomPattern(size), {
         encoding: FileSystem.EncodingType.Base64,
       });
     } catch (error) {
-      console.error('SecureDelete: Overwrite failed:', error);
+      dbgErr('SecureDelete: Overwrite failed:', error);
     }
   }
 
@@ -163,137 +201,98 @@ export class SecureDeleteService {
       '49', // More patterns
       'D6', // Final patterns
     ];
+    return pass < patterns.length ? patterns[pass] : '00';
+  }
 
-    if (pass < patterns.length) {
-      return patterns[pass];
+  private static bytesToBase64(bytes: Uint8Array): string {
+    // Chunked: per-byte string concatenation is O(n^2) on Hermes.
+    const parts: string[] = [];
+    for (let i = 0; i < bytes.length; i += 8192) {
+      parts.push(String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + 8192))));
     }
-
-    // Für mehr als 7 Passes: Zufallsmuster
-    // Fallback: festes Muster für Sync-Aufrufe (sollte nicht vorkommen)
-    return '00';
+    return btoa(parts.join(''));
   }
 
   /**
-   * Wendet Muster auf Content an
-   * XORt den Base64-decodierten Content mit dem Pattern
-   */
-  private static applyPattern(
-    base64Content: string,
-    pattern: string,
-    pass: number,
-    totalPasses: number
-  ): string {
-    try {
-      // Decodiere Base64 zu Uint8Array
-      const decoded = atob(base64Content);
-      const bytes = new Uint8Array(decoded.length);
-      for (let i = 0; i < decoded.length; i++) {
-        bytes[i] = decoded.charCodeAt(i);
-      }
-
-      // Erstelle Pattern-Bytes (hex zu bytes)
-      const patternBytes = new Uint8Array(pattern.length / 2);
-      for (let i = 0; i < pattern.length; i += 2) {
-        patternBytes[i / 2] = parseInt(pattern.substr(i, 2), 16);
-      }
-
-      // Overwrite every byte with the pattern value (not XOR — XOR with 0x00 is a no-op)
-      const result = new Uint8Array(bytes.length);
-      for (let i = 0; i < bytes.length; i++) {
-        result[i] = patternBytes[i % patternBytes.length];
-      }
-
-      // Recodiere zu Base64
-      let binary = '';
-      for (let i = 0; i < result.length; i++) {
-        binary += String.fromCharCode(result[i]);
-      }
-      return btoa(binary);
-    } catch (error) {
-      // Rethrow so caller knows the overwrite pass failed rather than silently writing back original
-      throw new Error(`SecureDelete: applyPattern failed: ${error}`);
-    }
-  }
-
-  /**
-   * Generiert zufälliges Pattern
-   * Verwendet SecureCryptoService.generateSecureBytes für echtes Zufalls-Random
+   * Zufalls-Pass. expo-crypto liefert nur kleine Blöcke pro Bridge-Call (siehe Decoy-L6-Notiz);
+   * daher: 16 CSPRNG-Bytes als Seed → xoshiro128** Expansion. Für ein Überschreib-Pattern
+   * genügt das; ein fehlgeschlagener CSPRNG-Aufruf fällt NICHT stumm auf Nullen zurück.
    */
   private static async generateRandomPattern(size: number): Promise<string> {
-    try {
-      const randomBytes = await SecureCryptoService.generateSecureBytes(size);
-      const bytes = new Uint8Array(randomBytes);
-      // writeAsStringAsync with EncodingType.Base64 expects base64 input
-      let binary = '';
-      for (let i = 0; i < bytes.length; i++) {
-        binary += String.fromCharCode(bytes[i]);
-      }
-      return btoa(binary);
-    } catch (error) {
-      console.error('SecureDelete: generateRandomPattern failed:', error);
-      // Fallback: write zero bytes as base64
-      const zeros = new Uint8Array(size);
-      let binary = '';
-      for (let i = 0; i < zeros.length; i++) {
-        binary += String.fromCharCode(zeros[i]);
-      }
-      return btoa(binary);
+    const seed = new Uint32Array(new Uint8Array(await SecureCryptoService.generateSecureBytes(16)).buffer.slice(0, 16));
+    if (!(seed[0] | seed[1] | seed[2] | seed[3])) seed[0] = 1;
+    const out = new Uint8Array(size);
+    let [a, b, c, d] = [seed[0], seed[1], seed[2], seed[3]];
+    const rotl = (x: number, k: number) => ((x << k) | (x >>> (32 - k))) >>> 0;
+    for (let i = 0; i < size; i += 4) {
+      const r = Math.imul(rotl(Math.imul(b, 5) >>> 0, 7), 9) >>> 0;
+      const t = (b << 9) >>> 0;
+      c ^= a; d ^= b; b ^= c; a ^= d; c ^= t; d = rotl(d, 11);
+      a >>>= 0; b >>>= 0; c >>>= 0; d >>>= 0;
+      out[i] = r;
+      if (i + 1 < size) out[i + 1] = r >>> 8;
+      if (i + 2 < size) out[i + 2] = r >>> 16;
+      if (i + 3 < size) out[i + 3] = r >>> 24;
     }
+    return this.bytesToBase64(out);
   }
 
   /**
-   * Sichert alle Daten im Vault
+   * Vollständiger Wipe. Reihenfolge: (1) Crypto-Shred der Schlüssel, (2) alle SecureStore-
+   * Einträge, (3) Vault/Notizen/Guest/Backups/Cache-Temps. Jeder Schritt läuft unabhängig:
+   * ein Fehler bricht den Rest NICHT ab; am Ende wird aggregiert geworfen.
    */
   static async secureWipeAll(): Promise<void> {
-    // List of all keys to verify deletion
-    const keysToVerify = [
-      'filevault_encryption_key',
-      'filevault_pbkdf2_salt',
-      'filevault_argon2id_salt',
-      'filevault_kek_salt',
-      'filevault_master_enc',
-      'filevault_master_iv',
-      'filevault_master_mac',
-      'filevault_bio_kek',
-      'filevault_pin_hash',
-      'filevault_pin_salt',
-      'filevault_pin_iv',
-      'filevault_pin_key',
-      'filevault_failed_attempts',
-      'filevault_lock_until',
-      'filevault_app_initialized',
+    const errors: unknown[] = [];
+    const step = async (fn: () => Promise<unknown>) => {
+      try { await fn(); } catch (e) { errors.push(e); }
+    };
+
+    // Blob-Version-Floors brauchen die IDs → vor dem Löschen der Meta-Dateien einsammeln.
+    const ids = [
+      ...(await this.collectIds(this.VAULT_DIR, 'vault')),
+      ...(await this.collectIds(this.NOTES_DIR, 'notes')),
     ];
 
-    try {
-      console.log('SecureDelete: Starting full secure wipe...');
+    await step(() => SecureCryptoService.deleteEncryptionKey());
+    await step(() => SecureCryptoService.deletePinData());
+    for (const key of ALL_SECURE_KEYS) {
+      await step(() => SecureStore.deleteItemAsync(key));
+    }
+    for (const id of ids) await step(() => BlobVersionService.remove(id));
 
-      // Zuerst Crypto Schlüssel löschen
-      await SecureCryptoService.deleteEncryptionKey();
-
-      // Vault löschen
-      await this.secureDeleteVault();
-
-      // Notizen löschen
-      await this.secureDeleteNotes();
-
-      // Read-back Verification: Prüfe jedes gelöschte Item
-      console.log('SecureDelete: Starting read-back verification...');
-      for (const key of keysToVerify) {
-        const stillExists = await HardwareBackedStorage.exists(key);
-        if (stillExists) {
-          // Prüfe SecureStore direkt
-          const secureStoreValue = await SecureStore.getItemAsync(key);
-          if (secureStoreValue !== null) {
-            throw new Error(`secureWipeAll: Key still exists after deletion: ${key}`);
-          }
-        }
-        console.log(`SecureDelete: Verified deletion of ${key}`);
+    await step(() => this.secureDeleteVault());
+    await step(() => this.secureDeleteNotes());
+    await step(async () => {
+      const failed = await this.secureDeleteDir(this.GUEST_DIR, 'quick');
+      if (failed > 0) throw new Error('guest');
+    });
+    await step(async () => {
+      const failed = await this.secureDeleteDir(this.BACKUP_DIR, 'quick');
+      if (failed > 0) throw new Error('backups');
+    });
+    await step(async () => {
+      const cache = FileSystem.cacheDirectory || '';
+      if (!cache) return;
+      for (const name of await FileSystem.readDirectoryAsync(cache)) {
+        if (name.startsWith('vault_view_')) await this.secureDeleteFile(`${cache}${name}`, 'quick');
       }
+    });
 
-      console.log('SecureDelete: Full secure wipe complete (AES-256)');
-    } catch (error) {
-      console.error('SecureDelete: Full wipe failed:', error);
-      throw error;
+    // Read-back-Verifikation direkt auf SecureStore (kein Cache dazwischen).
+    for (const key of ALL_SECURE_KEYS) {
+      try {
+        if ((await SecureStore.getItemAsync(key)) !== null) {
+          errors.push(new Error(`secureWipeAll: Key still exists after deletion: ${key}`));
+        }
+      } catch (e) {
+        errors.push(e);
+      }
+    }
+
+    if (errors.length > 0) {
+      dbgErr('SecureDelete: Full wipe incomplete:', errors.length);
+      throw new Error('Wipe unvollständig');
     }
   }
 
@@ -301,22 +300,15 @@ export class SecureDeleteService {
    * Sichert und löscht eine einzelne Datei
    */
   static async secureDeleteFileById(fileId: string): Promise<void> {
+    if (!isValidObjectId(fileId)) throw new Error('Ungültige Datei-ID');
     try {
       const filePath = `${this.VAULT_DIR}file_${fileId}`;
-      const metaPath = `${filePath}.meta.enc`;
-
-      // Datei sicher löschen
+      // Meta zuerst: ein Abbruch hinterlässt höchstens verwaisten Ciphertext, keinen Listeneintrag.
+      await this.secureDeleteFile(`${filePath}.meta.enc`, 'guttman');
       await this.secureDeleteFile(filePath, 'guttman');
-
-      // Meta-Datei sicher löschen
-      const metaInfo = await FileSystem.getInfoAsync(metaPath);
-      if (metaInfo.exists) {
-        await this.secureDeleteFile(metaPath, 'guttman');
-      }
-
-      console.log(`SecureDelete: File ${fileId} deleted`);
+      await BlobVersionService.remove(fileId);
     } catch (error) {
-      console.error(`SecureDelete: Failed to delete file ${fileId}:`, error);
+      dbgErr(`SecureDelete: Failed to delete file:`, error);
       throw new Error('Datei konnte nicht sicher gelöscht werden');
     }
   }
@@ -337,7 +329,7 @@ export class SecureDeleteService {
    * Gibt die ungefähre Zeit für Secure Delete an
    */
   static getEstimatedDeleteTime(fileSize: number, method: SecureDeleteMethod): string {
-    const passes = method === 'guttman' ? 7 : method === 'dod' ? 3 : 1;
+    const passes = this.passesFor(method);
 
     // Geschätzt: 100KB/s pro Pass
     const estimatedSeconds = (fileSize / 100000) * passes;

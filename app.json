@@ -17,7 +17,8 @@
         "expo-image-picker",
         {
           "photosPermission": "Die App benötigt Zugriff auf Ihre Fotos, um Dateien in den Tresor zu importieren.",
-          "cameraPermission": "Die App benötigt Kamerazugriff, um Fotos aufzunehmen und im Tresor zu speichern."
+          "cameraPermission": "Die App benötigt Kamerazugriff, um Fotos aufzunehmen und im Tresor zu speichern.",
+          "microphonePermission": false
         }
       ],
       [
@@ -41,13 +42,18 @@
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
       "permissions": [
-        "READ_EXTERNAL_STORAGE",
-        "WRITE_EXTERNAL_STORAGE",
-        "CAMERA",
         "USE_BIOMETRIC",
         "USE_FINGERPRINT"
       ],
-      "package": "com.filevault.app"
+      "package": "com.filevault.app",
+      "blockedPermissions": [
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.SYSTEM_ALERT_WINDOW",
+        "android.permission.CAMERA"
+      ],
+      "allowBackup": false
     },
     "web": {
       "favicon": "./assets/favicon.png"

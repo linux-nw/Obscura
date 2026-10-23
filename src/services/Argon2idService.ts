@@ -30,6 +30,9 @@ export interface Argon2Params {
 
 export type Argon2Type = 0 | 1 | 2; // 0=Argon2d, 1=Argon2i, 2=Argon2id
 
+const MIN_NATIVE_MEMORY_KB = 19456;
+const MIN_NATIVE_ITERATIONS = 2;
+
 // ─────────────────────────────── Standard Parameter ───────────────────────────────
 
 export const DEFAULT_ARGON2_PARAMS: Argon2Params = {
@@ -71,6 +74,11 @@ export class Argon2idService {
     salt: ArrayBuffer,
     params: Argon2Params = DEFAULT_ARGON2_PARAMS
   ): Promise<ArrayBuffer> {
+    this.assertParams(params);
+    if (!(salt instanceof ArrayBuffer) || salt.byteLength < 16 || salt.byteLength > 64) {
+      throw new Error('Argon2id: salt must be 16..64 bytes');
+    }
+    password = password.normalize('NFC');
     // Prüfe auf native Module
     const nativeAvailable = (global as any).__argon2_native_available;
     if (nativeAvailable) {
@@ -113,27 +121,6 @@ export class Argon2idService {
   }
 
   /**
-   * Verifiziert eine Passphrase gegen einen gespeicherten Hash
-   * @param password Die Passphrase zur Verifizierung
-   * @param hash Der gespeicherte Hash
-   * @param params Argon2 Parameter
-   * @returns true wenn die Passphrase korrekt ist
-   */
-  static async verify(
-    password: string,
-    hash: ArrayBuffer,
-    params: Argon2Params = DEFAULT_ARGON2_PARAMS
-  ): Promise<boolean> {
-    try {
-      const derivedKey = await this.deriveKey(password, hash, params);
-      return this.constantTimeEquals(derivedKey, hash);
-    } catch (error) {
-      console.error('Argon2id verification error:', error);
-      return false;
-    }
-  }
-
-  /**
    * Generiert ein kryptographisch sicheres Salt
    * @param length Länge des Salt in Bytes (16-64 empfohlen)
    * @returns Das generierte Salt als ArrayBuffer
@@ -148,21 +135,15 @@ export class Argon2idService {
     }
   }
 
-  /**
-   * Konstantzeit-Vergleich zweier Buffer (gegen Timing-Attacks)
-   */
-  private static constantTimeEquals(a: ArrayBuffer, b: ArrayBuffer): boolean {
-    if (a.byteLength !== b.byteLength) return false;
-
-    const aBytes = new Uint8Array(a);
-    const bBytes = new Uint8Array(b);
-    let result = 0;
-
-    for (let i = 0; i < aBytes.length; i++) {
-      result |= aBytes[i] ^ bBytes[i];
-    }
-
-    return result === 0;
+  private static assertParams(params: Argon2Params): void {
+    const ok =
+      params &&
+      params.type === 2 &&
+      params.version === 0x13 &&
+      Number.isInteger(params.memoryKB) && params.memoryKB >= 8 && params.memoryKB <= 1048576 &&
+      Number.isInteger(params.iterations) && params.iterations >= 1 && params.iterations <= 64 &&
+      Number.isInteger(params.hashLength) && params.hashLength >= 16 && params.hashLength <= 64;
+    if (!ok) throw new Error('Argon2id: invalid parameters');
   }
 
   // ─────────────────────────────── Native Module Helper ───────────────────────────────
@@ -180,6 +161,9 @@ export class Argon2idService {
     if (!NativeModules.RNFileVault) {
       throw new Error('Native Argon2 Module nicht verfügbar');
     }
+    if (params.memoryKB < MIN_NATIVE_MEMORY_KB || params.iterations < MIN_NATIVE_ITERATIONS) {
+      throw new Error('Argon2id: parameters below the minimum cost floor');
+    }
 
     try {
       // Konvertiere ArrayBuffer zu Base64 für native API
@@ -193,7 +177,9 @@ export class Argon2idService {
         params.hashLength
       );
       console.log(`[KDF] native Argon2id ran (libsodium crypto_pwhash, ${params.memoryKB}KB/${params.iterations}it) in ${Date.now() - t0}ms`);
-      return this.base64ToBuffer(hash);
+      const out = this.base64ToBuffer(hash);
+      if (out.byteLength !== params.hashLength) throw new Error('unexpected derived key length');
+      return out;
     } catch (error) {
       console.error('Native Argon2id failed:', error);
       throw new Error('Native Argon2 Module fehlgeschlagen - ' + (error instanceof Error ? error.message : 'unknown error'));
@@ -225,6 +211,9 @@ export class Argon2idService {
   ): Promise<ArrayBuffer> {
     // Wenn iterationCount angegeben ist, nutze PBKDF2 für Kompatibilität
     if (iterationCount !== undefined) {
+      if (!Number.isInteger(iterationCount) || iterationCount < 1000 || iterationCount > 10_000_000) {
+        throw new Error('PBKDF2: invalid iteration count');
+      }
       // Import CryptoJS dynamisch
       const CryptoJS = require('crypto-js');
       const saltHex = this.bufferToHex(salt);

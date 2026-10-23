@@ -17,10 +17,17 @@ class RNFileVaultModule(reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
 
     private val ls: LazySodiumAndroid by lazy {
-        LazySodiumAndroid(SodiumAndroid())
+        LazySodiumAndroid(SodiumAndroid()).also { it.sodium.sodium_init() }
     }
 
     override fun getName() = "RNFileVault"
+
+    private companion object {
+        const val MIN_ARGON2_ITERATIONS = 2
+        const val MAX_ARGON2_ITERATIONS = 64
+        const val MIN_ARGON2_MEMORY_KB = 19456
+        const val MAX_ARGON2_MEMORY_KB = 1048576
+    }
 
     // ─── XChaCha20-Poly1305 IETF Verschlüsselung ─────────────────────────────
 
@@ -35,28 +42,33 @@ class RNFileVaultModule(reactContext: ReactApplicationContext) :
             val ad: ByteArray? = if (aadHex.isNullOrEmpty()) null else hexToBytes(aadHex)
             val adLen: Long = ad?.size?.toLong() ?: 0L
 
-            val plainText = Base64.decode(dataB64, Base64.DEFAULT)
             val key   = hexToBytes(keyHex)   // 32 bytes
-            val nonce = hexToBytes(nonceHex) // 24 bytes
+            var plainText: ByteArray? = null
+            var cipherText = ByteArray(0)
+            val mac = ByteArray(16) // XCHACHA20POLY1305_IETF_ABYTES = 16
+            var rc = -1
+            try {
+                val nonce = hexToBytes(nonceHex) // 24 bytes
+                if (key.size != 32) throw IllegalArgumentException("Key must be 32 bytes (got ${key.size})")
+                if (nonce.size != 24) throw IllegalArgumentException("Nonce must be 24 bytes (got ${nonce.size})")
+                val pt = Base64.decode(dataB64, Base64.DEFAULT)
+                plainText = pt
+                cipherText = ByteArray(pt.size)
+                val macLen = LongArray(1)
 
-            if (key.size != 32) throw IllegalArgumentException("Key must be 32 bytes (got ${key.size})")
-            if (nonce.size != 24) throw IllegalArgumentException("Nonce must be 24 bytes (got ${nonce.size})")
-
-            val cipherText = ByteArray(plainText.size)
-            val mac        = ByteArray(16) // XCHACHA20POLY1305_IETF_ABYTES = 16
-            val macLen     = LongArray(1)
-
-            val rc = ls.sodium.crypto_aead_xchacha20poly1305_ietf_encrypt_detached(
-                cipherText, mac, macLen,
-                plainText, plainText.size.toLong(),
-                ad, adLen,
-                null,
-                nonce, key
-            )
-            // Layer 3: zero secret inputs (key + plaintext) in the JVM heap immediately
-            // after the op so they do not linger until GC. cipherText/mac are outputs.
-            key.fill(0)
-            plainText.fill(0)
+                rc = ls.sodium.crypto_aead_xchacha20poly1305_ietf_encrypt_detached(
+                    cipherText, mac, macLen,
+                    pt, pt.size.toLong(),
+                    ad, adLen,
+                    null,
+                    nonce, key
+                )
+            } finally {
+                // Layer 3: zero secret inputs (key + plaintext) in the JVM heap immediately
+                // after the op so they do not linger until GC. cipherText/mac are outputs.
+                key.fill(0)
+                plainText?.fill(0)
+            }
             if (rc != 0) {
                 promise.reject("ENCRYPT_ERROR", "XChaCha20-Poly1305 encryption failed (rc=$rc)")
                 return
@@ -67,7 +79,7 @@ class RNFileVaultModule(reactContext: ReactApplicationContext) :
             result.putString("tag", bytesToHex(mac))
             promise.resolve(result)
         } catch (e: Exception) {
-            promise.reject("ENCRYPT_ERROR", e.message, e)
+            promise.reject("ENCRYPT_ERROR", e.message ?: "encryption failed")
         }
     }
 
@@ -85,28 +97,34 @@ class RNFileVaultModule(reactContext: ReactApplicationContext) :
             val ad: ByteArray? = if (aadHex.isNullOrEmpty()) null else hexToBytes(aadHex)
             val adLen: Long = ad?.size?.toLong() ?: 0L
 
-            val cipherText = hexToBytes(encHex)
-            val nonce      = hexToBytes(nonceHex) // 24 bytes
-            val mac        = hexToBytes(tagHex)   // 16 bytes
             val key        = hexToBytes(keyHex)   // 32 bytes
+            var plainText = ByteArray(0)
+            var rc = -1
+            try {
+                val cipherText = hexToBytes(encHex)
+                val nonce      = hexToBytes(nonceHex) // 24 bytes
+                val mac        = hexToBytes(tagHex)   // 16 bytes
 
-            if (key.size != 32) throw IllegalArgumentException("Key must be 32 bytes")
-            if (nonce.size != 24) throw IllegalArgumentException("Nonce must be 24 bytes")
-            if (mac.size != 16) throw IllegalArgumentException("MAC must be 16 bytes")
+                if (key.size != 32) throw IllegalArgumentException("Key must be 32 bytes")
+                if (nonce.size != 24) throw IllegalArgumentException("Nonce must be 24 bytes")
+                if (mac.size != 16) throw IllegalArgumentException("MAC must be 16 bytes")
 
-            val plainText = ByteArray(cipherText.size)
+                plainText = ByteArray(cipherText.size)
 
-            val rc = ls.sodium.crypto_aead_xchacha20poly1305_ietf_decrypt_detached(
-                plainText, null,
-                cipherText, cipherText.size.toLong(),
-                mac,
-                ad, adLen,
-                nonce, key
-            )
-            // Layer 3: key is consumed — zero it immediately (input).
-            key.fill(0)
+                rc = ls.sodium.crypto_aead_xchacha20poly1305_ietf_decrypt_detached(
+                    plainText, null,
+                    cipherText, cipherText.size.toLong(),
+                    mac,
+                    ad, adLen,
+                    nonce, key
+                )
+            } finally {
+                // Layer 3: key is consumed — zero it immediately (input).
+                key.fill(0)
+            }
             if (rc != 0) {
                 // rc != 0 means authentication tag mismatch — reject without detail to avoid oracle
+                plainText.fill(0)
                 promise.reject("DECRYPT_ERROR", "XChaCha20-Poly1305 decryption failed — integrity check failed")
                 return
             }
@@ -116,7 +134,7 @@ class RNFileVaultModule(reactContext: ReactApplicationContext) :
             plainText.fill(0)
             promise.resolve(out)
         } catch (e: Exception) {
-            promise.reject("DECRYPT_ERROR", e.message, e)
+            promise.reject("DECRYPT_ERROR", "XChaCha20-Poly1305 decryption failed")
         }
     }
 
@@ -131,6 +149,13 @@ class RNFileVaultModule(reactContext: ReactApplicationContext) :
             val memoryKB   = if (params.hasKey("memory"))     params.getInt("memory")     else 65536
             val keyLen     = if (params.hasKey("keyLen"))     params.getInt("keyLen")     else 32
 
+            if (iterations < MIN_ARGON2_ITERATIONS || iterations > MAX_ARGON2_ITERATIONS)
+                throw IllegalArgumentException("Argon2id iterations out of range")
+            if (memoryKB < MIN_ARGON2_MEMORY_KB || memoryKB > MAX_ARGON2_MEMORY_KB)
+                throw IllegalArgumentException("Argon2id memory out of range")
+            if (keyLen < 16 || keyLen > 64)
+                throw IllegalArgumentException("Argon2id keyLen out of range")
+
             // R-03 / W-04: NFC-normalise here so every client (incl. non-JS callers)
             // derives the same key for NFD vs. NFC representations of the same string.
             val password = java.text.Normalizer.normalize(passwordRaw, java.text.Normalizer.Form.NFC)
@@ -139,25 +164,28 @@ class RNFileVaultModule(reactContext: ReactApplicationContext) :
             // now also feeds Argon2id the raw 16 bytes (not the Base64 string), so both
             // paths derive byte-identical keys for the same password+salt.
             val salt          = Base64.decode(saltB64, Base64.DEFAULT)
+            if (salt.size != 16) throw IllegalArgumentException("Argon2id salt must be exactly 16 bytes (got ${salt.size})")
             val passwordBytes = password.toByteArray(Charsets.UTF_8)
             val derivedKey    = ByteArray(keyLen)
-
-            if (salt.size != 16) throw IllegalArgumentException("Argon2id salt must be exactly 16 bytes (got ${salt.size})")
 
             // crypto_pwhash: 0 = success, -1 = failure. ALG_ARGON2ID13 = 2.
             // NOTE: libsodium crypto_pwhash hardcodes parallelism (lanes) = 1 — no lanes
             // argument exists. The JS side therefore also pins p=1 (C1).
-            val rc = ls.sodium.crypto_pwhash(
-                derivedKey, derivedKey.size.toLong(),
-                passwordBytes, passwordBytes.size.toLong(),
-                salt,
-                iterations.toLong(),
-                NativeLong(memoryKB.toLong() * 1024L), // memlimit in bytes
-                2 // crypto_pwhash_ALG_ARGON2ID13
-            )
-            // Layer 3: the passphrase bytes are consumed — zero them immediately.
-            passwordBytes.fill(0)
+            val rc = try {
+                ls.sodium.crypto_pwhash(
+                    derivedKey, derivedKey.size.toLong(),
+                    passwordBytes, passwordBytes.size.toLong(),
+                    salt,
+                    iterations.toLong(),
+                    NativeLong(memoryKB.toLong() * 1024L), // memlimit in bytes
+                    2 // crypto_pwhash_ALG_ARGON2ID13
+                )
+            } finally {
+                // Layer 3: the passphrase bytes are consumed — zero them immediately.
+                passwordBytes.fill(0)
+            }
             if (rc != 0) {
+                derivedKey.fill(0)
                 promise.reject("ARGON2_ERROR", "Argon2id key derivation failed (rc=$rc, memory=${memoryKB}KB)")
                 return
             }
@@ -207,6 +235,7 @@ class RNFileVaultModule(reactContext: ReactApplicationContext) :
     fun generateRandomBytes(params: ReadableMap, promise: Promise) {
         try {
             val length = if (params.hasKey("length")) params.getInt("length") else 32
+            if (length < 1 || length > 1024) throw IllegalArgumentException("length must be 1..1024")
             val bytes  = ByteArray(length)
             ls.sodium.randombytes_buf(bytes, length)
             promise.resolve(Base64.encodeToString(bytes, Base64.NO_WRAP))
@@ -217,13 +246,7 @@ class RNFileVaultModule(reactContext: ReactApplicationContext) :
 
     // ─── Hilfsmethoden ────────────────────────────────────────────────────────
 
-    private fun hexToBytes(hex: String): ByteArray {
-        val len = hex.length
-        require(len % 2 == 0) { "Hex string must have even length" }
-        return ByteArray(len / 2) { i ->
-            hex.substring(i * 2, i * 2 + 2).toInt(16).toByte()
-        }
-    }
+    private fun hexToBytes(hex: String): ByteArray = NativeKeyCustodyCrypto.fromHex(hex)
 
     private fun bytesToHex(bytes: ByteArray): String =
         bytes.joinToString("") { "%02x".format(it) }
