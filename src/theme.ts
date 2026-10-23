@@ -24,7 +24,7 @@ export function useBottomInset(): number {
 }
 
 /**
- * OBSCURA — "Optical Instrument" design tokens (ported from obscura/theme.css).
+ * OBSCURA — "Optical Instrument" design tokens (ported from design/web-prototype/obscura/theme.css).
  * Matte near-black body, a single amber signal, red only for destructive actions.
  *
  * NOTE: the historic `c.*` keys are preserved (lots of screens import them) but

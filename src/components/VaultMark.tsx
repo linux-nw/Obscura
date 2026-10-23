@@ -5,7 +5,7 @@ import { c } from '../theme';
 
 /**
  * Obscura brand mark — an aperture / iris diaphragm with a keyhole.
- * Ported from obscura/components.jsx (VaultMark). 48×48 viewBox.
+ * Ported from design/web-prototype/obscura/components.jsx (VaultMark). 48×48 viewBox.
  */
 interface Props {
   size?: number;

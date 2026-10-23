@@ -2,7 +2,7 @@ import React from 'react';
 import Svg, { Path, Circle, Rect } from 'react-native-svg';
 
 /**
- * Obscura icon set — ported from obscura/icons.jsx (Lucide-style, 24×24 viewBox,
+ * Obscura icon set — ported from design/web-prototype/obscura/icons.jsx (Lucide-style, 24×24 viewBox,
  * currentColor stroke). Compact encoding: parts split on '|'; a part starting with
  * '@circle'/'@rect' renders that primitive, otherwise it is a path `d`.
  */

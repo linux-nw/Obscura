@@ -48,9 +48,10 @@ Obscura/
 ├── index.ts              Expo entry point + performance polyfill
 ├── app.json              Expo config (Android/iOS permissions, metadata)
 ├── package.json          Dependencies + test/build scripts
-├── CRYPTO_PROTOCOL_SPEC.md   70 KB detailed cryptographic protocol specification
-├── FINAL_REPORT_ROUND3.md    Production-readiness audit; lists 8 new files, 12 fixes, 0 TS errors
-├── L3_CUSTODY_AUDIT.md       Map of raw key locations in memory; phase 0 for hardware backing
+├── assets/               App icons (generated from assets/branding/icon.svg), fonts
+├── docs/                 Specification, audits and reports (see docs/README.md)
+├── design/               Web design prototype and sketches (not part of the app build)
+├── scripts/ tools/       Build patches and native parity harness
 └── .github/workflows/    CI for Android KAT verification + lint
 ```
 
@@ -262,7 +263,7 @@ On vault wipe, the app:
 - ✅ **12/12 tests green** (no platform-specific issues)
 - ✅ **Critical bug fixed:** Prefix-strip bug (all data was unreadable until Round 3 fix)
 - ✅ **5 security bugs fixed:** Panic PIN timing, backup KDF, WAL handling, NFC normalization, unauthenticated prefix
-- ⚠️ **5 known weaknesses** (all Medium/Low/Info severity, documented in `CRYPTO_PROTOCOL_SPEC.md` §10):
+- ⚠️ **5 known weaknesses** (all Medium/Low/Info severity, documented in `docs/CRYPTO_PROTOCOL_SPEC.md` §10):
   - W-01: AES fallback MAC key derivation (fixed; separate key via HKDF)
   - W-02: Panic PIN PBKDF2 rounds (fixed; now Argon2id)
   - W-03: Backend byte unauthenticated (fixed; now AEAD AAD)
@@ -271,9 +272,9 @@ On vault wipe, the app:
 
 ### Audit & Verification
 
-- **FINAL_REPORT_ROUND3.md:** Complete accountability report (Phase 1 reality audit, Phase 2 fixes applied, Phase 3 quality gates)
-- **CRYPTO_PROTOCOL_SPEC.md:** 70 KB detailed cryptographic specification (threat model, primitives, wire formats, test coverage, known weaknesses)
-- **L3_CUSTODY_AUDIT.md:** Map of every point where the raw master key materialises in the JS heap; roadmap for Phase 1 hardware key custody
+- **docs/reports/FINAL_REPORT_ROUND3.md:** Complete accountability report (Phase 1 reality audit, Phase 2 fixes applied, Phase 3 quality gates)
+- **docs/CRYPTO_PROTOCOL_SPEC.md:** 70 KB detailed cryptographic specification (threat model, primitives, wire formats, test coverage, known weaknesses)
+- **docs/L3_CUSTODY_AUDIT.md:** Map of every point where the raw master key materialises in the JS heap; roadmap for Phase 1 hardware key custody
 
 ---
 
@@ -292,12 +293,12 @@ On vault wipe, the app:
   Yes—the backup format is platform-agnostic JSON. Restore is just a decryption + re-import step, so the content is re-encrypted under the current vault's master key on the target device.
 
 - **"What if someone roots/jailbreaks my device?"**  
-  Hardware-backed key storage (Android Keystore, iOS Keychain) makes it harder, but not impossible, for an attacker to extract keys from a rooted device. The 64 MiB Argon2id KDF also makes brute-force expensive. See `L3_CUSTODY_AUDIT.md` for the roadmap to move the raw master key out of the JS heap entirely.
+  Hardware-backed key storage (Android Keystore, iOS Keychain) makes it harder, but not impossible, for an attacker to extract keys from a rooted device. The 64 MiB Argon2id KDF also makes brute-force expensive. See `docs/L3_CUSTODY_AUDIT.md` for the roadmap to move the raw master key out of the JS heap entirely.
 
 ---
 
 ## License & Citation
 
-This project implements cryptographic protocols. For academic/commercial use, please refer to `CRYPTO_PROTOCOL_SPEC.md` for the formal specification and verify the implementation against the documented invariants.
+This project implements cryptographic protocols. For academic/commercial use, please refer to `docs/CRYPTO_PROTOCOL_SPEC.md` for the formal specification and verify the implementation against the documented invariants.
 
 **Status:** Production-ready after Round 3 security fixes. Ready for independent cryptographic audit before wide release.
