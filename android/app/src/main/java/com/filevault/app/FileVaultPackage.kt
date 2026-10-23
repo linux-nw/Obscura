@@ -12,7 +12,6 @@ class FileVaultPackage : ReactPackage {
         listOf(
             RNFileVaultModule(reactContext),
             NativeKeyCustodyModule(reactContext),
-            Argon2Module(reactContext),
             HardwareKeystoreModule(reactContext),
             DeviceSecurityModule(reactContext),
             IntegrityModule(reactContext),
