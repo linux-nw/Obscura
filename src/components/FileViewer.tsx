@@ -1,11 +1,12 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  View, Text, Image, ScrollView, StyleSheet, Modal,
+  View, Text, Image, ScrollView, StyleSheet,
   ActivityIndicator, TouchableOpacity, Dimensions,
 } from 'react-native';
 import { FileManager, FileMetadata } from '../services/FileManager';
 import { DecoyVaultService } from '../services/DecoyVaultService';
 import Icon from './Icon';
+import SecureModal from './SecureModal';
 import { c, rs, font, radius } from '../theme';
 
 // expo-video / expo-sharing sind native Module. Sie werden LAZY geladen, damit die
@@ -193,7 +194,7 @@ export default function FileViewer({ file, isDecoy = false, onClose }: Props) {
   const ext  = extOf(file.originalName);
 
   return (
-    <Modal visible transparent animationType="fade" onRequestClose={handleClose}>
+    <SecureModal visible onRequestClose={handleClose}>
       <View style={s.root}>
         {/* Header */}
         <View style={s.header}>
@@ -264,7 +265,7 @@ export default function FileViewer({ file, isDecoy = false, onClose }: Props) {
           )}
         </View>
       </View>
-    </Modal>
+    </SecureModal>
   );
 }
 

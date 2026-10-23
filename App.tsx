@@ -46,6 +46,7 @@ import { DeviceSecurityService } from './src/services/DeviceSecurityService';
 import { ScreenProtectionService } from './src/services/ScreenProtectionService';
 import { AutoLockService } from './src/services/AutoLockService';
 import { PanicService } from './src/services/PanicService';
+import { SecureDeleteService } from './src/services/SecureDeleteService';
 import { DecoyVaultService } from './src/services/DecoyVaultService';
 import { BackupService } from './src/services/BackupService';
 import { KeyRotationService } from './src/services/KeyRotationService';
@@ -310,6 +311,7 @@ export default function App() {
     await attempt(() => SecureStore.deleteItemAsync('filevault_auth_attempts'));
     await attempt(() => SecureStore.deleteItemAsync('filevault_guest_active'));
     await attempt(() => FileManager.cleanupViewTemps());
+    await attempt(() => SecureDeleteService.secureWipeAll());
     await CryptoService.setAppInitialized(false);
 
     setIsDecoy(false);
