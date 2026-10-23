@@ -29,7 +29,12 @@ const ALLOWED_TIMEOUTS = [-1, 0, 15, 30, 60, 300, 600, 900, 1800];
 
 /** Clamp every field to a known-good value so a tampered/corrupt store cannot weaken protections. */
 export function sanitizeSettings(raw: unknown): AppSettings {
-  const r = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  const src = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  // Own properties only: an inherited (polluted) Object.prototype value must never be honoured.
+  const r: Record<string, unknown> = Object.create(null);
+  for (const k of ['biometricsEnabled', 'bioAutoTrigger', 'require2FA', 'autoLockTimeout', 'maxFailedAttempts', 'maxFailedAttemptsAction']) {
+    if (Object.prototype.hasOwnProperty.call(src, k)) r[k] = src[k];
+  }
   const bool = (v: unknown, d: boolean) => (typeof v === 'boolean' ? v : d);
   const t = r.autoLockTimeout;
   const m = r.maxFailedAttempts;

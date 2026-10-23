@@ -851,6 +851,9 @@ export class SecureCryptoService {
   }
 
   private static async unlockImpl(passphrase: string): Promise<boolean> {
+    // Red-team: only a real primitive string may reach the KDF. A duck-typed object with its own
+    // normalize()/toString() must not be accepted as a passphrase.
+    if (typeof passphrase !== 'string') return false;
     try {
       await this.recoverMasterTxn();
       const isLocked = await this.isAccountLocked();
@@ -1417,6 +1420,11 @@ export class SecureCryptoService {
    */
   static async computeMac(macKey: string, data: string): Promise<string> {
     try {
+      // Red-team: an empty / short MAC key is a valid HMAC key, so a caller bug (or tampered
+      // input) would silently yield a forgeable tag. All MAC keys here are HKDF 32-byte outputs.
+      if (typeof macKey !== 'string' || !/^[0-9a-fA-F]{64}$/.test(macKey)) {
+        throw new Error('invalid MAC key');
+      }
       const keyBytes = new Uint8Array(this.hexToBuffer(macKey));
       // Fast path: @noble/hashes HMAC-SHA256 (~4x faster than CryptoJS for large data)
       try {
@@ -1523,6 +1531,9 @@ export class SecureCryptoService {
    * a byte-oracle against), but do not rely on it for timing-sensitive secrets.
    */
   static async constantsTimeEquals(a: string, b: string): Promise<boolean> {
+    // Red-team: non-strings (null/undefined) must never compare equal — TextEncoder would
+    // otherwise coerce both to "null"/"undefined" and report a match.
+    if (typeof a !== 'string' || typeof b !== 'string') return false;
     try {
       const result = await nativeVerifyConstantTime(a, b);
       return result;
@@ -1564,6 +1575,15 @@ export class SecureCryptoService {
       } catch {
         return null;
       }
+    }
+  }
+
+  /** Like getItemSecure but a storage ERROR throws instead of reading as "absent" (lockout must fail closed). */
+  private static async getItemSecureStrict(key: string): Promise<string | null> {
+    try {
+      return await HardwareBackedStorage.getItem(key);
+    } catch {
+      return await SecureStore.getItemAsync(key);
     }
   }
 
@@ -1787,14 +1807,16 @@ export class SecureCryptoService {
   static async getFailedAttempts(): Promise<number> {
     try {
       const str = await this.getItemSecure(this.STORAGE_FAILED_ATTEMPTS);
-      return str ? parseInt(str, 10) : 0;
+      const n = str ? parseInt(str, 10) : 0;
+      // Red-team: a tampered counter ("NaN", "-7") must not leak NaN/negatives to the UI.
+      return Number.isFinite(n) && n >= 0 ? n : this.MAX_FAILED_ATTEMPTS;
     } catch { return 0; }
   }
 
   /** Gibt zurück ob der Account gesperrt ist und wann er sich entsperrt */
   static async getLockStatus(): Promise<{ locked: boolean; unlockAt: number }> {
     try {
-      const lockUntilStr = await this.getItemSecure(this.STORAGE_LOCK_UNTIL);
+      const lockUntilStr = await this.getItemSecureStrict(this.STORAGE_LOCK_UNTIL);
       if (!lockUntilStr) return { locked: false, unlockAt: 0 };
       const lockUntil = parseInt(lockUntilStr, 10);
       if (isNaN(lockUntil)) {
@@ -1808,7 +1830,8 @@ export class SecureCryptoService {
       }
       return { locked: true, unlockAt: lockUntil };
     } catch {
-      return { locked: false, unlockAt: 0 };
+      // Lock state unreadable: fail closed (short lock) rather than treat it as "not locked".
+      return { locked: true, unlockAt: Date.now() + 30000 };
     }
   }
 
@@ -1822,7 +1845,7 @@ export class SecureCryptoService {
    */
   private static async isAccountLocked(): Promise<boolean> {
     try {
-      const lockUntilStr = await this.getItemSecure(this.STORAGE_LOCK_UNTIL);
+      const lockUntilStr = await this.getItemSecureStrict(this.STORAGE_LOCK_UNTIL);
       if (!lockUntilStr) return false;
 
       const lockUntil = parseInt(lockUntilStr, 10);
@@ -1840,7 +1863,7 @@ export class SecureCryptoService {
       await this.deleteItemSecure(this.STORAGE_LOCK_UNTIL);
       return false;
     } catch {
-      return false;
+      return true; // unreadable lock state: fail closed
     }
   }
 

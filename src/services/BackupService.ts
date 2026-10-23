@@ -250,7 +250,7 @@ export class BackupService {
       notes?: { title: string; content: string; category?: string; tags?: string[] }[];
       settings?: any;
     };
-    if (!data || typeof data !== 'object') throw new Error('Ungültige Backup-Daten');
+    if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('Ungültige Backup-Daten');
     const files = data.files ?? [];
     const notes = data.notes ?? [];
     if (!Array.isArray(files) || !Array.isArray(notes) || files.length + notes.length > MAX_BACKUP_ENTRIES) {

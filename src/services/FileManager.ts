@@ -152,7 +152,7 @@ class SecureFileManager {
           mac,
         })
       );
-      await writeFileAtomic(`${this.VAULT_DIR}${fileName}`, encryptedData);
+      await this.writeContentOrRollbackMeta(fileName, encryptedData);
 
       // A3: Floor erst NACH erfolgreichem (atomarem) Write anheben.
       await BlobVersionService.advanceTo(fileId, version);
@@ -175,6 +175,9 @@ class SecureFileManager {
       };
     } catch (error) {
       console.error('Error saving file:', error);
+      // A failed import must not strand the picker's plaintext copy in the cache either
+      // (cache-dir only, never user originals — see deletePlaintextCacheCopy).
+      await this.deletePlaintextCacheCopy(fileUri);
       throw new Error('Konnte Datei nicht speichern');
     }
   }
@@ -223,7 +226,7 @@ class SecureFileManager {
         mac,
       })
     );
-    await writeFileAtomic(`${this.VAULT_DIR}${fileName}`, encryptedData);
+    await this.writeContentOrRollbackMeta(fileName, encryptedData);
     await BlobVersionService.advanceTo(fileId, version);
 
     return {
@@ -237,6 +240,21 @@ class SecureFileManager {
       mac,
       version,
     };
+  }
+
+  /**
+   * Attack_Data: the meta is committed first (a listable entry never lacks its meta), but if the
+   * content write then fails the meta must not stay behind as an orphan entry that getFiles()
+   * lists and getFileContent() can never serve (it also breaks restore atomicity).
+   */
+  private static async writeContentOrRollbackMeta(fileName: string, encryptedData: string): Promise<void> {
+    try {
+      await writeFileAtomic(`${this.VAULT_DIR}${fileName}`, encryptedData);
+    } catch (e) {
+      await FileSystem.deleteAsync(`${this.VAULT_DIR}${fileName}.meta.enc`, { idempotent: true }).catch(() => {});
+      await FileSystem.deleteAsync(`${this.VAULT_DIR}${fileName}`, { idempotent: true }).catch(() => {});
+      throw e;
+    }
   }
 
   /**
@@ -255,7 +273,8 @@ class SecureFileManager {
     try {
       if (!fileUri || fileUri.startsWith('data:')) return;
       const cacheDir = FileSystem.cacheDirectory || '';
-      if (cacheDir && fileUri.startsWith(cacheDir) && !fileUri.includes('..')) {
+      // '%' is rejected too: the native layer percent-decodes file:// URIs ('%2e%2e' == '..').
+      if (cacheDir && fileUri.startsWith(cacheDir) && !fileUri.includes('..') && !fileUri.slice(cacheDir.length).includes('%')) {
         await FileSystem.deleteAsync(fileUri, { idempotent: true });
       }
     } catch {
@@ -309,8 +328,13 @@ class SecureFileManager {
             name: fileName,
             originalName,
             type: type as 'image' | 'video' | 'document',
-            size: encryptedMeta.size,
-            createdAt: new Date(encryptedMeta.createdAt),
+            // size/createdAt are unauthenticated plaintext: coerce, never trust the JSON types
+            // (a string size would turn the usage sum into string concatenation).
+            size: Number.isSafeInteger(encryptedMeta.size) && encryptedMeta.size >= 0 ? encryptedMeta.size : 0,
+            createdAt: (() => {
+              const d = typeof encryptedMeta.createdAt === 'string' ? new Date(encryptedMeta.createdAt) : new Date(NaN);
+              return isNaN(d.getTime()) ? new Date(0) : d;
+            })(),
             iv: encryptedMeta.iv,
             mac: encryptedMeta.mac,
             version,
@@ -400,7 +424,7 @@ class SecureFileManager {
     try {
       const cacheDir = FileSystem.cacheDirectory || '';
       // Prefix match alone is bypassable with `..` segments; require a plain leaf name.
-      if (uri && cacheDir && uri.startsWith(`${cacheDir}vault_view_`) && !/[\\/]|\.\./.test(uri.slice(cacheDir.length))) {
+      if (uri && cacheDir && uri.startsWith(`${cacheDir}vault_view_`) && !/[\\/%]|\.\./.test(uri.slice(cacheDir.length))) {
         await this.overwriteThenDelete(uri);
       }
     } catch {
@@ -591,7 +615,8 @@ class SecureFileManager {
   private static containsPathTraversal(filename: string): boolean {
     if (typeof filename !== 'string' || filename.length === 0 || filename.length > 255) return true;
     // Separators, '..', NUL/control chars and bidi overrides (display spoofing) are rejected.
-    return /\.\.|[\/\\\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/.test(filename);
+    // (also C1 controls, zero-width/bidi marks, line/paragraph separators, BOM: display spoofing)
+    return /\.\.|[\/\\\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff]/.test(filename);
   }
 
   /** Pre-flight check used by BackupService to validate a whole restore before importing. */

@@ -147,9 +147,10 @@ export class IntegrityService {
       if (!result) return false;
 
       const data = JSON.parse(result);
-      return !data.isIntact;
+      // Only an explicit boolean true counts as intact; forged/odd shapes read as compromised.
+      return !(data && typeof data === 'object' && data.isIntact === true);
     } catch {
-      return false;
+      return true; // a present-but-unparseable record is tampering, not "never checked"
     }
   }
 
@@ -157,15 +158,20 @@ export class IntegrityService {
    * Führt Tamper Response aus
    */
   static async triggerTamperResponse(): Promise<void> {
+    // Permanent lock FIRST, then each destructive step independently: one throwing step must
+    // never leave the vault unlocked or skip the key shred.
+    try { await SecureStore.setItemAsync('filevault_lock_until', String(Number.MAX_SAFE_INTEGER)); } catch {}
+    let CS: any;
     try {
       // Lazy import: CryptoService owns the real key/lock storage names.
-      const { SecureCryptoService } = require('./CryptoService');
-      SecureCryptoService.clearAllCaches();
-      await SecureCryptoService.deleteEncryptionKey();
-      await SecureCryptoService.deletePinData();
-      await SecureStore.setItemAsync('filevault_lock_until', String(Number.MAX_SAFE_INTEGER));
-      await SecureCryptoService.setAppInitialized(false);
-    } catch {}
+      CS = require('./CryptoService').SecureCryptoService;
+    } catch { return; }
+    try { CS.clearAllCaches(); } catch {}
+    try { await CS.deleteEncryptionKey(); } catch {}
+    try { await CS.deletePinData(); } catch {}
+    // deletePinData clears the lock flag; re-assert it.
+    try { await SecureStore.setItemAsync('filevault_lock_until', String(Number.MAX_SAFE_INTEGER)); } catch {}
+    try { await CS.setAppInitialized(false); } catch {}
   }
 
   // ─────────────────────────────── Settings ───────────────────────────────
@@ -236,8 +242,8 @@ export class IntegrityService {
 
       const data = JSON.parse(result);
       return {
-        isIntact: data.isIntact || false,
-        lastCheck: data.timestamp || 0,
+        isIntact: data.isIntact === true,
+        lastCheck: typeof data.timestamp === 'number' ? data.timestamp : 0,
       };
     } catch {
       return { isIntact: false, lastCheck: 0 };

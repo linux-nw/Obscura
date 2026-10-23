@@ -36,6 +36,11 @@ class SecureNotesService {
     if (!isValidObjectId(noteId) || !noteId.startsWith('note_')) throw new Error('Ungültige Notiz-ID');
   }
 
+  private static safeDate(v: unknown): Date {
+    const d = typeof v === 'string' ? new Date(v) : new Date(NaN);
+    return isNaN(d.getTime()) ? new Date(0) : d;
+  }
+
   private static isNoteFile(name: string): boolean {
     return name.startsWith('note_') && !name.endsWith('.tmp');
   }
@@ -163,8 +168,9 @@ class SecureNotesService {
             id: encryptedNoteData.id,
             title,
             content,
-            createdAt: new Date(encryptedNoteData.createdAt),
-            updatedAt: new Date(encryptedNoteData.updatedAt),
+            // createdAt/updatedAt are unauthenticated plaintext: never surface Invalid Date.
+            createdAt: this.safeDate(encryptedNoteData.createdAt),
+            updatedAt: this.safeDate(encryptedNoteData.updatedAt),
             category: category || undefined,
             tags: tags.length ? tags : undefined,
             isEncrypted: true,
@@ -205,6 +211,12 @@ class SecureNotesService {
   ): Promise<Note | null> {
     try {
       this.assertId(noteId);
+      if (
+        (typeof updates.title === 'string' && updates.title.length > this.MAX_FIELD_CHARS) ||
+        (typeof updates.content === 'string' && updates.content.length > this.MAX_FIELD_CHARS)
+      ) {
+        throw new Error('Notiz zu groß');
+      }
       await this.initialize();
 
       const notes = await this.getNotes();

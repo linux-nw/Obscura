@@ -10,6 +10,7 @@ import { SecureCryptoService } from '../services/CryptoService';
 import { KeyRotationService } from '../services/KeyRotationService';
 import { PanicService } from '../services/PanicService';
 import { DecoyVaultService } from '../services/DecoyVaultService';
+import { parseAttemptCounter } from '../services/AttemptCounter';
 import { DeviceSecurityService } from '../services/DeviceSecurityService';
 import { SettingsService, AppSettings } from '../services/SettingsService';
 import VaultMark, { CornerFrame } from '../components/VaultMark';
@@ -61,7 +62,7 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
           SecureStore.getItemAsync(ATTEMPTS_KEY),
         ]);
         setAppSettings(settings);
-        if (storedAttempts) setFailedAttempts(parseInt(storedAttempts, 10));
+        if (storedAttempts) setFailedAttempts(parseAttemptCounter(storedAttempts, settings.maxFailedAttempts));
 
         const hw  = await LocalAuthentication.hasHardwareAsync();
         const ok  = hw && await LocalAuthentication.isEnrolledAsync();
@@ -187,8 +188,8 @@ export default function AuthScreen({ onAuthenticate, isFirstLaunch, onWipeVault 
       const liveSettings = await SettingsService.get();
       const maxAttempts = liveSettings.maxFailedAttempts;
       const action = liveSettings.maxFailedAttemptsAction;
-      const prior = parseInt((await SecureStore.getItemAsync(ATTEMPTS_KEY)) ?? '0', 10);
-      const pending = (Number.isFinite(prior) && prior > 0 ? prior : 0) + 1;
+      const prior = parseAttemptCounter(await SecureStore.getItemAsync(ATTEMPTS_KEY), maxAttempts);
+      const pending = prior + 1;
       await SecureStore.setItemAsync(ATTEMPTS_KEY, String(pending));
       setFailedAttempts(pending);
 

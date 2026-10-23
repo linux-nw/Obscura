@@ -18,10 +18,16 @@ export interface SecurityStatus {
 
 let compromised = false;
 
-async function safe<T>(fn: (() => Promise<T>) | undefined, fallback: T): Promise<T> {
+// A native check that THROWS (or is stripped from a present module) is an unknown, not a pass:
+// hooking a check to reject must not read as "clean". Recorded as a warning-level indicator.
+let failedChecks: string[] = [];
+
+async function safe<T>(name: string, fn: (() => Promise<T>) | undefined, fallback: T): Promise<T> {
+  if (!fn) { failedChecks.push(`${name}_unavailable`); return fallback; }
   try {
-    return fn ? await fn() : fallback;
+    return await fn();
   } catch {
+    failedChecks.push(`${name}_failed`);
     return fallback;
   }
 }
@@ -39,22 +45,28 @@ export class DeviceSecurityService {
       };
     }
 
+    failedChecks = [];
     const [tracer, frida, debuggable, su, rootPkg] = await Promise.all([
-      safe<number>(ds.getTracerPid ? () => ds.getTracerPid() : undefined, 0),
-      safe<string[]>(ds.checkFridaModules ? () => ds.checkFridaModules() : undefined, []),
-      safe<boolean>(ds.checkDebuggable ? () => ds.checkDebuggable() : undefined, false),
-      safe<boolean>(ds.checkSuBinary ? () => ds.checkSuBinary() : undefined, false),
-      safe<boolean>(ds.checkRootKeysInPackage ? () => ds.checkRootKeysInPackage() : undefined, false),
+      safe<number>('getTracerPid', ds.getTracerPid ? () => ds.getTracerPid() : undefined, 0),
+      safe<string[]>('checkFridaModules', ds.checkFridaModules ? () => ds.checkFridaModules() : undefined, []),
+      safe<boolean>('checkDebuggable', ds.checkDebuggable ? () => ds.checkDebuggable() : undefined, false),
+      safe<boolean>('checkSuBinary', ds.checkSuBinary ? () => ds.checkSuBinary() : undefined, false),
+      safe<boolean>('checkRootKeysInPackage', ds.checkRootKeysInPackage ? () => ds.checkRootKeysInPackage() : undefined, false),
     ]);
     const isDev = typeof __DEV__ !== 'undefined' && __DEV__;
 
     const critical: string[] = [];
     if (tracer && tracer !== 0) critical.push('tracer_attached');
-    if (Array.isArray(frida) && frida.length > 0) critical.push(...frida);
+    if (Array.isArray(frida)) {
+      if (frida.length > 0) critical.push(...frida.map(String));
+    } else if (frida) {
+      critical.push('frida_forged_result'); // truthy non-array = malformed/forged native result
+    }
     if (debuggable && !isDev) critical.push('debuggable_release');
     const warning: string[] = [];
     if (su) warning.push('su_binary');
     if (rootPkg) warning.push('root_package');
+    warning.push(...failedChecks);
 
     const level = critical.length ? 'critical' : warning.length ? 'warning' : 'secure';
     if (level !== 'secure') compromised = true;

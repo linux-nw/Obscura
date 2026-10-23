@@ -108,7 +108,9 @@ export class AutoLockService {
 
       const lastActivity = await SecureStore.getItemAsync(this.LAST_ACTIVITY_KEY);
       if (lastActivity) {
-        this.settings.lastActivity = parseInt(lastActivity, 10);
+        const la = parseInt(lastActivity, 10);
+        // NaN / future stamp (tamper or clock rollback) must not extend the session: epoch 0 = expired.
+        this.settings.lastActivity = Number.isFinite(la) && la <= Date.now() ? la : 0;
       }
     } catch (error) {
       console.error('Error loading auto lock settings:', error);
@@ -185,15 +187,20 @@ export class AutoLockService {
     try {
       const lastActivity = await SecureStore.getItemAsync(this.LAST_ACTIVITY_KEY);
       if (lastActivity) {
-        this.settings.lastActivity = parseInt(lastActivity, 10);
+        const la = parseInt(lastActivity, 10);
+        // Unparseable or future-dated (clock rollback / tampered store) => fail closed: lock.
+        const valid = Number.isFinite(la) && la <= Date.now();
+        this.settings.lastActivity = valid ? la : 0;
         const elapsed = Date.now() - this.settings.lastActivity;
         const timeoutMs = this.settings.timeoutSeconds * 1000;
 
-        if (elapsed >= timeoutMs) {
+        if (!valid || elapsed >= timeoutMs) {
           this.triggerLock();
         } else {
           this.startTimer();
         }
+      } else {
+        this.startTimer();
       }
     } catch (error) {
       console.error('Error checking auto lock:', error);

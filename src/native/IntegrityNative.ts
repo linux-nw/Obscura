@@ -43,8 +43,9 @@ export async function verifyPinnedSignature(): Promise<SignatureVerdict> {
   if (!Native?.verifyPinnedSignature) return 'unverifiable';
   try {
     const r = await Native.verifyPinnedSignature();
-    if (!r.configured) return 'unverifiable';
-    return r.isValid ? 'valid' : 'invalid';
+    // Strict typing: a forged/odd bridge result (string "false", 1, null) must never read as 'valid'.
+    if (!r || typeof r !== 'object' || r.configured !== true) return 'unverifiable';
+    return r.isValid === true ? 'valid' : 'invalid';
   } catch {
     return 'unverifiable';
   }
@@ -62,7 +63,9 @@ export async function checkInstallerIntegrity(): Promise<{
     return { installer: 'unknown', fromTrustedSource: false };
   }
   try {
-    return await Native.checkInstallerIntegrity();
+    const r = await Native.checkInstallerIntegrity();
+    if (!r || typeof r.installer !== 'string') return { installer: 'unknown', fromTrustedSource: false };
+    return { installer: r.installer, fromTrustedSource: r.fromTrustedSource === true };
   } catch {
     return { installer: 'unknown', fromTrustedSource: false };
   }

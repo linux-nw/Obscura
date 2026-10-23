@@ -302,8 +302,9 @@ export default function App() {
     });
     await attempt(() => FileManager.clearVault());
 
-    await CryptoService.deletePinData();
-    await CryptoService.deleteEncryptionKey();
+    // Key first, and each destructive step independent: a throwing PIN-data delete must not skip the shred.
+    await attempt(() => CryptoService.deleteEncryptionKey());
+    await attempt(() => CryptoService.deletePinData());
     CryptoService.clearAllCaches();
     await attempt(() => DecoyVaultService.destroyDecoyVault());
     DecoyVaultService.clearDecoyCache();
@@ -312,7 +313,7 @@ export default function App() {
     await attempt(() => SecureStore.deleteItemAsync('filevault_guest_active'));
     await attempt(() => FileManager.cleanupViewTemps());
     await attempt(() => SecureDeleteService.secureWipeAll());
-    await CryptoService.setAppInitialized(false);
+    await attempt(() => CryptoService.setAppInitialized(false));
 
     setIsDecoy(false);
     setIsFirstLaunch(true);
