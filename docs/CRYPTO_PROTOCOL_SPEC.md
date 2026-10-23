@@ -406,7 +406,7 @@ passphrase fails the MAC check and imports nothing.
 
 | Use case         | Source                                      |
 |------------------|---------------------------------------------|
-| Nonce / IV       | `expo-crypto.getRandomBytesAsync` → `crypto_secretstream_xchacha20_keygen` on native |
+| Nonce / IV       | `expo-crypto.getRandomBytesAsync` (Round 7: output rejected if short or all-zero) |
 | Key generation   | `libsodium.randombytes_buf` (native) or `expo-crypto.getRandomBytesAsync` (fallback) |
 | Salt (KDF)       | `expo-crypto.getRandomBytesAsync`           |
 | Salt (backup)    | `expo-crypto.getRandomBytesAsync` (16 bytes; H1 — libsodium `crypto_pwhash_SALTBYTES`=16) |
@@ -428,6 +428,10 @@ All sources use hardware CSPRNG on Android (via `/dev/urandom` or `SecureRandom`
 | `filevault_panic_pin_algo`             | Panic PIN KDF marker (`argon2id`; absent = legacy PBKDF2-10k) |
 | `filevault_decoy_pin_hash` / `_salt` / `_algo` | Decoy PIN hash/salt/KDF marker (Argon2id; S1) |
 | `filevault_keyrotation_wal`            | JSON RotationWAL (present only during rotation) |
+| `filevault_master_txn`                 | Round 7: transaction record for the multi-item wrapped-master write; rolled forward on next unlock |
+| `filevault_blobver_*`                  | Per-blob version floors (rollback protection) |
+| `filevault_guest_*`                    | Decoy/guest vault credentials and flags |
+| `filevault_auth_attempts`              | Failed-login counter (written before the KDF runs) |
 | `filevault_decoy_activated`            | `"true"` when decoy vault is active       |
 | `filevault_lock_until`                 | Unix timestamp (permanent lock expiry)    |
 
@@ -932,3 +936,38 @@ The three 2b-new methods (`adoptRawKey`, `unwrapVaultWithKek`, `rewrapVault`) ra
 | L3-2b | High | **`src/services/CryptoService.ts`** — R1/R2/R3 `resolve()` seams eliminated on the native path. `encryptDataWithHandle`/`decryptDataWithHandle`: native branch routes through `keyCustody.encryptContent/decryptContent`; non-0x01 prefix on native is a hard error, no JS fallback. `unlockKEK` → `openVaultInstall`; `loadMasterKeyForBiometric` → `unwrapVaultWithKekInstall`; `changePassphrase` → `rewrapVault`. `setMasterHandle` adopts natively-minted handles without a raw-key crossing. |
 | L3-2b | — | **Device ceremony 2026-06-30** — `L3Phase4CeremonyTest` (6 tests) on SM-S906B (Galaxy S22+, arm64-v8a): **6/6 PASS, 0.38 s**. First native execution of `adoptRawKey`, `unwrapVaultWithKek`, `rewrapVault`. §15.5 updated: L3 status → **Done** (three documented limits: plaintext-per-op bridge crossing inherent; lazysodium `byte[]` transient; one-time B1/B5/legacy master touch). |
 | L3-2b | — | `__tests__/L3_KeyZeroing.test.ts` — `resolve()` calls guarded by `JsBackedKeyCustody` cast (Jest-only seam; `NativeBackedKeyCustody` has no `resolve()`). `tsc --noEmit` exit 0; Jest 27 suites / 115 tests green. |
+
+
+---
+
+## 17. Change Log — Hardening Round 7
+
+Code-level audit of every module plus red-team simulation (`__tests__/Sec_*` and `__tests__/Attack_*`). No existing valid wire format was changed.
+
+| Area | Severity | Fix |
+|------|----------|-----|
+| AES-CBC+HMAC | High | MAC is over `iv‖ct` strings; field lengths were never validated, so bytes could be moved from ciphertext into the IV with a still-valid MAC. Strict IV (16 B), MAC (32 B), block-aligned ciphertext and hex validation on every decrypt path (§4.3). |
+| Native bridge | High | Kotlin modules now validate nonce/tag/salt/IV sizes before libsodium calls, parse hex strictly (`toInt(16)` accepted `-1`/`+f`), bound `generateRandomBytes`, validate custody handles, guard close-vs-use with a lock, zero the KEK on unwrap failure, return generic decrypt errors. |
+| Argon2id | Medium | JS path now NFC-normalizes; parameter and salt bounds; native cost floor (memory ≥ 19456 KiB, iterations ≥ 2) so a tampered backup or caller cannot select a weak KDF (§3.1). Broken `verify()` removed. |
+| Rotation WAL | High | Resume deletes the WAL only on a MAC mismatch; malformed WALs are kept; a pending WAL must resolve before a new rotation starts (§6.4). |
+| Master write | Medium | `storeWrappedMaster` is transactional via `filevault_master_txn` (crash mid-write no longer bricks the vault). |
+| Lockout | Medium | Tampered/non-numeric lock state locks instead of disabling the lockout; `unlock`/`verifyPin` serialized; attempt counter written before the KDF; wipe on max attempts is immediate. |
+| Plaintext master at rest | High | `updatePinHash` / `rotateEncryptionKey` no longer write the master key hex to SecureStore. |
+| Paths / backups | High | Vault paths derive from the validated id, not unauthenticated meta; backup ids validated; backup envelope shape- and size-checked before any KDF (512 MiB cap, bounded Argon2id window); restore validates fully, rolls back on failure. |
+| Wipe | High | Crypto-shred first and unconditionally; `secureWipeAll` is step-isolated and covers guest dir, backups, panic/guest keys, blob floors and view temps. |
+| UI leakage | High | All modals use `SecureModal` (RN `Modal` windows do not inherit `FLAG_SECURE`); `disableScreenCaptureBlocking` is a no-op; Recents screenshot disabled on API 33+; tapjacking protection. |
+| Integrity / device | High | `IntegrityService` is wired in and blocks unlock on an invalid verdict; `PenTestService` and `DeviceSecurityService` read real state and fail closed. |
+| Decoy | Medium | CSPRNG ids in the real shape, backdated file dates, dummy Argon2id when no PIN is configured, stale guest flag cleared, guest session hides wipe/panic/decoy/backup controls. |
+| Build | Medium | `allowBackup=false`, storage/camera/microphone permissions removed, release minify/shrink forced, non-debuggable, release fails without a pinned signing cert hash, R8 keep rules, console silenced in release. |
+
+### Open items after Round 7
+
+- Wrapped file keys and the master blob carry no AAD/context binding; file-key blobs can be swapped between files (needs a wire-format change).
+- Deleting a blob removes its version floor; a filesystem attacker can replay an old copy to resurrect it.
+- Meta `createdAt`/`size` are unauthenticated (format change).
+- Lockout state lives in SecureStore and uses the wall clock; counters fail open if storage throws on increment.
+- JS/JVM strings holding passphrases, hex keys and decrypted note text cannot be zeroed.
+- Overwrite passes are not reliable on flash; crypto-shred is the real protection.
+- Legacy PBKDF2 fallback code remains (unused outside the deprecated XChaCha20 service).
+- Root/Frida/debugger detection is bypassable; self-integrity check is bypassable on a rooted device.
+- Kotlin changes are covered by source-assert tests only; a device build and `connectedAndroidTest` run are still required.
