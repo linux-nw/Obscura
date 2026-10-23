@@ -49,7 +49,28 @@ export const ALL_SECURE_KEYS: readonly string[] = [
   'filevault_guest_created',
   'filevault_guest_kdf_salt',
   'filevault_guest_active',
+  // Attack_Data: state/secret keys other services write that the wipe used to leave behind.
+  'filevault_master_txn',
+  'filevault_xchacha20_key',
+  'filevault_last_rotation',
+  'filevault_next_rotation',
+  'filevault_rotation_count',
+  'filevault_rotation_enabled',
+  'filevault_rotation_interval',
+  'filevault_auto_lock_settings',
+  'filevault_last_activity',
+  'filevault_auto_locked',
+  'filevault_integrity_result',
+  'filevault_last_integrity_check',
+  'filevault_integrity_enabled',
+  'filevault_last_security_audit',
+  'filevault_checks_passed',
+  'filevault_checks_failed',
 ];
+
+/** Dynamic SecureStore key families (suffix = id/index) — cannot be enumerated, so derived. */
+const KEY_HISTORY_PREFIX = 'filevault_key_history_';
+const FILE_KEY_PREFIX = 'filevault_filekey_';
 
 // Overwrite work per pass is bounded; larger blobs rely on the crypto-shred.
 const MAX_OVERWRITE_BYTES = 32 * 1024 * 1024;
@@ -254,9 +275,17 @@ export class SecureDeleteService {
       ...(await this.collectIds(this.NOTES_DIR, 'notes')),
     ];
 
+    // Dynamic families: wrapped per-file keys (by id) and key-rotation history (0..count).
+    let rotationCount = 0;
+    try { rotationCount = parseInt((await SecureStore.getItemAsync('filevault_rotation_count')) ?? '0', 10) || 0; } catch { /* none */ }
+    const dynamicKeys = [
+      ...ids.map((id) => `${FILE_KEY_PREFIX}${id}`),
+      ...Array.from({ length: Math.min(Math.max(rotationCount, 0), 10000) + 1 }, (_, i) => `${KEY_HISTORY_PREFIX}${i}`),
+    ];
+
     await step(() => SecureCryptoService.deleteEncryptionKey());
     await step(() => SecureCryptoService.deletePinData());
-    for (const key of ALL_SECURE_KEYS) {
+    for (const key of [...ALL_SECURE_KEYS, ...dynamicKeys]) {
       await step(() => SecureStore.deleteItemAsync(key));
     }
     for (const id of ids) await step(() => BlobVersionService.remove(id));

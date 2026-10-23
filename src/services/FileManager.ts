@@ -269,7 +269,7 @@ class SecureFileManager {
    * Flash-Speicher können Restblöcke bis zum Wear-Leveling-Überschreiben
    * verbleiben (nicht software-seitig garantiert tilgbar).
    */
-  private static async deletePlaintextCacheCopy(fileUri: string): Promise<void> {
+  static async deletePlaintextCacheCopy(fileUri: string): Promise<void> {
     try {
       if (!fileUri || fileUri.startsWith('data:')) return;
       const cacheDir = FileSystem.cacheDirectory || '';
@@ -494,6 +494,7 @@ class SecureFileManager {
 
     for (const metaFile of metaFiles) {
       const metaPath = `${this.VAULT_DIR}${metaFile}`;
+      await this.recoverRotationJournal(metaPath, newHandle);
       const meta = JSON.parse(await FileSystem.readAsStringAsync(metaPath));
       if (!isValidObjectId(meta.id) || metaFile !== `file_${meta.id}${this.METADATA_SUFFIX}`) continue;
       const contentPath = `${this.VAULT_DIR}file_${meta.id}`;
@@ -515,13 +516,45 @@ class SecureFileManager {
       // Inhalt zuerst, dann Metadatei schreiben (per-Blob-Idempotenz macht die
       // Reihenfolge unkritisch — ein Abbruch dazwischen wird sauber resümiert).
       // H3: atomic temp+rename so a crash never truncates a blob.
+      // Red-team (crash injection): content ciphertext and its iv/mac live in TWO files, so a crash
+      // between the two renames left new ciphertext with OLD iv/mac (undecryptable under either
+      // key => permanent data loss; recryptBlob cannot recover it). Journal the new metadata
+      // FIRST (`<meta>.rot`); recoverRotationJournal() rolls it forward iff the content swap landed.
+      const newMeta = { ...meta, iv: newContent.iv, mac: newContent.mac, originalName: newOriginalName, type: newType };
+      const newMetaJson = JSON.stringify(newMeta);
+      const journalPath = `${metaPath}.rot`;
+      await writeFileAtomic(journalPath, newMetaJson);
       await writeFileAtomic(contentPath, newContent.data);
-      meta.iv = newContent.iv;
-      meta.mac = newContent.mac;
-      meta.originalName = newOriginalName;
-      meta.type = newType;
-      await writeFileAtomic(metaPath, JSON.stringify(meta));
+      await writeFileAtomic(metaPath, newMetaJson);
+      await FileSystem.deleteAsync(journalPath, { idempotent: true });
     }
+  }
+
+  /**
+   * Completes or discards an interrupted per-file rotation step (see reencryptAll). If the journaled
+   * metadata authenticates the CURRENT content blob under the new key, the content swap landed and
+   * the metadata is promoted; otherwise the content is still the old blob and the journal is dropped.
+   */
+  private static async recoverRotationJournal(metaPath: string, newHandle: string): Promise<void> {
+    const journalPath = `${metaPath}.rot`;
+    let raw: string;
+    try {
+      raw = await FileSystem.readAsStringAsync(journalPath);
+    } catch {
+      return; // no journal
+    }
+    try {
+      const j = JSON.parse(raw);
+      if (isValidObjectId(j?.id) && metaPath === `${this.VAULT_DIR}file_${j.id}${this.METADATA_SUFFIX}`) {
+        const content = await FileSystem.readAsStringAsync(`${this.VAULT_DIR}file_${j.id}`);
+        const v = parseBlobVersion(j.version);
+        await CryptoService.decryptDataWithHandle(content, j.iv, j.mac, newHandle, `${j.id}:content:v${v}`);
+        await writeFileAtomic(metaPath, raw); // content is already under the new key: promote metadata
+      }
+    } catch {
+      // content still old (or journal unusable): keep the current metadata
+    }
+    await FileSystem.deleteAsync(journalPath, { idempotent: true });
   }
 
   /**

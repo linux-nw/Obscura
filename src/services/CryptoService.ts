@@ -2022,7 +2022,14 @@ export class SecureCryptoService {
    */
   static async setAppInitialized(initialized: boolean): Promise<void> {
     try {
-      await this.setItemSecure(this.STORAGE_APP_INIT, initialized ? 'true' : 'false');
+      if (initialized) {
+        await this.setItemSecure(this.STORAGE_APP_INIT, 'true');
+      } else {
+        // Absent == not initialized (isAppInitialized checks === 'true'). Deleting instead of
+        // writing 'false' keeps a post-wipe store free of any filevault_* residue.
+        try { await HardwareBackedStorage.deleteItem(this.STORAGE_APP_INIT); }
+        catch { await SecureStore.deleteItemAsync(this.STORAGE_APP_INIT); }
+      }
     } catch {
       // Silent fail for setting app initialized
     }

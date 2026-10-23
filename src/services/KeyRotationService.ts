@@ -294,7 +294,10 @@ export class KeyRotationService {
 
   private static async getRotationCount(): Promise<number> {
     const value = await SecureStore.getItemAsync(this.ROTATION_COUNT_KEY);
-    return value ? parseInt(value, 10) : 0;
+    // Red-team: a tampered counter (e.g. "99999999999999999999") drove getKeyHistory() into a
+    // ~1e20-iteration SecureStore read loop (DoS/OOM). Clamp to a sane range.
+    const n = value ? parseInt(value, 10) : 0;
+    return Number.isInteger(n) && n >= 0 && n <= 100000 ? n : 0;
   }
 
   static async getKeyHistory(): Promise<{ rotationCount: number; history: { index: number; timestamp: number }[] }> {
@@ -315,6 +318,11 @@ export class KeyRotationService {
     }
   }
 
+  private static safeTimestamp(v: string | null): number {
+    const n = v ? parseInt(v, 10) : 0;
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+  }
+
   static async getRotationInfo(): Promise<KeyRotationInfo> {
     try {
       const lastRotation  = await SecureStore.getItemAsync(this.LAST_ROTATION_KEY);
@@ -322,8 +330,8 @@ export class KeyRotationService {
       const rotationCount = await this.getRotationCount();
       const interval      = await this.getRotationInterval();
       return {
-        lastRotation: lastRotation ? parseInt(lastRotation, 10) : 0,
-        nextRotation: nextRotation ? parseInt(nextRotation, 10) : 0,
+        lastRotation: this.safeTimestamp(lastRotation),
+        nextRotation: this.safeTimestamp(nextRotation),
         rotationCount,
         enabled: await this.isRotationEnabled(),
         rotationIntervalDays: interval,
@@ -344,7 +352,7 @@ export class KeyRotationService {
     try {
       const nextRotation = await SecureStore.getItemAsync(this.NEXT_ROTATION_KEY);
       if (!nextRotation) return 0;
-      const diff = parseInt(nextRotation, 10) - Date.now();
+      const diff = this.safeTimestamp(nextRotation) - Date.now();
       return Math.max(0, diff);
     } catch {
       return 0;

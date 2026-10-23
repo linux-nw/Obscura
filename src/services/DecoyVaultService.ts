@@ -563,6 +563,20 @@ export class DecoyVaultService {
     type: 'image' | 'video' | 'document',
     originalName: string,
   ): Promise<DecoyFile> {
+    try {
+      return await this.saveFileInner(fileUri, type, originalName);
+    } finally {
+      // Same as the real vault (F2): the picker's plaintext copy must not outlive the import,
+      // success or failure (cache-dir only; user originals are never touched).
+      await FileManager.deletePlaintextCacheCopy(fileUri);
+    }
+  }
+
+  private static async saveFileInner(
+    fileUri: string,
+    type: 'image' | 'video' | 'document',
+    originalName: string,
+  ): Promise<DecoyFile> {
     const handle = this._contentHandle;
     if (!handle) {
       throw new Error('Guest content key not unlocked — set the guest PIN first');
@@ -583,10 +597,18 @@ export class DecoyVaultService {
     const filePath = `${this.DECOY_DIR}file_${fileId}`;
     const size = Math.floor((base64.length * 3) / 4); // approx decoded byte length
 
-    await FileSystem.writeAsStringAsync(filePath, await this.seal(base64, handle, `guest:file:${fileId}`));
+    try {
+      await FileSystem.writeAsStringAsync(filePath, await this.seal(base64, handle, `guest:file:${fileId}`));
+      const createdAtIso = new Date().toISOString();
+      const meta = { name: `file_${fileId}`, originalName, type, size, createdAt: createdAtIso };
+      await FileSystem.writeAsStringAsync(`${filePath}.meta`, await this.seal(JSON.stringify(meta), handle, `guest:meta:${fileId}`));
+    } catch (e) {
+      // No orphan sealed content (a half-written guest file is also a deniability tell).
+      await FileSystem.deleteAsync(filePath).catch(() => {});
+      await FileSystem.deleteAsync(`${filePath}.meta`).catch(() => {});
+      throw e;
+    }
     const createdAt = new Date();
-    const meta = { name: `file_${fileId}`, originalName, type, size, createdAt: createdAt.toISOString() };
-    await FileSystem.writeAsStringAsync(`${filePath}.meta`, await this.seal(JSON.stringify(meta), handle, `guest:meta:${fileId}`));
 
     return { id: fileId, name: `file_${fileId}`, originalName, type, size, createdAt };
   }

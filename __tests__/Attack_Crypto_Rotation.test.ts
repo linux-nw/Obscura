@@ -279,7 +279,7 @@ describe('rotation misc', () => {
     expect(C.__masterKeyHexForTest()).not.toBe(oldMaster);
     const oldH = C.registerKeyHandle(oldMaster);
     const files = await FileManager.getFiles();
-    const name = [...mockFs.keys()].find((k) => /vault\/file_[^/]+$/.test(k) && !k.endsWith('.tmp'))!;
+    const name = [...mockFs.keys()].find((k) => /vault\/file_[A-Za-z0-9_-]+$/.test(k))!;
     const meta = JSON.parse(mockFs.get(name + '.meta.enc')!);
     await expect(C.decryptDataWithHandle(mockFs.get(name)!, meta.iv, meta.mac, oldH, `${files[0].id}:content:v1`)).rejects.toThrow();
     // old wrapped master (replayed) now opens the OLD key, which can decrypt nothing
@@ -308,7 +308,7 @@ describe('rotation misc', () => {
     await expect(KeyRotationService.isRotationDue()).resolves.toEqual(expect.any(Boolean));
     await expect(KeyRotationService.getKeyHistory()).resolves.toBeDefined();
     for (const d of [NaN, -1, 0, Infinity, 1e9]) {
-      await expect(KeyRotationService.enableRotation(d as number)).resolves.not.toThrow();
+      await expect(KeyRotationService.enableRotation(d as number)).rejects.toThrow();
       const i2 = await KeyRotationService.getRotationInfo();
       expect(Number.isFinite(i2.rotationIntervalDays)).toBe(true);
       expect(i2.rotationIntervalDays).toBeGreaterThan(0);

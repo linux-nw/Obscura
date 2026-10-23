@@ -158,6 +158,19 @@ describe('Attack_Data_Vault: decoy existence distinguishability', () => {
     expect(mockFs.has(uri)).toBe(false);
   }, 60000);
 
+  test('guest import also removes the picker plaintext cache copy (success and failure)', async () => {
+    await DecoyVaultService.setDecoyPin(PIN);
+    mockFs.set('/mock/cache/pick_a.jpg', 'plain');
+    await DecoyVaultService.saveFile('/mock/cache/pick_a.jpg', 'image', 'a.jpg');
+    expect(mockFs.has('/mock/cache/pick_a.jpg')).toBe(false);
+    mockFs.set('/mock/cache/pick_b.jpg', 'plain');
+    await expect(DecoyVaultService.saveFile('/mock/cache/pick_b.jpg', 'image', '../x')).rejects.toThrow();
+    expect(mockFs.has('/mock/cache/pick_b.jpg')).toBe(false);
+    mockFs.set('/mock/documents/orig.jpg', 'keep');
+    await DecoyVaultService.saveFile('/mock/documents/orig.jpg', 'image', 'a.jpg').catch(() => {});
+    expect(mockFs.has('/mock/documents/orig.jpg')).toBe(true);
+  }, 60000);
+
   test('guest import failure leaves no orphan sealed content without metadata', async () => {
     await DecoyVaultService.setDecoyPin(PIN);
     const orig = FS.writeAsStringAsync.getMockImplementation();

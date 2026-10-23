@@ -72,6 +72,7 @@ export class PanicService {
       await SecureStore.setItemAsync(this.STORAGE_PANIC_PIN_HASH, hash);
       await SecureStore.setItemAsync(this.STORAGE_PANIC_PIN_SALT, salt);
       await SecureStore.setItemAsync(this.STORAGE_PANIC_PIN_ALGO, 'argon2id');
+      this.wiped = false; // a fresh configuration after a wipe re-arms the counter
     } catch (error) {
       dbgErr('Error setting panic pin:', error);
       throw new Error('Konnte Panic PIN nicht setzen');
@@ -206,6 +207,7 @@ export class PanicService {
     // Crypto-shred first. Every step runs even if an earlier one failed — a half-failed
     // wipe must still destroy as much as possible (secureWipeAll is itself step-isolated
     // and also clears panic/guest keys, guest dir, backups and view temps).
+    this.wiped = true; // queued/late counter increments must not resurrect state or re-lock a wiped vault
     const steps: Array<() => Promise<unknown>> = [
       () => SecureCryptoService.deleteEncryptionKey(),
       () => SecureCryptoService.deletePinData(),
@@ -244,6 +246,9 @@ export class PanicService {
       const value = await SecureStore.getItemAsync(this.STORAGE_PANIC_SETTINGS);
       if (value) {
         const parsed = JSON.parse(value);
+        // Only a plain object is valid: a stored array/string/number must not be able to freeze
+        // the counter (props on an array are lost by JSON.stringify; on primitives they are dropped).
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('corrupt');
         // Coerce legacy actions ('decoy', 'all') to 'lock'
         if (parsed.triggerAction !== 'wipe' && parsed.triggerAction !== 'lock') {
           parsed.triggerAction = 'lock';
@@ -294,6 +299,7 @@ export class PanicService {
       const settings = await this.loadSettings();
       settings.triggerAction = action;
       await this.saveSettings(settings);
+      this.wiped = false; // explicit (re)configuration re-arms the counter
     } catch (error) {
       dbgErr('Error setting trigger action:', error);
     }
@@ -310,8 +316,11 @@ export class PanicService {
   }
 
   private static counterLock: Promise<void> = Promise.resolve();
+  // Set once a wipe ran in this process; cleared when a new panic configuration is written.
+  private static wiped = false;
 
   private static async incrementFailedAttemptsLocked(): Promise<void> {
+    if (this.wiped) return;
     try {
       const settings = await this.loadSettings();
       settings.failedAttempts = (settings.failedAttempts || 0) + 1;
