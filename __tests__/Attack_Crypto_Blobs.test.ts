@@ -411,7 +411,7 @@ describe('malformed / oversized hex & strings to public primitives', () => {
       expect(() => keyCustody.registerRawKey(k)).toThrow();
     }
     expect(keyCustody.has('x')).toBe(false);
-    expect(() => keyCustody.resolve('x')).toThrow();
+    expect(() => (keyCustody as any).resolve('x')).toThrow();
     expect(keyCustody.close('x')).toBe(false);
   });
 
