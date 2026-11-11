@@ -1,3 +1,5 @@
+> **Project status: discontinued.** This project has been abandoned and will not be completed. It taught me a great deal about building encrypted mobile apps.
+
 # Obscura FileVault
 
 **A privacy-first, cryptographically secured file and note vault for Android and iOS.**
